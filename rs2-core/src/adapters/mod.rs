@@ -6,10 +6,14 @@
 //! S3 and database-backed adapters are M1 stretch items tracked in the PRD;
 //! they slot in behind the same traits without touching services.
 
+#[cfg(feature = "http")]
+mod http_out;
 mod local_fs;
 mod mem_data;
 mod mem_query;
 
+#[cfg(feature = "http")]
+pub use http_out::UreqHttpOut;
 pub use local_fs::LocalFsFileStore;
 pub use mem_data::MemDataStore;
 pub use mem_query::MemQueryStore;

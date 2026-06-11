@@ -36,6 +36,8 @@ pub struct ServiceContext {
     pub files: Option<ScopedFileStore>,
     pub data: Option<ScopedDataStore>,
     pub query: Option<ScopedQueryStore>,
+    /// Outbound HTTP adapter; grants scope it per mount (PRD §9.2).
+    pub http: Option<Arc<dyn crate::capabilities::HttpOut>>,
     pub limits: InvocationLimits,
     /// Internal dispatch capability (pipelines and composition).
     pub requester: Option<Arc<dyn Requester>>,

@@ -11,6 +11,8 @@ default = []
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # V8 isolate engine for TS/JS custom services
 js = ["dep:v8"]
+# Outbound HTTP adapter (ureq) for httpOut capability grants
+http = ["dep:ureq"]
 
 [dependencies]
 argon2 = "0.5"
@@ -32,6 +34,7 @@ sha2 = "0.10"
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
+ureq = { version = "2", optional = true }
 uuid.workspace = true
 v8 = { version = "150", optional = true }
 wasmtime = { version = "37", optional = true }

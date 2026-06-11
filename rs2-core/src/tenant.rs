@@ -47,6 +47,9 @@ pub struct Adapters {
     /// Query store (PRD §10.4). Defaults to the reference adapter scanning
     /// the data store; SQL adapters push queries down.
     pub query: Arc<dyn crate::capabilities::QueryStore>,
+    /// Outbound HTTP (PRD §9.2): granted per mount with allowed-host
+    /// patterns; `None` disables external calls entirely.
+    pub http: Option<Arc<dyn crate::capabilities::HttpOut>>,
 }
 
 impl Adapters {
@@ -56,7 +59,13 @@ impl Adapters {
             query: Arc::new(crate::adapters::MemQueryStore::new(data.clone())),
             data,
             idempotency: Arc::new(crate::idempotency::MemIdempotencyStore::default()),
+            http: None,
         }
+    }
+
+    pub fn with_http(mut self, http: Arc<dyn crate::capabilities::HttpOut>) -> Self {
+        self.http = Some(http);
+        self
     }
 }
 
@@ -123,6 +132,7 @@ impl Tenant {
                     adapters.query.clone(),
                     name,
                 )),
+                http: adapters.http.clone(),
                 limits: limits.invocation_limits(),
                 requester: requester.clone(),
                 control: control.clone(),

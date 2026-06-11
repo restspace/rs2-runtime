@@ -56,6 +56,7 @@ pub struct CodeService {
     wasm_engine: crate::engines::wasm::WasmEngine,
     #[cfg(feature = "js")]
     js_engine: crate::engines::js::JsEngine,
+    #[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
     state: Arc<tokio::sync::RwLock<HashMap<String, Vec<u8>>>>,
     code: tokio::sync::OnceCell<LoadedCode>,
 }
@@ -117,6 +118,10 @@ impl CodeService {
     }
 
     /// Build the default-deny capability table from the mount's `grants`.
+    /// Grant kinds: `{ "prefix": "/data/orders" }` scopes internal dispatch
+    /// under a URL prefix; `{ "type": "httpOut", "hosts": ["api.x.com",
+    /// "*.x.com"] }` allows outbound HTTP to matching hosts (PRD §9.2).
+    #[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
     fn grants(&self, ctx: &ServiceContext) -> Result<HashMap<String, CapabilityTarget>, RsError> {
         let mut grants: HashMap<String, CapabilityTarget> = HashMap::new();
         let Some(config_grants) = ctx.config.get("grants").and_then(|g| g.as_object()) else {
@@ -127,6 +132,44 @@ impl CodeService {
             .clone()
             .ok_or_else(|| RsError::internal("code service has no requester capability"))?;
         for (capability, grant) in config_grants {
+            if grant.get("type").and_then(|t| t.as_str()) == Some("httpOut") {
+                let hosts: Vec<String> = grant
+                    .get("hosts")
+                    .and_then(|h| h.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if hosts.is_empty() {
+                    return Err(RsError::bad_request(format!(
+                        "httpOut grant '{capability}' requires a non-empty 'hosts' allowlist"
+                    )));
+                }
+                let http = ctx.http.clone().ok_or_else(|| {
+                    RsError::engine_unavailable(
+                        "this deployment has no outbound HTTP adapter configured",
+                    )
+                })?;
+                let target: CapabilityTarget = Arc::new(move |msg: Message| {
+                    let http = http.clone();
+                    let hosts = hosts.clone();
+                    Box::pin(async move {
+                        let host = url_host(&msg.url.path).ok_or_else(|| {
+                            RsError::bad_request(format!(
+                                "outbound call needs an absolute URL, got '{}'",
+                                msg.url.path
+                            ))
+                        })?;
+                        if !hosts.iter().any(|pattern| host_matches(pattern, &host)) {
+                            return Err(RsError::capability_denied(&format!(
+                                "httpOut to '{host}'"
+                            )));
+                        }
+                        http.request(msg).await
+                    })
+                });
+                grants.insert(capability.clone(), target);
+                continue;
+            }
+
             let prefix = grant
                 .get("prefix")
                 .and_then(|p| p.as_str())
@@ -162,6 +205,30 @@ impl CodeService {
             grants.insert(capability.clone(), target);
         }
         Ok(grants)
+    }
+}
+
+/// Host of an absolute URL ("https://api.x.com:8443/v1" → "api.x.com").
+#[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Allowlist matching: exact host or a `*.suffix` wildcard.
+#[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
+fn host_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host == suffix || host.ends_with(&format!(".{suffix}"))
+    } else {
+        host == pattern
     }
 }
 
@@ -248,6 +315,18 @@ mod tests {
         assert!(CodeService::from_ref("code:noversion").is_err());
         assert!(CodeService::from_ref("code:bad/name@v").is_err());
         assert!(CodeService::from_ref("file").is_err());
+    }
+
+    #[test]
+    fn host_allowlist_matching() {
+        assert_eq!(url_host("https://api.stripe.com/v1/charges").as_deref(), Some("api.stripe.com"));
+        assert_eq!(url_host("https://api.x.com:8443/v1?q=1").as_deref(), Some("api.x.com"));
+        assert_eq!(url_host("/relative/path"), None);
+        assert!(host_matches("api.stripe.com", "api.stripe.com"));
+        assert!(host_matches("*.stripe.com", "api.stripe.com"));
+        assert!(host_matches("*.stripe.com", "stripe.com"));
+        assert!(!host_matches("*.stripe.com", "evil-stripe.com"));
+        assert!(!host_matches("api.stripe.com", "api.stripe.com.evil.io"));
     }
 
     #[test]

@@ -256,7 +256,9 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let adapters = Adapters::new(
         Arc::new(rs2_core::adapters::LocalFsFileStore::new(&config.file_root)),
         Arc::new(rs2_core::adapters::MemDataStore::new()),
-    );
+    )
+    // Outbound HTTP: granted per mount via `httpOut` allowlists (PRD §9.2).
+    .with_http(Arc::new(rs2_core::adapters::UreqHttpOut::new()));
     let loader = Arc::new(FileConfigLoader { dir: PathBuf::from(&config.tenants_dir) });
     let runtime = Runtime::new(tenancy, adapters, loader, LimitTable::default());
 

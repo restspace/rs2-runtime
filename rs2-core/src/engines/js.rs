@@ -35,6 +35,11 @@ use crate::contract::{Engine, HostApi, InvocationLimits, LogLevel, ServiceCode};
 use crate::error::{codes, RsError};
 use crate::message::{Body, MediaType, Message, Source};
 
+/// The compat prelude (G5): the supported web/Node API surface, injected
+/// before every bundle. The explicit supported-API list lives at the top of
+/// the prelude file and is pinned by `tests/npm_compat.rs`.
+const PRELUDE: &str = include_str!("js_prelude.js");
+
 static V8_INIT: Once = Once::new();
 
 fn ensure_v8() {
@@ -153,6 +158,10 @@ impl JsEngine {
             let context = v8::Context::new(scope, Default::default());
             let scope = &mut v8::ContextScope::new(scope, context);
             v8::tc_scope!(let tc, scope);
+            // The compat runtime with no invocation behind it: host-call
+            // natives throw if a bundle does I/O at module top level.
+            install_runtime(tc, std::ptr::null_mut())
+                .ok_or_else(|| RsError::internal("compat runtime installation failed"))?;
             match compile_bundle(tc, &source) {
                 Some(_) => Ok(()),
                 None => {
@@ -399,6 +408,8 @@ fn execute(
     config_json: &str,
     state: &InvocationState,
 ) -> Result<Value, String> {
+    install_runtime(scope, state as *const InvocationState as *mut c_void)
+        .ok_or("compat runtime installation failed")?;
     let namespace = compile_bundle(scope, source).ok_or("bundle error")?;
 
     let default_key = v8::String::new(scope, "default").ok_or("oom")?;
@@ -422,6 +433,14 @@ fn execute(
     let msg_value = parse_json(scope, &input.to_string()).ok_or("input marshaling failed")?;
     let ctx_value = build_ctx(scope, config_json, state).ok_or("ctx construction failed")?;
 
+    // Timer hook installed by the prelude, used to fast-forward virtual
+    // time while the handler's promise is pending.
+    let global = scope.get_current_context().global(scope);
+    let run_timers_key = v8::String::new(scope, "__rs2_runTimers").ok_or("oom")?;
+    let run_timers: Option<v8::Local<v8::Function>> = global
+        .get(scope, run_timers_key.into())
+        .and_then(|v| v.try_into().ok());
+
     let recv = v8::undefined(scope).into();
     let result = handle_fn.call(scope, recv, &[msg_value, ctx_value]).ok_or("handle threw")?;
 
@@ -443,11 +462,29 @@ fn execute(
                 }
                 v8::PromiseState::Pending => {
                     scope.perform_microtask_checkpoint();
+                    if promise.state() != v8::PromiseState::Pending {
+                        continue;
+                    }
+                    // Microtasks exhausted and still pending: fast-forward
+                    // virtual time and run due timers (retry backoffs etc.).
+                    let ran_timer = match &run_timers {
+                        Some(f) => {
+                            let recv = v8::undefined(scope).into();
+                            f.call(scope, recv, &[])
+                                .map(|v| v.is_true())
+                                .ok_or("timer callback threw")?
+                        }
+                        None => false,
+                    };
                     spins += 1;
-                    if spins > 10_000 {
+                    if !ran_timer && spins > 10_000 {
                         return Err(
-                            "handle's promise never settles (timers are not available)".to_string()
+                            "handle's promise never settles (no pending timers or host work)"
+                                .to_string(),
                         );
+                    }
+                    if spins > 1_000_000 {
+                        return Err("handle's timers never converge".to_string());
                     }
                 }
             }
@@ -507,9 +544,161 @@ fn build_ctx<'s>(
 }
 
 fn invocation_state<'a>(args: &v8::FunctionCallbackArguments<'a>) -> &'a InvocationState {
+    try_invocation_state(args).expect("callback requires a live invocation")
+}
+
+fn try_invocation_state<'a>(
+    args: &v8::FunctionCallbackArguments<'a>,
+) -> Option<&'a InvocationState> {
     let external: v8::Local<v8::External> =
         args.data().try_into().expect("callback data is the invocation external");
-    unsafe { &*(external.value() as *const InvocationState) }
+    let ptr = external.value() as *const InvocationState;
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
+}
+
+/// Install the compat runtime (G5): raw native hooks, then the prelude that
+/// wraps them into the supported web/Node API surface and removes them.
+fn install_runtime(scope: &mut v8::PinScope<'_, '_>, state_ptr: *mut c_void) -> Option<()> {
+    let global = scope.get_current_context().global(scope);
+    let external = v8::External::new(scope, state_ptr);
+
+    let fetch_fn = v8::Function::builder(native_fetch_callback).data(external.into()).build(scope)?;
+    let fetch_key = v8::String::new(scope, "__rs2_native_fetch")?;
+    global.set(scope, fetch_key.into(), fetch_fn.into())?;
+
+    let log_fn = v8::Function::builder(native_log_callback).data(external.into()).build(scope)?;
+    let log_key = v8::String::new(scope, "__rs2_native_log")?;
+    global.set(scope, log_key.into(), log_fn.into())?;
+
+    let random_fn =
+        v8::Function::builder(native_random_callback).data(external.into()).build(scope)?;
+    let random_key = v8::String::new(scope, "__rs2_native_random")?;
+    global.set(scope, random_key.into(), random_fn.into())?;
+
+    let prelude = v8::String::new(scope, PRELUDE)?;
+    let script = v8::Script::compile(scope, prelude, None)?;
+    script.run(scope)?;
+    Some(())
+}
+
+/// `fetch` (compat layer): an absolute-URL request through the `fetch`
+/// capability grant — default deny, host-allowlisted (PRD §9.2).
+fn native_fetch_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(state) = try_invocation_state(&args) else {
+        throw_text(scope, "fetch is not available during deploy-time validation");
+        return;
+    };
+    let req_json = match stringify(scope, args.get(0)) {
+        Some(s) => s,
+        None => {
+            throw_text(scope, "fetch request is not serializable");
+            return;
+        }
+    };
+    let req: Value = serde_json::from_str(&req_json).unwrap_or(Value::Null);
+    let url = req.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    let method = req
+        .get("method")
+        .and_then(|m| m.as_str())
+        .and_then(|m| http::Method::from_bytes(m.as_bytes()).ok())
+        .unwrap_or(http::Method::GET);
+
+    // Absolute URL carried in the message path; the HttpOut adapter parses.
+    let mut call = Message::request(method, url, &state.tenant);
+    call.source = Source::Internal;
+    call.depth = state.depth.saturating_add(1);
+    if let Some(headers) = req.get("headers").and_then(|h| h.as_object()) {
+        for (k, v) in headers {
+            if let (Some(v), Ok(name)) =
+                (v.as_str(), http::header::HeaderName::try_from(k.as_str()))
+            {
+                if let Ok(value) = http::HeaderValue::from_str(v) {
+                    call.headers.insert(name, value);
+                }
+            }
+        }
+    }
+    if let Some(Value::String(text)) = req.get("body") {
+        let mt = call
+            .header("content-type")
+            .map(MediaType::parse)
+            .unwrap_or_else(|| MediaType::new("text/plain"));
+        call.body = Some(Body::from_string(text.clone(), mt));
+    }
+
+    match state.rt.block_on(state.host.request("fetch", call)) {
+        Ok(mut resp) => {
+            let status = resp.status.map(|s| s.as_u16()).unwrap_or(200);
+            let text = match &mut resp.body {
+                None => String::new(),
+                Some(body) => match state.rt.block_on(body.materialize(state.materialize_cap)) {
+                    Ok(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                    Err(e) => {
+                        *state.host_error.lock().unwrap() = Some(e.clone());
+                        throw_rs_error(scope, &e);
+                        return;
+                    }
+                },
+            };
+            let headers: serde_json::Map<String, Value> = resp
+                .headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), json!(s))))
+                .collect();
+            let envelope = json!({ "status": status, "headers": headers, "body": text });
+            if let Some(value) = parse_json(scope, &envelope.to_string()) {
+                rv.set(value);
+            }
+        }
+        Err(e) => {
+            *state.host_error.lock().unwrap() = Some(e.clone());
+            throw_rs_error(scope, &e);
+        }
+    }
+}
+
+fn native_log_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(state) = try_invocation_state(&args) else { return };
+    let level = match args.get(0).to_rust_string_lossy(scope).as_str() {
+        "debug" => LogLevel::Debug,
+        "warn" => LogLevel::Warn,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    };
+    let text = args.get(1).to_rust_string_lossy(scope);
+    state.host.log(level, &text);
+}
+
+fn native_random_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    use rand::RngCore;
+    let n = args
+        .get(0)
+        .to_uint32(scope)
+        .map(|v| v.value() as usize)
+        .unwrap_or(0)
+        .min(65536);
+    let mut bytes = vec![0u8; n];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let array: Vec<Value> = bytes.into_iter().map(|b| json!(b)).collect();
+    if let Some(value) = parse_json(scope, &Value::Array(array).to_string()) {
+        rv.set(value);
+    }
 }
 
 /// `ctx.request(capability, { method?, url, headers?, body?, mediaType? })`

@@ -211,6 +211,34 @@ behind the same `Engine` trait).
   engine is in the build); `code:` mounts dispatch by bundle type, so wasm
   and JS services share grants, limits, and the host contract.
 
-Remaining toward G5 (npm corpus): Node-compat shims (`node:` builtins,
-fetch) and the esbuild bundling step in `rs2 deploy` — the engine and
-contract surface they target are now in place.
+## npm-compat layer (G5)
+
+Every JS bundle runs against an injected compat prelude
+(`engines/js_prelude.js`) — the **explicit supported-API list** (PRD §17
+risk mitigation), pinned by the corpus suite in `tests/npm_compat.rs`:
+
+- `fetch` / `Headers` / `Request` / `Response` — outbound HTTP through the
+  `fetch` capability, granted per mount with host allowlists:
+  `"grants": { "fetch": { "type": "httpOut", "hosts": ["api.stripe.com",
+  "*.example.com"] } }`. Default deny; disallowed hosts fail with
+  `capability_denied` before any I/O. The server wires a ureq-backed
+  `HttpOut` adapter (`http` feature); embedders supply their own.
+- `setTimeout` / `clearTimeout` / `setInterval` / `clearInterval` —
+  **virtual time**: when the handler is otherwise idle, pending timers
+  fast-forward, so SDK retry backoffs (429 + Retry-After loops) complete
+  without real waits.
+- `console`, `queueMicrotask`, `structuredClone`, `TextEncoder`/`TextDecoder`,
+  `atob`/`btoa`, `Buffer` (from/alloc/concat/toString utf8|base64|hex),
+  `URL`/`URLSearchParams`, `AbortController`/`AbortSignal`,
+  `crypto.{getRandomValues, randomUUID}`, `process.{env, nextTick, version}`.
+
+The corpus exercises the request/auth/retry patterns the popular
+API-wrapper SDKs are built from (Stripe-style form POST + idempotency
+keys, OpenAI-style JSON + 429 backoff, Slack-style query building +
+base64 auth) — `cargo test --features js --test npm_compat`. Compat
+additions require a corpus-driven case (PRD §17).
+
+Bundling: `rs2 deploy entry.ts --name x --bundle` runs `npx esbuild`
+(single-file ESM; npm deps resolve at build time; native addons fail at
+build time). Timers are virtual and there is no event loop: code needing
+real wall-clock waits or background work is out of scope for v1.

@@ -18,7 +18,7 @@ http.workspace = true
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
-rs2-core = { path = "../rs2-core" }
+rs2-core = { path = "../rs2-core", features = ["http"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util", "time", "sync"] }

@@ -42,9 +42,9 @@ enum Command {
         #[arg(long)]
         component: Option<String>,
     },
-    /// Deploy a compiled component through the self-config API.
+    /// Deploy a compiled component or JS bundle through the self-config API.
     Deploy {
-        /// Path to the .wasm component.
+        /// Path to the .wasm component or .js/.ts entry point.
         component: String,
         /// Deployed bundle name (mounts reference `code:<name>@<version>`).
         #[arg(long)]
@@ -55,6 +55,10 @@ enum Command {
         /// Bearer token for an authenticated `services` mount.
         #[arg(long)]
         token: Option<String>,
+        /// Bundle the entry point first (npx esbuild: npm deps resolved at
+        /// build time, single-file ESM output for the sandbox).
+        #[arg(long)]
+        bundle: bool,
     },
     /// Convert a Restspace `services.json` to an RS2 tenant config.
     Migrate {
@@ -75,8 +79,9 @@ fn main() {
             rt.block_on(rs2_server::run(&config)).map_err(|e| e.to_string())
         }
         Command::Test { path, component } => test_service(&path, component.as_deref()),
-        Command::Deploy { component, name, server, token } => {
-            deploy(&component, &name, &server, token.as_deref())
+        Command::Deploy { component, name, server, token, bundle } => {
+            (if bundle { esbuild(&component) } else { Ok(component) })
+                .and_then(|artifact| deploy(&artifact, &name, &server, token.as_deref()))
         }
         Command::Migrate { input, output } => migrate::migrate(&input, &output),
     };
@@ -157,6 +162,34 @@ fn test_service(path: &str, component: Option<&str>) -> Result<(), String> {
         }
         Err(format!("{} problem(s) found", problems.len()))
     }
+}
+
+/// Bundle a JS/TS entry point with esbuild (PRD §11: npm packages resolve
+/// at bundle time; the sandbox runs single-file ESM against the compat
+/// prelude). Native addons fail here, at build time, with esbuild's error.
+fn esbuild(entry: &str) -> Result<String, String> {
+    let out = std::env::temp_dir().join("rs2-bundle.js");
+    let out_str = out.to_string_lossy().into_owned();
+    let npx = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    let status = std::process::Command::new(npx)
+        .args([
+            "--yes",
+            "esbuild",
+            entry,
+            "--bundle",
+            "--format=esm",
+            "--platform=browser",
+            "--target=es2022",
+            "--define:process.env.NODE_ENV=\"production\"",
+            &format!("--outfile={out_str}"),
+        ])
+        .status()
+        .map_err(|e| format!("cannot run npx esbuild (is Node.js installed?): {e}"))?;
+    if !status.success() {
+        return Err("esbuild failed (see its output above)".to_string());
+    }
+    println!("bundled {entry} → {out_str}");
+    Ok(out_str)
 }
 
 fn deploy(component: &str, name: &str, server: &str, token: Option<&str>) -> Result<(), String> {
