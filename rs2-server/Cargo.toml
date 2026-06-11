@@ -1,0 +1,24 @@
+[package]
+name = "rs2-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RS2 server binary: HTTP listener, config loading, adapter wiring"
+
+[features]
+default = []
+wasm = ["rs2-core/wasm"]
+js = ["rs2-core/js"]
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+rs2-core = { path = "../rs2-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "fs", "io-util", "time", "sync"] }

@@ -1,0 +1,6 @@
+{
+  "mounts": [
+    { "path": "/files", "service": "file" },
+    { "path": "/data", "service": "data", "config": { "enforceSchema": true } }
+  ]
+}

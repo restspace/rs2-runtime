@@ -1,0 +1,13 @@
+//! Built-in capability implementations. Embedders supply their own by
+//! implementing the traits in [`crate::capabilities`].
+//!
+//! M1 ships `local_fs` (streamed file store on the local filesystem) and
+//! `mem_data` (in-memory data store, also the default test double).
+//! S3 and database-backed adapters are M1 stretch items tracked in the PRD;
+//! they slot in behind the same traits without touching services.
+
+mod local_fs;
+mod mem_data;
+
+pub use local_fs::LocalFsFileStore;
+pub use mem_data::MemDataStore;

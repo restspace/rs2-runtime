@@ -1,0 +1,6 @@
+{
+  "listen": "127.0.0.1:3100",
+  "tenancy": { "mode": "single", "tenant": "main" },
+  "fileRoot": "./data",
+  "tenantsDir": "./tenants"
+}

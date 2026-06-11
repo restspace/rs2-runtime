@@ -1,0 +1,16 @@
+# Conformance guest: a minimal Wasm component implementing the RS2 service
+# world. Built standalone (not a workspace member — it targets wasm32-wasip2):
+#   cargo build --target wasm32-wasip2 --release
+[package]
+name = "conformance-echo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[profile.release]
+strip = true
