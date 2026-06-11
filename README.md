@@ -41,6 +41,7 @@ conformance/echo-guest/   Wasm guest component for engine conformance
 ```powershell
 cargo test                       # default features: native engine only, fast build
 cargo test --features wasm       # + Wasmtime component engine
+cargo test --features js         # + V8 isolate engine (self-contained JS conformance)
 
 # Wasm engine conformance against a real component:
 rustup target add wasm32-wasip2
@@ -181,7 +182,35 @@ Done:
     the tenant; unsupported services are skipped with explicit warnings
 
 Exit criteria: **G4 (core service parity) met** — all six services
-reimplemented with documented semantics. **G2/G5 are blocked on the JS
-engine** (still the M1 skeleton): the conformance suite passes on
-native + wasm, but the TS/JS half of G2 and the npm corpus (G5) need the
-V8 isolate engine first. That engine is the single largest remaining item.
+reimplemented with documented semantics.
+
+## V8/JS engine (`--features js`)
+
+`engines/js.rs` embeds rusty_v8 (v8 150). Shape: **one isolate per
+invocation** on a blocking thread (PRD open question 2 resolved
+conservatively — full isolation; warm pools are a later optimization
+behind the same `Engine` trait).
+
+- **Bundle contract**: a single-file ES module whose default export is
+  `async (msg, ctx) => response` or `{ handle }`. JSON bodies arrive
+  parsed; responses are `{ status?, headers?, body?, mediaType? }` (or any
+  value as a 200 JSON body). `ctx` = `{ config, request, log, state }`.
+- **Host bridge**: `ctx.request` is synchronous from the guest (the
+  isolate thread parks on the async host future); `async/await` works via
+  microtask pumping to quiescence. No event loop: timers unavailable in v1.
+- **Limits**: wall clock via a watchdog thread + `terminate_execution`;
+  memory via isolate heap caps with a near-limit callback (an allocation
+  bomb gets a structured `limit_exceeded`, not a process abort); outbound
+  budget and materialization caps host-enforced as for every engine.
+- **Conformance (G2)**: the JS engine passes the identical invariant suite
+  (message semantics, capability denial with preserved error identity,
+  wall-clock kill, memory containment, outbound budget, state capability,
+  no global leakage between invocations) — `cargo test --features js`.
+- **Deployment**: `PUT /services/code/<name>` with
+  `application/javascript` stores the bundle (compile smoke test when the
+  engine is in the build); `code:` mounts dispatch by bundle type, so wasm
+  and JS services share grants, limits, and the host contract.
+
+Remaining toward G5 (npm corpus): Node-compat shims (`node:` builtins,
+fetch) and the esbuild bundling step in `rs2 deploy` — the engine and
+contract surface they target are now in place.

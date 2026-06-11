@@ -9,8 +9,8 @@ description = "RS2 sandboxed composable-service runtime — core crate (0.x, uns
 default = []
 # Wasmtime component engine for Rust/Wasm custom services
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
-# V8 isolate engine for TS/JS custom services (skeleton only in M1)
-js = []
+# V8 isolate engine for TS/JS custom services
+js = ["dep:v8"]
 
 [dependencies]
 argon2 = "0.5"
@@ -33,6 +33,7 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+v8 = { version = "150", optional = true }
 wasmtime = { version = "37", optional = true }
 wasmtime-wasi = { version = "37", optional = true }
 

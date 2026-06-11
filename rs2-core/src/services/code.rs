@@ -19,8 +19,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "wasm")]
-use crate::contract::GrantedHost;
 use crate::contract::CapabilityTarget;
 use crate::error::RsError;
 use crate::message::{Message, Source};
@@ -41,13 +39,25 @@ pub fn code_path(name: &str, version: &str) -> String {
     format!("{CODE_PREFIX}/{name}/{version}.wasm")
 }
 
+pub fn code_path_js(name: &str, version: &str) -> String {
+    format!("{CODE_PREFIX}/{name}/{version}.js")
+}
+
+/// A deployed bundle, dispatched to the engine that can run it (PRD §5.3).
+pub enum LoadedCode {
+    Wasm(Arc<Vec<u8>>),
+    Js(Arc<String>),
+}
+
 pub struct CodeService {
     name: String,
     version: String,
     #[cfg(feature = "wasm")]
-    engine: crate::engines::wasm::WasmEngine,
+    wasm_engine: crate::engines::wasm::WasmEngine,
+    #[cfg(feature = "js")]
+    js_engine: crate::engines::js::JsEngine,
     state: Arc<tokio::sync::RwLock<HashMap<String, Vec<u8>>>>,
-    code: tokio::sync::OnceCell<Arc<Vec<u8>>>,
+    code: tokio::sync::OnceCell<LoadedCode>,
 }
 
 impl CodeService {
@@ -68,31 +78,42 @@ impl CodeService {
             name: name.to_string(),
             version: version.to_string(),
             #[cfg(feature = "wasm")]
-            engine: crate::engines::wasm::WasmEngine::new()?,
+            wasm_engine: crate::engines::wasm::WasmEngine::new()?,
+            #[cfg(feature = "js")]
+            js_engine: crate::engines::js::JsEngine::new(),
             state: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             code: tokio::sync::OnceCell::new(),
         })
     }
 
-    async fn load_code(&self, ctx: &ServiceContext) -> Result<Arc<Vec<u8>>, RsError> {
+    async fn load_code(&self, ctx: &ServiceContext) -> Result<&LoadedCode, RsError> {
         self.code
             .get_or_try_init(|| async {
                 let files = ctx
                     .files
                     .as_ref()
                     .ok_or_else(|| RsError::internal("code service has no file capability"))?;
-                let mut body = files.read(&code_path(&self.name, &self.version), None).await
-                    .map_err(|_| {
-                        RsError::not_found(format!(
-                            "deployed code '{}@{}' not found — deploy it via PUT /code/{}",
-                            self.name, self.version, self.name
-                        ))
+                let cap = ctx.limits.materialized_body_bytes;
+                if let Ok(mut body) = files.read(&code_path(&self.name, &self.version), None).await
+                {
+                    let bytes = body.materialize(cap).await?;
+                    return Ok(LoadedCode::Wasm(Arc::new(bytes.to_vec())));
+                }
+                if let Ok(mut body) =
+                    files.read(&code_path_js(&self.name, &self.version), None).await
+                {
+                    let bytes = body.materialize(cap).await?;
+                    let text = String::from_utf8(bytes.to_vec()).map_err(|_| {
+                        RsError::contract_violation("deployed JS bundle is not valid UTF-8")
                     })?;
-                let bytes = body.materialize(ctx.limits.materialized_body_bytes).await?;
-                Ok(Arc::new(bytes.to_vec()))
+                    return Ok(LoadedCode::Js(Arc::new(text)));
+                }
+                Err(RsError::not_found(format!(
+                    "deployed code '{}@{}' not found — deploy it via PUT /code/{}",
+                    self.name, self.version, self.name
+                )))
             })
             .await
-            .cloned()
     }
 
     /// Build the default-deny capability table from the mount's `grants`.
@@ -146,30 +167,72 @@ impl CodeService {
 
 #[async_trait]
 impl Service for CodeService {
-    #[cfg(feature = "wasm")]
     async fn handle(&self, msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
-        use crate::contract::{Engine, ServiceCode};
         let code = self.load_code(ctx).await?;
-        let host = Arc::new(GrantedHost::new(
-            self.grants(ctx)?,
-            ctx.limits.outbound_calls,
-            self.state.clone(),
-            &format!("{}@{}", self.name, self.version),
-        ));
-        self.engine
-            .invoke(&ServiceCode::WasmComponent(code), msg, &ctx.config, host, &ctx.limits)
-            .await
-    }
-
-    #[cfg(not(feature = "wasm"))]
-    async fn handle(&self, _msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
-        // Keep the unused-field warnings away and the config valid: a build
-        // without the engine feature serves a structured 501 at request time.
-        let _ = (self.load_code(ctx).await, self.grants(ctx), &self.state);
-        Err(RsError::engine_unavailable(format!(
-            "mount references code:{}@{} but this build has no wasm engine (rebuild with --features wasm)",
-            self.name, self.version
-        )))
+        match code {
+            LoadedCode::Wasm(_bytes) => {
+                #[cfg(feature = "wasm")]
+                {
+                    use crate::contract::{Engine, ServiceCode};
+                    let host = Arc::new(crate::contract::GrantedHost::new(
+                        self.grants(ctx)?,
+                        ctx.limits.outbound_calls,
+                        self.state.clone(),
+                        &format!("{}@{}", self.name, self.version),
+                    ));
+                    return self
+                        .wasm_engine
+                        .invoke(
+                            &ServiceCode::WasmComponent(_bytes.clone()),
+                            msg,
+                            &ctx.config,
+                            host,
+                            &ctx.limits,
+                        )
+                        .await;
+                }
+                #[cfg(not(feature = "wasm"))]
+                {
+                    let _ = msg;
+                    Err(RsError::engine_unavailable(format!(
+                        "code:{}@{} is a wasm component but this build has no wasm engine \
+                         (rebuild with --features wasm)",
+                        self.name, self.version
+                    )))
+                }
+            }
+            LoadedCode::Js(_source) => {
+                #[cfg(feature = "js")]
+                {
+                    use crate::contract::{Engine, ServiceCode};
+                    let host = Arc::new(crate::contract::GrantedHost::new(
+                        self.grants(ctx)?,
+                        ctx.limits.outbound_calls,
+                        self.state.clone(),
+                        &format!("{}@{}", self.name, self.version),
+                    ));
+                    return self
+                        .js_engine
+                        .invoke(
+                            &ServiceCode::JsBundle(_source.clone()),
+                            msg,
+                            &ctx.config,
+                            host,
+                            &ctx.limits,
+                        )
+                        .await;
+                }
+                #[cfg(not(feature = "js"))]
+                {
+                    let _ = msg;
+                    Err(RsError::engine_unavailable(format!(
+                        "code:{}@{} is a JS bundle but this build has no JS engine \
+                         (rebuild with --features js)",
+                        self.name, self.version
+                    )))
+                }
+            }
+        }
     }
 }
 

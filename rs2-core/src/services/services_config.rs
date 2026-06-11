@@ -110,29 +110,49 @@ impl Service for ServicesService {
                 if name.is_empty() || name.contains(['/', '\\', '.']) {
                     return Err(RsError::bad_request("invalid code bundle name"));
                 }
+                let is_js = msg
+                    .body
+                    .as_ref()
+                    .map(|b| b.media_type.essence().contains("javascript"))
+                    .unwrap_or(false);
                 let bytes = match &mut msg.body {
                     Some(b) => b.materialize(ctx.limits.materialized_body_bytes).await?.clone(),
                     None => return Err(RsError::bad_request("PUT /code/<name> requires a component body")),
                 };
-                // Validation: an instantiation smoke test in a quarantine
-                // sandbox when the engine is in this build.
-                #[cfg(feature = "wasm")]
-                let validated = {
-                    crate::engines::wasm::WasmEngine::new()?.compile_check(&bytes)?;
-                    true
-                };
-                #[cfg(not(feature = "wasm"))]
-                let validated = false;
+                // Validation: a compile smoke test in a quarantine sandbox
+                // when the matching engine is in this build.
+                #[allow(unused_mut, unused_assignments)]
+                let mut validated = false;
+                if is_js {
+                    #[cfg(feature = "js")]
+                    {
+                        let source = std::str::from_utf8(&bytes).map_err(|_| {
+                            RsError::bad_request("JS bundle is not valid UTF-8")
+                        })?;
+                        crate::engines::js::JsEngine::new().compile_check(source)?;
+                        validated = true;
+                    }
+                } else {
+                    #[cfg(feature = "wasm")]
+                    {
+                        crate::engines::wasm::WasmEngine::new()?.compile_check(&bytes)?;
+                        validated = true;
+                    }
+                }
 
                 let version = super::code::version_of(&bytes);
                 let files = ctx
                     .files
                     .as_ref()
                     .ok_or_else(|| RsError::internal("services service has no file capability"))?;
-                let path = super::code::code_path(&name, &version);
+                let (path, media_type) = if is_js {
+                    (super::code::code_path_js(&name, &version), "application/javascript")
+                } else {
+                    (super::code::code_path(&name, &version), "application/wasm")
+                };
                 let body = crate::message::Body::from_bytes(
                     bytes,
-                    crate::message::MediaType::new("application/wasm"),
+                    crate::message::MediaType::new(media_type),
                 );
                 files.write(&path, body).await?;
                 Ok(msg.response(
@@ -157,7 +177,7 @@ impl Service for ServicesService {
                     .map_err(|_| RsError::not_found(format!("no deployed code '{name}'")))?;
                 let versions: Vec<String> = entries
                     .iter()
-                    .map(|e| e.name.trim_end_matches(".wasm").to_string())
+                    .map(|e| e.name.trim_end_matches(".wasm").trim_end_matches(".js").to_string())
                     .collect();
                 Ok(msg.ok_json(&serde_json::json!({ "name": name, "versions": versions })))
             }

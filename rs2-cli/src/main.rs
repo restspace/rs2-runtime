@@ -161,11 +161,16 @@ fn test_service(path: &str, component: Option<&str>) -> Result<(), String> {
 
 fn deploy(component: &str, name: &str, server: &str, token: Option<&str>) -> Result<(), String> {
     let bytes = std::fs::read(component).map_err(|e| format!("cannot read {component}: {e}"))?;
-    if !bytes.starts_with(b"\0asm") {
-        return Err(format!("{component} is not a WebAssembly binary"));
-    }
+    // JS bundles deploy as source; anything else must be a wasm component.
+    let content_type = if component.ends_with(".js") || component.ends_with(".mjs") {
+        "application/javascript"
+    } else if bytes.starts_with(b"\0asm") {
+        "application/wasm"
+    } else {
+        return Err(format!("{component} is neither a .js bundle nor a WebAssembly binary"));
+    };
     let url = format!("{}/code/{name}", server.trim_end_matches('/'));
-    let mut req = ureq::put(&url).set("content-type", "application/wasm");
+    let mut req = ureq::put(&url).set("content-type", content_type);
     if let Some(token) = token {
         req = req.set("authorization", &format!("Bearer {token}"));
     }

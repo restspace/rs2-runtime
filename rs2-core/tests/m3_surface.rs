@@ -277,6 +277,60 @@ async fn code_deploys_content_addressed_and_mounts() {
     assert_eq!(body_json(&mut hit).await["code"], "engine_unavailable");
 }
 
+/// With the JS engine in the build: deploy a JS bundle through the
+/// self-config API, mount it with a capability grant, and serve a request
+/// that round-trips through the grant back into the data service.
+#[cfg(feature = "js")]
+#[tokio::test]
+async fn deployed_js_bundle_serves_requests_with_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), surface_config());
+    seed_orders(&rt).await;
+
+    let bundle = r#"
+        export default async (msg, ctx) => {
+            const order = ctx.request("orders", { url: "/o1" });
+            ctx.log("info", `loaded order o1: ${order.status}`);
+            return {
+                status: 200,
+                headers: { "x-engine": "js" },
+                body: { engine: "js", orderStatus: order.body.status },
+            };
+        };
+    "#;
+    let deploy = req(Method::PUT, "/services/code/order-view").with_body(Body::from_bytes(
+        bundle.as_bytes().to_vec(),
+        MediaType::new("application/javascript"),
+    ));
+    let mut resp = rt.handle(deploy).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
+    let body = body_json(&mut resp).await;
+    assert_eq!(body["validated"], true, "compile smoke test ran");
+    let code_ref = body["ref"].as_str().unwrap().to_string();
+
+    // Mount it with a grant scoping the capability to /data/orders.
+    let mut config = surface_config();
+    config["mounts"].as_array_mut().unwrap().push(json!({
+        "path": "/order-view", "service": code_ref,
+        "config": { "grants": { "orders": { "prefix": "/data/orders" } } }
+    }));
+    let put = req(Method::PUT, "/services/raw").with_json(&config);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::NO_CONTENT));
+
+    let mut hit = rt.handle(req(Method::GET, "/order-view/anything")).await;
+    assert_eq!(hit.status, Some(StatusCode::OK), "{:?}", hit.body);
+    assert_eq!(hit.header("x-engine"), Some("js"));
+    let out = body_json(&mut hit).await;
+    assert_eq!(out["orderStatus"], "open", "grant round-tripped into the data service");
+
+    // A broken bundle is rejected at deploy time by the compile smoke test.
+    let bad = req(Method::PUT, "/services/code/broken").with_body(Body::from_bytes(
+        b"export default ((((".to_vec(),
+        MediaType::new("application/javascript"),
+    ));
+    assert_eq!(rt.handle(bad).await.status.unwrap().as_u16(), 502);
+}
+
 /// With the wasm engine in the build: deploy the real conformance echo
 /// component end-to-end and invoke it through a mount. Self-skips unless
 /// `RS2_CONFORMANCE_COMPONENT` points at the built guest.
