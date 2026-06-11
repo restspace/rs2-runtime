@@ -189,11 +189,6 @@ impl Runtime {
             return Err(RsError::limit_exceeded("call_depth", msg.depth as u64, self.limits.max_depth as u64));
         }
         let tenant = self.tenant(&msg.tenant).await?;
-        let mount = tenant
-            .mounts
-            .route(&msg.url.path)
-            .ok_or_else(|| RsError::not_found(format!("no service mounted at '{}'", msg.url.path)))?;
-        msg.url.apply_mount(&mount.base_path);
 
         // Verify any presented token into a principal (PRD §10.5); a bad
         // token is rejected outright rather than treated as anonymous.
@@ -204,6 +199,18 @@ impl Runtime {
                 msg.principal = crate::services::auth::principal_from_token(&msg, secret)?;
             }
         }
+
+        // The discovery surface (PRD §12) is generated, not mounted; its
+        // documents are already filtered by the caller's read permission.
+        if crate::discovery::is_discovery_path(&msg.url.path) {
+            return crate::discovery::handle(&tenant, &msg);
+        }
+
+        let mount = tenant
+            .mounts
+            .route(&msg.url.path)
+            .ok_or_else(|| RsError::not_found(format!("no service mounted at '{}'", msg.url.path)))?;
+        msg.url.apply_mount(&mount.base_path);
 
         check_access(&msg, &mount.config)?;
         check_declared_body_size(&msg, &self.limits)?;

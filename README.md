@@ -19,15 +19,20 @@ rs2-core/                 the runtime crate (no global state; 0.x API)
                           JSONata transforms, segment planner, executor
   src/retry.rs            retry policies + effect classes (PRD §7)
   src/idempotency.rs      idempotency store capability + key/replay logic
-  src/services/           prebuilt: file, data, pipeline, auth, services
-  src/capabilities/       FileStore/DataStore/HttpOut traits + tenant scoping
-  src/adapters/           local fs file store, in-memory data store
+  src/services/           prebuilt: file, data, pipeline, query, auth,
+                          services + code: (engine-backed custom services)
+  src/discovery.rs        agent surface + OpenAPI 3.1 (/.well-known/rs2/*)
+  src/capabilities/       FileStore/DataStore/QueryStore/HttpOut traits +
+                          tenant scoping
+  src/adapters/           local fs file store, in-memory data + query stores
   src/tenant.rs           tenant config → built tenant (atomic)
   src/runtime.rs          lazy tenant load + dispatch + control plane
   tests/conformance.rs    engine-neutral conformance suite
   tests/runtime_services.rs  full-path integration tests
   tests/m2_composition.rs    demo tenant e2e, G6 idempotency proof, G7 bench
-rs2-server/               the supported v1 binary (hyper listener)
+  tests/m3_surface.rs        query/discovery/openapi/code-deploy tests
+rs2-server/               the supported v1 binary (hyper listener; also a lib)
+rs2-cli/                  the `rs2` developer CLI (new/dev/test/deploy/migrate)
 conformance/echo-guest/   Wasm guest component for engine conformance
 ```
 
@@ -139,4 +144,44 @@ M2 deviations (tracked):
 - Lockout/session state is node-local (PRD wants the shared state store).
 - TOTP MFA, impersonation, data-field authorization rules, zip/unzip and
   multipart split/join, and the audit log are deferred.
-- `query` service and agent surface are M3 scope.
+
+## M3 status (PRD §16, "Surface & migration")
+
+Done:
+- **`query` service** (PRD §10.4): stored query templates as config objects;
+  named `${param}` + positional `$0…` parameters; parameter schemas
+  validated *before* execution; adapter quoting (failures are structured
+  400s); `X-Total-Count` paging. `QueryStore` capability + reference
+  adapter scanning any `DataStore` (SQL adapters push down).
+- **Agent surface** (PRD §12), generated per tenant and filtered by the
+  caller's read permission and `?surface=` against `x-expose`:
+  - `/.well-known/rs2/services` — mount catalogue with x-agent/x-policy
+  - `/.well-known/rs2/agent-surface` — entities, actions (effect class +
+    Idempotency-Key guidance advertised), stored queries with their schemas
+  - `/.well-known/rs2/openapi` — OpenAPI 3.1; the schemas referenced are
+    the ones enforced at runtime (no drift by construction)
+- **Structured errors complete**: pipeline failures carry the failing step
+  and per-step statuses in the problem+json body.
+- **Custom code deployment** (PRD §10.6): `PUT /services/code/<name>`
+  stores components content-addressed and immutable per version, with a
+  compile smoke test when the engine is in the build; mounts reference
+  `code:<name>@<version>`; capability `grants` map names to internal URL
+  prefixes and re-enter full dispatch (authz/limits/idempotency apply).
+  Proven end-to-end against the real conformance component (wasm feature).
+- **`rs2` CLI** (`cargo run -p rs2-cli --` or the `rs2` binary):
+  - `rs2 new <name> [--js]` — scaffold against the published WIT (the Rust
+    scaffold compiles to a working component as-is)
+  - `rs2 dev` — run a local node (shares the rs2-server library)
+  - `rs2 test` — manifest consistency + component checks (engine compile
+    check with `--features wasm`)
+  - `rs2 deploy <wasm> --name n` — upload via the self-config API
+  - `rs2 migrate <services.json>` — Restspace config → RS2 tenant config:
+    mounts, access roles, retry policies carried over; string-DSL pipelines
+    converted to the typed spec; the result is validated by dry-building
+    the tenant; unsupported services are skipped with explicit warnings
+
+Exit criteria: **G4 (core service parity) met** — all six services
+reimplemented with documented semantics. **G2/G5 are blocked on the JS
+engine** (still the M1 skeleton): the conformance suite passes on
+native + wasm, but the TS/JS half of G2 and the npm corpus (G5) need the
+V8 isolate engine first. That engine is the single largest remaining item.

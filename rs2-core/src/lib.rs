@@ -23,6 +23,7 @@
 pub mod adapters;
 pub mod capabilities;
 pub mod contract;
+pub mod discovery;
 pub mod engines;
 pub mod error;
 pub mod idempotency;

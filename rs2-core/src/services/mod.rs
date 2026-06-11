@@ -4,22 +4,26 @@
 //! custom services identically.
 
 pub mod auth;
+pub mod code;
 mod data;
 mod file;
 mod pipeline_service;
+mod query;
 mod services_config;
 
 pub use auth::AuthService;
+pub use code::CodeService;
 pub use data::DataService;
 pub use file::FileService;
 pub use pipeline_service::PipelineService;
+pub use query::QueryService;
 pub use services_config::ServicesService;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::capabilities::{ScopedDataStore, ScopedFileStore};
+use crate::capabilities::{ScopedDataStore, ScopedFileStore, ScopedQueryStore};
 use crate::contract::InvocationLimits;
 use crate::error::RsError;
 use crate::message::Message;
@@ -31,6 +35,7 @@ pub struct ServiceContext {
     pub config: serde_json::Value,
     pub files: Option<ScopedFileStore>,
     pub data: Option<ScopedDataStore>,
+    pub query: Option<ScopedQueryStore>,
     pub limits: InvocationLimits,
     /// Internal dispatch capability (pipelines and composition).
     pub requester: Option<Arc<dyn Requester>>,

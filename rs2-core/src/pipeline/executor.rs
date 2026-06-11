@@ -68,6 +68,9 @@ pub struct Executor {
     /// Pipeline invocation id: the root of idempotency key derivation
     /// (PRD §7.3) — fresh per invocation, stable across segment retries.
     invocation_id: String,
+    /// Per-step execution report: failures surface the failing step and
+    /// per-step statuses in the structured error (PRD §12).
+    report: Arc<std::sync::Mutex<Vec<Value>>>,
 }
 
 /// What a step did with the in-flight message.
@@ -88,7 +91,22 @@ impl Executor {
             limits,
             retry,
             invocation_id: uuid::Uuid::new_v4().simple().to_string(),
+            report: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Per-step statuses recorded during the last run (step key paths are
+    /// `/<index>` chains; segment retries append repeated entries).
+    pub fn report(&self) -> Vec<Value> {
+        self.report.lock().unwrap().clone()
+    }
+
+    fn record(&self, step_path: &str, kind: &str, status: u16) {
+        self.report.lock().unwrap().push(serde_json::json!({
+            "step": step_path,
+            "kind": kind,
+            "status": status,
+        }));
     }
 
     /// Run a pipeline over a message. `to_step` truncates execution after
@@ -255,10 +273,24 @@ impl Executor {
                 return self.run_split(spec, i, msg, vars, depth, key_path).await;
             }
 
+            let kind = if step.call.is_some() {
+                "call"
+            } else if step.transform.is_some() {
+                "transform"
+            } else {
+                "pipeline"
+            };
             match self.run_step(step, msg, vars, depth, &step_path).await? {
-                Flow::Exit(m) => return Ok(Flow::Exit(m)),
-                Flow::Abort(m) => return Ok(Flow::Abort(m)),
+                Flow::Exit(m) => {
+                    self.record(&step_path, kind, m.status.map(|s| s.as_u16()).unwrap_or(200));
+                    return Ok(Flow::Exit(m));
+                }
+                Flow::Abort(m) => {
+                    self.record(&step_path, kind, m.status.map(|s| s.as_u16()).unwrap_or(500));
+                    return Ok(Flow::Abort(m));
+                }
                 Flow::Continue(out) => {
+                    self.record(&step_path, kind, out.status.map(|s| s.as_u16()).unwrap_or(200));
                     if !out.is_ok() && step.capture.is_none() && !step.try_mode {
                         match spec.fail_action() {
                             Action::Stop => return Ok(Flow::Abort(out)),

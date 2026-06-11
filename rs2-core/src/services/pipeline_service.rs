@@ -62,14 +62,53 @@ impl Service for PipelineService {
         ]);
         let executor = Executor::new(requester, limits.clone(), retry);
 
-        match tokio::time::timeout(limits.wall_clock, executor.run(&self.spec, msg, to_step)).await
-        {
-            Ok(result) => result,
-            Err(_) => Err(RsError::limit_exceeded(
-                "pipeline_wall_clock_ms",
-                limits.wall_clock.as_millis() as u64,
-                limits.wall_clock.as_millis() as u64,
-            )),
+        let result =
+            match tokio::time::timeout(limits.wall_clock, executor.run(&self.spec, msg, to_step))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(RsError::limit_exceeded(
+                    "pipeline_wall_clock_ms",
+                    limits.wall_clock.as_millis() as u64,
+                    limits.wall_clock.as_millis() as u64,
+                )),
+            };
+
+        // Pipeline failures include the failing step and per-step statuses
+        // (PRD §12) so agents can recover instead of guessing.
+        match result {
+            Ok(mut resp) if !resp.is_ok() => {
+                let steps = executor.report();
+                let failed = steps
+                    .iter()
+                    .rev()
+                    .find(|s| s["status"].as_u64().unwrap_or(0) >= 400)
+                    .cloned();
+                if let Some(body) = &mut resp.body {
+                    if body.media_type.is_json() {
+                        if let Ok(mut problem) =
+                            body.as_json(ctx.limits.materialized_body_bytes).await
+                        {
+                            if let Some(obj) = problem.as_object_mut() {
+                                obj.insert(
+                                    "pipeline".to_string(),
+                                    serde_json::json!({
+                                        "failedStep": failed.as_ref().and_then(|f| f.get("step")),
+                                        "steps": steps,
+                                    }),
+                                );
+                                let media_type = body.media_type.clone();
+                                resp.body = Some(crate::message::Body::from_string(
+                                    problem.to_string(),
+                                    media_type,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(resp)
+            }
+            other => other,
         }
     }
 }

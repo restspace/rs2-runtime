@@ -1,0 +1,21 @@
+[package]
+name = "rs2-cli"
+version = "0.1.0"
+edition = "2021"
+description = "rs2 — developer CLI: new/dev/test/deploy/migrate (PRD §11, §15)"
+
+[[bin]]
+name = "rs2"
+path = "src/main.rs"
+
+[dependencies]
+rs2-core = { path = "../rs2-core" }
+rs2-server = { path = "../rs2-server" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+ureq = "2"
+
+[features]
+# Enables the deployment-time component compile check in `rs2 test`.
+wasm = ["rs2-core/wasm"]

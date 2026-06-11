@@ -72,6 +72,51 @@ pub trait HttpOut: Send + Sync {
     async fn request(&self, msg: Message) -> Result<Message, RsError>;
 }
 
+/// Parameterized queries against a backing store (PRD §10.4). The query
+/// template is adapter-specific JSON; parameters are spliced by the `query`
+/// service using [`QueryStore::quote`].
+#[async_trait]
+pub trait QueryStore: Send + Sync {
+    /// Execute a (param-substituted) query; returns (rows, total count).
+    async fn run_query(
+        &self,
+        tenant: &str,
+        query: &serde_json::Value,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<serde_json::Value>, u64), RsError>;
+
+    /// Quote a JSON value for safe splicing into a string position of this
+    /// adapter's query language. Unquotable values are structured 400s.
+    fn quote(&self, value: &serde_json::Value) -> Result<String, RsError>;
+}
+
+/// A [`QueryStore`] handle pre-scoped to one tenant.
+#[derive(Clone)]
+pub struct ScopedQueryStore {
+    inner: Arc<dyn QueryStore>,
+    tenant: String,
+}
+
+impl ScopedQueryStore {
+    pub fn new(inner: Arc<dyn QueryStore>, tenant: &str) -> Self {
+        ScopedQueryStore { inner, tenant: tenant.to_string() }
+    }
+
+    pub async fn run_query(
+        &self,
+        query: &serde_json::Value,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<serde_json::Value>, u64), RsError> {
+        self.inner.run_query(&self.tenant, query, take, skip).await
+    }
+
+    pub fn quote(&self, value: &serde_json::Value) -> Result<String, RsError> {
+        self.inner.quote(value)
+    }
+}
+
 /// A [`FileStore`] handle pre-scoped to one tenant — the only form services see.
 #[derive(Clone)]
 pub struct ScopedFileStore {

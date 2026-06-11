@@ -8,6 +8,8 @@
 
 mod local_fs;
 mod mem_data;
+mod mem_query;
 
 pub use local_fs::LocalFsFileStore;
 pub use mem_data::MemDataStore;
+pub use mem_query::MemQueryStore;

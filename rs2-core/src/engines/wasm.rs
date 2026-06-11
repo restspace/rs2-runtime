@@ -169,6 +169,14 @@ impl WasmEngine {
         Ok(WasmEngine { engine, compiled: tokio::sync::RwLock::new(HashMap::new()) })
     }
 
+    /// Compile-only validation: the deployment-time smoke test for
+    /// `PUT /code/<name>` (PRD §10.6).
+    pub fn compile_check(&self, bytes: &[u8]) -> Result<(), RsError> {
+        Component::new(&self.engine, bytes)
+            .map(|_| ())
+            .map_err(|e| RsError::contract_violation(format!("component failed to compile: {e}")))
+    }
+
     async fn component_for(&self, bytes: &[u8]) -> Result<Component, RsError> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut hasher);

@@ -44,12 +44,16 @@ pub struct Adapters {
     /// Idempotency store (PRD §7.2). The default in-memory adapter is
     /// single-node; supply a shared adapter for scale-out.
     pub idempotency: Arc<dyn crate::idempotency::IdempotencyStore>,
+    /// Query store (PRD §10.4). Defaults to the reference adapter scanning
+    /// the data store; SQL adapters push queries down.
+    pub query: Arc<dyn crate::capabilities::QueryStore>,
 }
 
 impl Adapters {
     pub fn new(files: Arc<dyn FileStore>, data: Arc<dyn DataStore>) -> Self {
         Adapters {
             files,
+            query: Arc::new(crate::adapters::MemQueryStore::new(data.clone())),
             data,
             idempotency: Arc::new(crate::idempotency::MemIdempotencyStore::default()),
         }
@@ -93,11 +97,15 @@ impl Tenant {
                 "file" => Arc::new(FileService::new()),
                 "data" => Arc::new(DataService::new()),
                 "pipeline" => Arc::new(crate::services::PipelineService::from_config(&mount.config)?),
+                "query" => Arc::new(crate::services::QueryService::from_config(&mount.config)?),
                 "auth" => Arc::new(crate::services::AuthService::from_config(
                     &mount.config,
                     config.auth.as_ref(),
                 )?),
                 "services" => Arc::new(crate::services::ServicesService::new()),
+                code_ref if code_ref.starts_with("code:") => {
+                    Arc::new(crate::services::CodeService::from_ref(code_ref)?)
+                }
                 other => {
                     return Err(RsError::bad_request(format!(
                         "unknown service '{other}' at mount '{}' (custom `code:` services arrive with the self-config API)",
@@ -111,6 +119,10 @@ impl Tenant {
                 config: mount.config.clone(),
                 files: Some(ScopedFileStore::new(adapters.files.clone(), name)),
                 data: Some(ScopedDataStore::new(adapters.data.clone(), name)),
+                query: Some(crate::capabilities::ScopedQueryStore::new(
+                    adapters.query.clone(),
+                    name,
+                )),
                 limits: limits.invocation_limits(),
                 requester: requester.clone(),
                 control: control.clone(),

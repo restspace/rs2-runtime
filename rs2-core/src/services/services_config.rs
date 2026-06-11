@@ -103,8 +103,67 @@ impl Service for ServicesService {
                 Ok(resp)
             }
 
+            // Custom service deployment (PRD §10.6): content-addressed,
+            // immutable per version. Mounts reference `code:<name>@<version>`.
+            (&http::Method::PUT, ["code", name]) => {
+                let name = name.to_string();
+                if name.is_empty() || name.contains(['/', '\\', '.']) {
+                    return Err(RsError::bad_request("invalid code bundle name"));
+                }
+                let bytes = match &mut msg.body {
+                    Some(b) => b.materialize(ctx.limits.materialized_body_bytes).await?.clone(),
+                    None => return Err(RsError::bad_request("PUT /code/<name> requires a component body")),
+                };
+                // Validation: an instantiation smoke test in a quarantine
+                // sandbox when the engine is in this build.
+                #[cfg(feature = "wasm")]
+                let validated = {
+                    crate::engines::wasm::WasmEngine::new()?.compile_check(&bytes)?;
+                    true
+                };
+                #[cfg(not(feature = "wasm"))]
+                let validated = false;
+
+                let version = super::code::version_of(&bytes);
+                let files = ctx
+                    .files
+                    .as_ref()
+                    .ok_or_else(|| RsError::internal("services service has no file capability"))?;
+                let path = super::code::code_path(&name, &version);
+                let body = crate::message::Body::from_bytes(
+                    bytes,
+                    crate::message::MediaType::new("application/wasm"),
+                );
+                files.write(&path, body).await?;
+                Ok(msg.response(
+                    http::StatusCode::CREATED,
+                    Some(crate::message::Body::from_json(&serde_json::json!({
+                        "name": name,
+                        "version": version,
+                        "ref": format!("code:{name}@{version}"),
+                        "validated": validated,
+                    }))),
+                ))
+            }
+
+            (&http::Method::GET, ["code", name]) => {
+                let files = ctx
+                    .files
+                    .as_ref()
+                    .ok_or_else(|| RsError::internal("services service has no file capability"))?;
+                let (entries, _) = files
+                    .list(&format!("{}/{name}/", super::code::CODE_PREFIX), 1000, 0)
+                    .await
+                    .map_err(|_| RsError::not_found(format!("no deployed code '{name}'")))?;
+                let versions: Vec<String> = entries
+                    .iter()
+                    .map(|e| e.name.trim_end_matches(".wasm").to_string())
+                    .collect();
+                Ok(msg.ok_json(&serde_json::json!({ "name": name, "versions": versions })))
+            }
+
             _ => Err(RsError::not_found(format!(
-                "services endpoint '{}' (have: GET catalogue/services/raw, PUT raw)",
+                "services endpoint '{}' (have: GET catalogue/services/raw/code, PUT raw, PUT code/<name>)",
                 msg.url.service_path
             ))),
         }

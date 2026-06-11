@@ -1,5 +1,5 @@
 [workspace]
-members = ["rs2-core", "rs2-server"]
+members = ["rs2-core", "rs2-server", "rs2-cli"]
 exclude = ["conformance/echo-guest"]
 resolver = "2"
 
