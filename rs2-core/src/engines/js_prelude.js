@@ -305,11 +305,102 @@
   globalThis.process = {
     env: {},
     nextTick: (fn, ...args) => queueMicrotask(() => fn(...args)),
-    version: "v20.0.0",
-    versions: { node: "20.0.0" },
+    version: "v22.12.0",
+    versions: { node: "22.12.0" },
     platform: "rs2",
   };
   globalThis.global = globalThis;
+
+  // Presence-only WebSocket: SDKs (supabase realtime) sniff for it at
+  // construction; actually opening a socket is out of scope for v1.
+  globalThis.WebSocket = class WebSocket {
+    constructor() {
+      throw new Error("WebSocket connections are not available in RS2 v1");
+    }
+  };
+
+  // Minimal DOM event model: SDK builds for workers extend these (stripe).
+  class Event {
+    constructor(type, init = {}) {
+      this.type = String(type);
+      this.bubbles = !!init.bubbles;
+      this.cancelable = !!init.cancelable;
+      this.defaultPrevented = false;
+    }
+    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+    stopPropagation() {}
+  }
+  class CustomEvent extends Event {
+    constructor(type, init = {}) { super(type, init); this.detail = init.detail; }
+  }
+  class EventTarget {
+    #listeners = new Map();
+    addEventListener(type, fn) {
+      const list = this.#listeners.get(type) ?? [];
+      list.push(fn);
+      this.#listeners.set(type, list);
+    }
+    removeEventListener(type, fn) {
+      const list = this.#listeners.get(type) ?? [];
+      this.#listeners.set(type, list.filter((f) => f !== fn));
+    }
+    dispatchEvent(event) {
+      for (const fn of this.#listeners.get(event.type) ?? []) fn.call(this, event);
+      return !event.defaultPrevented;
+    }
+  }
+  globalThis.Event = Event;
+  globalThis.CustomEvent = CustomEvent;
+  globalThis.EventTarget = EventTarget;
+
+  // Presence-only streams: SDKs reference these for instanceof checks and
+  // streaming responses; body streaming is out of scope for v1 (bodies
+  // materialize at the engine boundary).
+  globalThis.ReadableStream = class ReadableStream {
+    constructor() {}
+    getReader() { throw new Error("response streaming is not available in RS2 v1"); }
+  };
+  globalThis.WritableStream = class WritableStream {};
+  globalThis.TransformStream = class TransformStream {};
+
+  // Blob / File / FormData: enough for SDK presence checks and text-based
+  // payload assembly (binary multipart uploads are out of scope for v1).
+  class Blob {
+    #text;
+    constructor(parts = [], options = {}) {
+      this.#text = parts
+        .map((p) => (typeof p === "string" ? p : p instanceof Blob ? p.__text : utf8Decode(p)))
+        .join("");
+      this.type = options.type ?? "";
+    }
+    get __text() { return this.#text; }
+    get size() { return utf8Encode(this.#text).length; }
+    text() { return Promise.resolve(this.#text); }
+    arrayBuffer() { return Promise.resolve(utf8Encode(this.#text).buffer); }
+    slice() { return new Blob([this.#text], { type: this.type }); }
+  }
+  class File extends Blob {
+    constructor(parts, name, options = {}) {
+      super(parts, options);
+      this.name = String(name);
+      this.lastModified = options.lastModified ?? 0;
+    }
+  }
+  class FormData {
+    #pairs = [];
+    append(k, v, filename) { this.#pairs.push([String(k), v, filename]); }
+    set(k, v, filename) { this.delete(k); this.append(k, v, filename); }
+    delete(k) { this.#pairs = this.#pairs.filter(([pk]) => pk !== k); }
+    get(k) { const hit = this.#pairs.find(([pk]) => pk === k); return hit ? hit[1] : null; }
+    getAll(k) { return this.#pairs.filter(([pk]) => pk === k).map(([, v]) => v); }
+    has(k) { return this.#pairs.some(([pk]) => pk === k); }
+    entries() { return this.#pairs.map(([k, v]) => [k, v])[Symbol.iterator](); }
+    forEach(fn) { for (const [k, v] of this.entries()) fn(v, k, this); }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  globalThis.Blob = Blob;
+  globalThis.File = File;
+  globalThis.FormData = FormData;
 
   // ---- fetch ------------------------------------------------------------
   class Headers {
@@ -361,7 +452,17 @@
       this.url = input instanceof Request ? input.url : String(input);
       this.method = (init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
       this.headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined));
-      this.body = init.body ?? null;
+      this.body = init.body ?? (input instanceof Request ? input.body : null);
+      this.signal = init.signal ?? (input instanceof Request ? input.signal : undefined);
+    }
+    clone() { return new Request(this); }
+    text() {
+      const b = this.body;
+      if (b == null) return Promise.resolve("");
+      if (typeof b === "string") return Promise.resolve(b);
+      if (b instanceof URLSearchParams) return Promise.resolve(b.toString());
+      if (b instanceof Uint8Array) return Promise.resolve(utf8Decode(b));
+      return Promise.resolve(JSON.stringify(b));
     }
   }
   globalThis.Headers = Headers;

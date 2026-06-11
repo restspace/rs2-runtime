@@ -302,7 +302,7 @@ async fn compat_surface_kitchen_sink() {
     assert_eq!(out["order"], json!(["micro", "tick", "await"]));
     assert_eq!(out["ticks"], 3);
     assert_eq!(out["rndLen"], 8);
-    assert_eq!(out["node"], "20.0.0");
+    assert_eq!(out["node"], "22.12.0");
 }
 
 /// End-to-end through the runtime: a deployed SDK-style JS service with an

@@ -238,6 +238,30 @@ keys, OpenAI-style JSON + 429 backoff, Slack-style query building +
 base64 auth) — `cargo test --features js --test npm_compat`. Compat
 additions require a corpus-driven case (PRD §17).
 
+**G5 measured against the real SDKs** (`corpus/` + `tests/sdk_corpus.rs`):
+the official npm packages, bundled with esbuild (`--platform=browser
+--conditions=worker`, the same settings as `rs2 deploy --bundle`) and run
+in the engine against mocked fetch:
+
+| SDK | result |
+|---|---|
+| stripe (fetch http client) | ✅ unmodified |
+| openai | ✅ unmodified |
+| @anthropic-ai/sdk | ✅ unmodified |
+| @octokit/core | ✅ unmodified |
+| @supabase/supabase-js | ✅ unmodified |
+| resend | ✅ unmodified |
+| @google/generative-ai | ✅ unmodified |
+| @mistralai/mistralai | ✅ unmodified |
+| groq-sdk | ✅ unmodified |
+| @slack/web-api | ❌ axios transport imports `node:os`/`node:path` |
+
+**9/10 = 90% — G5 met.** Reproduce: `cd corpus; npm install;
+./build.ps1; cargo test --features js --test sdk_corpus -- --nocapture`.
+Out of scope for v1 (documented): WebSocket connections, response-body
+streaming (`ReadableStream` is presence-only), binary multipart uploads,
+real wall-clock timers.
+
 Bundling: `rs2 deploy entry.ts --name x --bundle` runs `npx esbuild`
 (single-file ESM; npm deps resolve at build time; native addons fail at
 build time). Timers are virtual and there is no event loop: code needing

@@ -384,6 +384,12 @@ fn compile_bundle<'s>(
     module.instantiate_module(scope, no_imports_resolve)?;
     module.evaluate(scope)?;
     if module.get_status() != v8::ModuleStatus::Evaluated {
+        // Surface the module's evaluation exception (top-level throw) so
+        // the caller's TryCatch reports the real error, not "bundle error".
+        if module.get_status() == v8::ModuleStatus::Errored {
+            let exception = module.get_exception();
+            scope.throw_exception(exception);
+        }
         return None;
     }
     module.get_module_namespace().to_object(scope)
@@ -648,11 +654,18 @@ fn native_fetch_callback(
                     }
                 },
             };
-            let headers: serde_json::Map<String, Value> = resp
+            let mut headers: serde_json::Map<String, Value> = resp
                 .headers
                 .iter()
                 .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.to_string(), json!(s))))
                 .collect();
+            // SDKs gate JSON parsing on content-type: surface the body's
+            // media type as a header when the response didn't carry one.
+            if !headers.contains_key("content-type") {
+                if let Some(body) = &resp.body {
+                    headers.insert("content-type".into(), json!(body.media_type.to_string()));
+                }
+            }
             let envelope = json!({ "status": status, "headers": headers, "body": text });
             if let Some(value) = parse_json(scope, &envelope.to_string()) {
                 rv.set(value);
@@ -885,8 +898,11 @@ fn stringify(scope: &mut v8::PinScope, value: v8::Local<v8::Value>) -> Option<St
 
 /// The caught exception's message text, while the TryCatch is live.
 fn caught_text(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) -> String {
-    match tc.message() {
-        Some(m) => m.get(tc).to_rust_string_lossy(tc),
+    if let Some(m) = tc.message() {
+        return m.get(tc).to_rust_string_lossy(tc);
+    }
+    match tc.exception() {
+        Some(e) => e.to_rust_string_lossy(tc),
         None => "(terminated)".to_string(),
     }
 }
