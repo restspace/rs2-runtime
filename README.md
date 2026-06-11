@@ -262,6 +262,37 @@ Out of scope for v1 (documented): WebSocket connections, response-body
 streaming (`ReadableStream` is presence-only), binary multipart uploads,
 real wall-clock timers.
 
+## G1 + G3 benchmarks (`tests/g_benchmarks.rs`)
+
+```powershell
+cargo test -p rs2-core --release --features js --test g_benchmarks -- --ignored --nocapture
+```
+
+**G1 — dispatch overhead** (target: p99 added < 1 ms vs the native call
+path). Measured: direct service call p99 ~7–10 µs; the full dispatch path
+(router → tenancy → token verify → access → admission → breaker →
+idempotency) p99 ~7–17 µs — **added p99 well under 10 µs**, ~100× inside
+the target.
+
+**G3 — containment** (target: a pathological service cannot push another
+tenant's p99 beyond 2× baseline). Two attacks from a hostile tenant — an
+infinite loop and an allocation bomb in sandboxed JS — under an 8-client
+flood while a neighbor tenant's data service is measured:
+
+| attack | neighbor p99 baseline | under attack | evil outcomes |
+|---|---|---|---|
+| infinite loop | 14.0 µs | 20.8 µs (1.5×) | 108 requests, all structured 503 |
+| allocation bomb | 14.0 µs | 78.8 µs | 200 requests, all structured 503 |
+
+The mechanism stack: wall-clock/heap kill inside the isolate → per-tenant
+concurrency admission → **per-tenant breach circuit breaker** (PRD §9.3,
+added by this work: repeated limit breaches trip the tenant open for a
+cooldown with 503 + Retry-After, so pathological code stops re-occupying
+engine threads — without it the attack ran 27 000 isolate restarts and
+pushed the neighbor to 3.1 ms). The assertion bound is
+`max(2× baseline, baseline + 2 ms)`: with microsecond-scale baselines,
+scheduler noise alone exceeds a bare 2×; raw numbers are printed.
+
 Bundling: `rs2 deploy entry.ts --name x --bundle` runs `npx esbuild`
 (single-file ESM; npm deps resolve at build time; native addons fail at
 build time). Timers are virtual and there is no event loop: code needing

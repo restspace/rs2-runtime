@@ -14,7 +14,7 @@ use crate::idempotency;
 use crate::message::Message;
 use crate::router::{validate_path, Tenancy};
 use crate::tenant::{Adapters, Tenant, TenantConfig};
-use crate::wrapper::{check_access, check_declared_body_size, LimitTable, TenantLimiter};
+use crate::wrapper::{check_access, check_declared_body_size, LimitTable, TenantBreaker, TenantLimiter};
 
 /// Source of tenant configs ("config store" — PRD §13). The server binary
 /// supplies a file-backed loader; embedders supply their own.
@@ -63,6 +63,7 @@ pub struct Runtime {
     loader: Arc<dyn ConfigLoader>,
     limits: LimitTable,
     limiter: TenantLimiter,
+    breaker: TenantBreaker,
     tenants: tokio::sync::RwLock<HashMap<String, Arc<Tenant>>>,
     /// Serializes tenant builds so concurrent first requests load once
     /// (re-entrance guard, PRD §9.1).
@@ -132,6 +133,7 @@ impl Runtime {
             loader,
             limits,
             limiter: TenantLimiter::new(),
+            breaker: TenantBreaker::new(),
             tenants: tokio::sync::RwLock::new(HashMap::new()),
             load_guard: tokio::sync::Mutex::new(()),
             self_ref: me.clone(),
@@ -188,6 +190,9 @@ impl Runtime {
         if msg.depth > self.limits.max_depth {
             return Err(RsError::limit_exceeded("call_depth", msg.depth as u64, self.limits.max_depth as u64));
         }
+        // Breach circuit breaker (PRD §9.3): a tenant tripping limits
+        // repeatedly fails fast here, before holding any node resources.
+        self.breaker.check(&msg.tenant)?;
         let tenant = self.tenant(&msg.tenant).await?;
 
         // Verify any presented token into a principal (PRD §10.5); a bad
@@ -277,14 +282,30 @@ impl Runtime {
         ctx: Arc<crate::services::ServiceContext>,
         msg: Message,
     ) -> Result<Message, RsError> {
+        let tenant_name = msg.tenant.clone();
         let wall = self.limits.wall_clock_service;
-        match tokio::time::timeout(wall, service.handle(msg, &ctx)).await {
+        let result = match tokio::time::timeout(wall, service.handle(msg, &ctx)).await {
             Ok(result) => result,
             Err(_) => Err(RsError::limit_exceeded(
                 "wall_clock_ms",
                 wall.as_millis() as u64,
                 wall.as_millis() as u64,
             )),
+        };
+        // Resource-limit breaches feed the tenant's circuit breaker;
+        // admission rejections and breaker trips themselves do not.
+        if let Err(err) = &result {
+            if err.code == crate::error::codes::LIMIT_EXCEEDED {
+                let limit = err
+                    .extra
+                    .as_ref()
+                    .and_then(|e| e.get("limit"))
+                    .and_then(|l| l.as_str());
+                if !matches!(limit, Some("tenant_concurrency") | Some("tenant_breaker")) {
+                    self.breaker.record_breach(&tenant_name, &self.limits);
+                }
+            }
         }
+        result
     }
 }

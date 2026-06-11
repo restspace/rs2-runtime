@@ -23,6 +23,11 @@ pub struct LimitTable {
     pub tenant_concurrency: usize,
     pub outbound_calls: u32,
     pub max_depth: u16,
+    /// Circuit breaker (PRD §9.3 breach behavior): this many resource-limit
+    /// breaches within the window trip the tenant open for the cooldown.
+    pub breaker_threshold: u32,
+    pub breaker_window: Duration,
+    pub breaker_cooldown: Duration,
 }
 
 impl Default for LimitTable {
@@ -35,6 +40,9 @@ impl Default for LimitTable {
             tenant_concurrency: 64,
             outbound_calls: 64,
             max_depth: 16,
+            breaker_threshold: 8,
+            breaker_window: Duration::from_secs(10),
+            breaker_cooldown: Duration::from_secs(5),
         }
     }
 }
@@ -46,6 +54,66 @@ impl LimitTable {
             memory_bytes: self.memory_bytes,
             outbound_calls: self.outbound_calls,
             materialized_body_bytes: self.materialized_body_bytes,
+        }
+    }
+}
+
+/// Per-tenant circuit breaker (PRD §9.3): repeated resource-limit breaches
+/// trip the tenant open — its requests fail fast with 503 + Retry-After
+/// instead of re-occupying engine threads and degrading neighbors.
+#[derive(Default)]
+pub struct TenantBreaker {
+    states: std::sync::Mutex<HashMap<String, BreakerState>>,
+}
+
+#[derive(Default)]
+struct BreakerState {
+    recent_breaches: std::collections::VecDeque<std::time::Instant>,
+    open_until: Option<std::time::Instant>,
+}
+
+impl TenantBreaker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fail fast while the tenant's breaker is open.
+    pub fn check(&self, tenant: &str) -> Result<(), RsError> {
+        let mut states = self.states.lock().unwrap();
+        if let Some(state) = states.get_mut(tenant) {
+            if let Some(until) = state.open_until {
+                let now = std::time::Instant::now();
+                if now < until {
+                    let mut err = RsError::limit_exceeded("tenant_breaker", 1u64, 0u64);
+                    err.detail = format!(
+                        "tenant '{tenant}' tripped the limit-breach circuit breaker; retry later"
+                    );
+                    err.retry_after_ms = Some((until - now).as_millis() as u64);
+                    return Err(err);
+                }
+                // Cooldown elapsed: half-open — clear and allow traffic.
+                state.open_until = None;
+                state.recent_breaches.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a resource-limit breach; trips the breaker at the threshold.
+    pub fn record_breach(&self, tenant: &str, limits: &LimitTable) {
+        let mut states = self.states.lock().unwrap();
+        let state = states.entry(tenant.to_string()).or_default();
+        let now = std::time::Instant::now();
+        state.recent_breaches.push_back(now);
+        while let Some(front) = state.recent_breaches.front() {
+            if now.duration_since(*front) > limits.breaker_window {
+                state.recent_breaches.pop_front();
+            } else {
+                break;
+            }
+        }
+        if state.recent_breaches.len() as u32 >= limits.breaker_threshold {
+            state.open_until = Some(now + limits.breaker_cooldown);
         }
     }
 }
@@ -217,6 +285,30 @@ mod tests {
         // Releasing a permit re-admits.
         drop(_p1);
         assert!(limiter.admit("t1", 2).await.is_ok());
+    }
+
+    #[test]
+    fn breaker_trips_at_threshold_and_recovers() {
+        let limits = LimitTable {
+            breaker_threshold: 3,
+            breaker_window: Duration::from_secs(10),
+            breaker_cooldown: Duration::from_millis(20),
+            ..LimitTable::default()
+        };
+        let breaker = TenantBreaker::new();
+        assert!(breaker.check("t1").is_ok());
+        breaker.record_breach("t1", &limits);
+        breaker.record_breach("t1", &limits);
+        assert!(breaker.check("t1").is_ok(), "below threshold");
+        breaker.record_breach("t1", &limits);
+        let err = breaker.check("t1").unwrap_err();
+        assert_eq!(err.code, crate::error::codes::LIMIT_EXCEEDED);
+        assert!(err.retry_after_ms.is_some());
+        // Other tenants unaffected.
+        assert!(breaker.check("t2").is_ok());
+        // Cooldown elapses → half-open → traffic flows again.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(breaker.check("t1").is_ok());
     }
 
     #[test]
