@@ -83,6 +83,11 @@ impl RsError {
         e
     }
 
+    /// Same `Idempotency-Key`, different request payload (PRD §7.2).
+    pub fn idempotency_key_reuse(detail: impl Into<String>) -> Self {
+        Self::new(422, codes::IDEMPOTENCY_KEY_REUSE, "Idempotency Key Reuse", detail)
+    }
+
     pub fn path_unsafe(detail: impl Into<String>) -> Self {
         Self::new(400, codes::PATH_UNSAFE, "Unsafe Path", detail)
     }

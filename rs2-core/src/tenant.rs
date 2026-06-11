@@ -17,6 +17,12 @@ use crate::wrapper::LimitTable;
 #[derive(Debug, Clone, Deserialize)]
 pub struct TenantConfig {
     pub mounts: Vec<MountSpec>,
+    /// Tenant-level retry default (PRD §7.3 resolution chain).
+    #[serde(default)]
+    pub retry: Option<crate::retry::RetryPolicy>,
+    /// Auth settings consumed by the `auth` service and the RBAC wrapper.
+    #[serde(default)]
+    pub auth: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,11 +41,26 @@ pub struct MountSpec {
 pub struct Adapters {
     pub files: Arc<dyn FileStore>,
     pub data: Arc<dyn DataStore>,
+    /// Idempotency store (PRD §7.2). The default in-memory adapter is
+    /// single-node; supply a shared adapter for scale-out.
+    pub idempotency: Arc<dyn crate::idempotency::IdempotencyStore>,
+}
+
+impl Adapters {
+    pub fn new(files: Arc<dyn FileStore>, data: Arc<dyn DataStore>) -> Self {
+        Adapters {
+            files,
+            data,
+            idempotency: Arc::new(crate::idempotency::MemIdempotencyStore::default()),
+        }
+    }
 }
 
 pub struct Tenant {
     pub name: String,
     pub mounts: MountTable,
+    /// Tenant auth settings (signing key etc.) for the RBAC wrapper.
+    pub auth: Option<serde_json::Value>,
     /// Service instance + granted context per mount base path.
     instances: HashMap<String, (Arc<dyn Service>, Arc<ServiceContext>)>,
 }
@@ -47,7 +68,14 @@ pub struct Tenant {
 impl Tenant {
     /// Validate config and build all service instances. Fails as a whole on
     /// any invalid mount — an invalid config never half-applies (PRD §10.6).
-    pub fn build(name: &str, config: TenantConfig, adapters: &Adapters, limits: &LimitTable) -> Result<Self, RsError> {
+    pub fn build(
+        name: &str,
+        config: TenantConfig,
+        adapters: &Adapters,
+        limits: &LimitTable,
+        requester: Option<Arc<dyn crate::pipeline::Requester>>,
+        control: Option<Arc<dyn crate::runtime::TenantControl>>,
+    ) -> Result<Self, RsError> {
         let mounts = MountTable::new(
             config
                 .mounts
@@ -64,6 +92,12 @@ impl Tenant {
             let service: Arc<dyn Service> = match mount.service.as_str() {
                 "file" => Arc::new(FileService::new()),
                 "data" => Arc::new(DataService::new()),
+                "pipeline" => Arc::new(crate::services::PipelineService::from_config(&mount.config)?),
+                "auth" => Arc::new(crate::services::AuthService::from_config(
+                    &mount.config,
+                    config.auth.as_ref(),
+                )?),
+                "services" => Arc::new(crate::services::ServicesService::new()),
                 other => {
                     return Err(RsError::bad_request(format!(
                         "unknown service '{other}' at mount '{}' (custom `code:` services arrive with the self-config API)",
@@ -78,10 +112,14 @@ impl Tenant {
                 files: Some(ScopedFileStore::new(adapters.files.clone(), name)),
                 data: Some(ScopedDataStore::new(adapters.data.clone(), name)),
                 limits: limits.invocation_limits(),
+                requester: requester.clone(),
+                control: control.clone(),
+                tenant_retry: config.retry.clone(),
+                pipeline_wall_clock: limits.wall_clock_pipeline,
             };
             instances.insert(mount.base_path.clone(), (service, Arc::new(ctx)));
         }
-        Ok(Tenant { name: name.to_string(), mounts, instances })
+        Ok(Tenant { name: name.to_string(), mounts, instances, auth: config.auth.clone() })
     }
 
     pub fn instance(&self, base_path: &str) -> Option<&(Arc<dyn Service>, Arc<ServiceContext>)> {

@@ -24,11 +24,11 @@ impl ConfigLoader for StaticLoader {
     }
 }
 
-fn test_runtime(file_root: &std::path::Path) -> Runtime {
-    let adapters = Adapters {
-        files: Arc::new(LocalFsFileStore::new(file_root)),
-        data: Arc::new(MemDataStore::new()),
-    };
+fn test_runtime(file_root: &std::path::Path) -> Arc<Runtime> {
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(file_root)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({
         "mounts": [
             { "path": "/files", "service": "file" },
@@ -195,10 +195,10 @@ async fn auth_stub_gates_protected_mounts() {
 #[tokio::test]
 async fn tenant_storage_is_host_scoped() {
     let dir = tempfile::tempdir().unwrap();
-    let adapters = Adapters {
-        files: Arc::new(LocalFsFileStore::new(dir.path())),
-        data: Arc::new(MemDataStore::new()),
-    };
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({ "mounts": [ { "path": "/files", "service": "file" } ] })));
     let rt = Runtime::new(
         Tenancy::Multi {

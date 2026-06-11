@@ -84,22 +84,102 @@ impl TenantLimiter {
     }
 }
 
-/// Authn/authz stub for M1. The full `auth` service (JWT verification, role
-/// specs, RBAC) is M2; this enforces the one policy M1 config can express:
-/// `"access": "authenticated"` on a mount requires a principal.
+/// Per-mount authorization (PRD §10.5 role model). The mount's `access`
+/// config is either a string policy (`"open"` / `"authenticated"`) or a
+/// role-spec object:
+///
+/// ```json
+/// { "readRoles": "all", "writeRoles": "A E", "createRoles": "A E U",
+///   "manageRoles": "A" }
+/// ```
+///
+/// Role-spec strings are space-separated tokens: `all`, `authenticated`,
+/// role letters/names, and path-scoped grants — a role token followed by a
+/// path pattern (`"U /user/{email}"`) grants that role only on matching
+/// paths, with `{email}` substituted from the principal id.
+///
+/// Internal calls with no principal are trusted composition (the original
+/// principal propagates when present); CORS-style external-only concerns
+/// never apply, but role specs do whenever a principal is attached.
 pub fn check_access(msg: &Message, mount_config: &serde_json::Value) -> Result<(), RsError> {
-    let access = mount_config.get("access").and_then(|v| v.as_str()).unwrap_or("open");
+    let access = match mount_config.get("access") {
+        None => return Ok(()),
+        Some(a) => a,
+    };
     match access {
-        "open" => Ok(()),
-        "authenticated" => {
-            if msg.principal.is_some() || msg.source == Source::Internal {
+        serde_json::Value::String(s) => match s.as_str() {
+            "open" => Ok(()),
+            "authenticated" => {
+                if msg.principal.is_some() || msg.source == Source::Internal {
+                    Ok(())
+                } else {
+                    Err(RsError::unauthorized("this mount requires authentication"))
+                }
+            }
+            other => Err(RsError::internal(format!("unknown access policy '{other}'"))),
+        },
+        serde_json::Value::Object(spec) => {
+            if msg.principal.is_none() && msg.source == Source::Internal {
+                return Ok(());
+            }
+            let write = spec.get("writeRoles").and_then(|v| v.as_str()).unwrap_or("A");
+            let role_spec = match msg.method {
+                http::Method::GET | http::Method::HEAD | http::Method::OPTIONS => {
+                    spec.get("readRoles").and_then(|v| v.as_str()).unwrap_or("all")
+                }
+                http::Method::POST => {
+                    spec.get("createRoles").and_then(|v| v.as_str()).unwrap_or(write)
+                }
+                _ => write,
+            };
+            if satisfies_role_spec(role_spec, msg) {
                 Ok(())
-            } else {
+            } else if msg.principal.is_none() {
                 Err(RsError::unauthorized("this mount requires authentication"))
+            } else {
+                Err(RsError::forbidden(format!(
+                    "principal lacks a role satisfying '{role_spec}' for {}",
+                    msg.method
+                )))
             }
         }
-        other => Err(RsError::internal(format!("unknown access policy '{other}'"))),
+        _ => Err(RsError::internal("invalid 'access' config")),
     }
+}
+
+/// Evaluate a role-spec string against the message's principal and path.
+fn satisfies_role_spec(spec: &str, msg: &Message) -> bool {
+    let principal = msg.principal.as_ref();
+    let tokens: Vec<&str> = spec.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let role = tokens[i];
+        // A role token may be followed by a path pattern scoping it.
+        let path_pattern = tokens.get(i + 1).filter(|t| t.starts_with('/'));
+        let step = if path_pattern.is_some() { 2 } else { 1 };
+        let role_ok = match role {
+            "all" => true,
+            "authenticated" => principal.is_some(),
+            r => principal.is_some_and(|p| p.roles.iter().any(|have| have == r)),
+        };
+        if role_ok {
+            match path_pattern {
+                None => return true,
+                Some(pattern) => {
+                    let resolved = match principal {
+                        Some(p) => pattern.replace("{email}", &p.id),
+                        None => pattern.to_string(),
+                    };
+                    let path = &msg.url.service_path;
+                    if path == &resolved || path.starts_with(&format!("{resolved}/")) {
+                        return true;
+                    }
+                }
+            }
+        }
+        i += step;
+    }
+    false
 }
 
 /// Body-size admission from the declared Content-Length, before any read.

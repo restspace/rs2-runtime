@@ -13,14 +13,22 @@ wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 js = []
 
 [dependencies]
+argon2 = "0.5"
 async-trait.workspace = true
+base64 = "0.22"
+bcrypt = "0.17"
+bumpalo = "3.20.3"
 bytes.workspace = true
 futures.workspace = true
+hmac = "0.12"
 http.workspace = true
+jsonata-rs = "0.3"
 jsonschema.workspace = true
 percent-encoding.workspace = true
+rand = "0.8"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

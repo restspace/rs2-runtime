@@ -67,18 +67,74 @@ struct FileConfigLoader {
     dir: PathBuf,
 }
 
-#[async_trait]
-impl ConfigLoader for FileConfigLoader {
-    async fn load_tenant(&self, tenant: &str) -> Result<TenantConfig, RsError> {
+impl FileConfigLoader {
+    fn tenant_path(&self, tenant: &str) -> Result<PathBuf, RsError> {
         if tenant.contains(['/', '\\', '.']) {
             return Err(RsError::bad_request("invalid tenant name"));
         }
-        let path = self.dir.join(format!("{tenant}.json"));
+        Ok(self.dir.join(format!("{tenant}.json")))
+    }
+
+    /// Config version for optimistic concurrency: content hash.
+    fn version_of(text: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+}
+
+#[async_trait]
+impl ConfigLoader for FileConfigLoader {
+    async fn load_tenant(&self, tenant: &str) -> Result<TenantConfig, RsError> {
+        let path = self.tenant_path(tenant)?;
         let text = tokio::fs::read_to_string(&path)
             .await
             .map_err(|_| RsError::not_found(format!("unknown tenant '{tenant}'")))?;
         serde_json::from_str(&text)
             .map_err(|e| RsError::internal(format!("tenant config for '{tenant}' is invalid: {e}")))
+    }
+
+    async fn load_raw(&self, tenant: &str) -> Result<(serde_json::Value, String), RsError> {
+        let path = self.tenant_path(tenant)?;
+        let text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|_| RsError::not_found(format!("unknown tenant '{tenant}'")))?;
+        let value = serde_json::from_str(&text)
+            .map_err(|e| RsError::internal(format!("tenant config for '{tenant}' is invalid: {e}")))?;
+        Ok((value, Self::version_of(&text)))
+    }
+
+    async fn save_raw(
+        &self,
+        tenant: &str,
+        config: &serde_json::Value,
+        expected_version: Option<&str>,
+    ) -> Result<String, RsError> {
+        let path = self.tenant_path(tenant)?;
+        if let Some(expected) = expected_version {
+            let current = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+            if Self::version_of(&current) != expected {
+                return Err(RsError::conflict(
+                    "config version mismatch (If-Match): reload and reapply",
+                ));
+            }
+        }
+        let text = serde_json::to_string_pretty(config)
+            .map_err(|e| RsError::internal(e.to_string()))?;
+        // Write-then-rename so a crash never leaves a torn config.
+        let tmp = self.dir.join(format!("{tenant}.json.tmp"));
+        tokio::fs::write(&tmp, &text)
+            .await
+            .map_err(|e| RsError::internal(format!("config write failed: {e}")))?;
+        if tokio::fs::rename(&tmp, &path).await.is_err() {
+            // Windows rename-over-existing: remove target first.
+            let _ = tokio::fs::remove_file(&path).await;
+            tokio::fs::rename(&tmp, &path)
+                .await
+                .map_err(|e| RsError::internal(format!("config rename failed: {e}")))?;
+        }
+        Ok(Self::version_of(&text))
     }
 }
 
@@ -198,12 +254,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TenancyConfig::Single { tenant } => Tenancy::Single { tenant },
         TenancyConfig::Multi { domain_map, main_domain } => Tenancy::Multi { domain_map, main_domain },
     };
-    let adapters = Adapters {
-        files: Arc::new(rs2_core::adapters::LocalFsFileStore::new(&config.file_root)),
-        data: Arc::new(rs2_core::adapters::MemDataStore::new()),
-    };
+    let adapters = Adapters::new(
+        Arc::new(rs2_core::adapters::LocalFsFileStore::new(&config.file_root)),
+        Arc::new(rs2_core::adapters::MemDataStore::new()),
+    );
     let loader = Arc::new(FileConfigLoader { dir: PathBuf::from(&config.tenants_dir) });
-    let runtime = Arc::new(Runtime::new(tenancy, adapters, loader, LimitTable::default()));
+    let runtime = Runtime::new(tenancy, adapters, loader, LimitTable::default());
 
     let addr: SocketAddr = config.listen.parse()?;
     let listener = TcpListener::bind(addr).await?;

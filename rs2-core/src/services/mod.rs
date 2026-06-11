@@ -3,11 +3,19 @@
 //! the sandbox host exposes, so swapping adapters affects prebuilt and
 //! custom services identically.
 
+pub mod auth;
 mod data;
 mod file;
+mod pipeline_service;
+mod services_config;
 
+pub use auth::AuthService;
 pub use data::DataService;
 pub use file::FileService;
+pub use pipeline_service::PipelineService;
+pub use services_config::ServicesService;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -15,6 +23,8 @@ use crate::capabilities::{ScopedDataStore, ScopedFileStore};
 use crate::contract::InvocationLimits;
 use crate::error::RsError;
 use crate::message::Message;
+use crate::pipeline::Requester;
+use crate::retry::RetryPolicy;
 
 /// What a service instance was granted at mount time.
 pub struct ServiceContext {
@@ -22,6 +32,14 @@ pub struct ServiceContext {
     pub files: Option<ScopedFileStore>,
     pub data: Option<ScopedDataStore>,
     pub limits: InvocationLimits,
+    /// Internal dispatch capability (pipelines and composition).
+    pub requester: Option<Arc<dyn Requester>>,
+    /// Control-plane capability (`services` self-config only).
+    pub control: Option<Arc<dyn crate::runtime::TenantControl>>,
+    /// Tenant-level retry default (PRD §7.3 resolution chain).
+    pub tenant_retry: Option<RetryPolicy>,
+    /// Pipeline wall-clock budget (PRD §9.3: 120 s default).
+    pub pipeline_wall_clock: std::time::Duration,
 }
 
 /// A unit of behavior handling messages at a mount: Message → Message.
