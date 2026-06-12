@@ -76,22 +76,30 @@ pub trait HttpOut: Send + Sync {
     async fn request(&self, msg: Message) -> Result<Message, RsError>;
 }
 
-/// Parameterized queries against a backing store (PRD §10.4). The query
-/// template is adapter-specific JSON; parameters are spliced by the `query`
-/// service using [`QueryStore::quote`].
+/// Parameterized queries against a backing store (PRD §10.4) — the RS2
+/// equivalent of v1's `IQueryAdapter`, language-agnostic by design.
+///
+/// JSON-language templates (Mongo aggregates, Elastic DSL, the reference
+/// adapter) arrive **already substituted** structurally by the service;
+/// `params` is supplementary. String-language templates (SQL) arrive
+/// **unsubstituted** with their `${name}` placeholders intact: the adapter
+/// rewrites them to its bind syntax and uses prepared statements — the
+/// service never splices values into string templates.
 #[async_trait]
 pub trait QueryStore: Send + Sync {
-    /// Execute a (param-substituted) query; returns (rows, total count).
+    /// Execute a query; returns (rows, total count).
     async fn run_query(
         &self,
         tenant: &str,
         query: &serde_json::Value,
+        params: &serde_json::Map<String, serde_json::Value>,
         take: usize,
         skip: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), RsError>;
 
-    /// Quote a JSON value for safe splicing into a string position of this
-    /// adapter's query language. Unquotable values are structured 400s.
+    /// Quote a JSON value for safe splicing into an embedded string position
+    /// of this adapter's query language (within JSON templates only).
+    /// Unquotable values are structured 400s.
     fn quote(&self, value: &serde_json::Value) -> Result<String, RsError>;
 }
 
@@ -110,10 +118,11 @@ impl ScopedQueryStore {
     pub async fn run_query(
         &self,
         query: &serde_json::Value,
+        params: &serde_json::Map<String, serde_json::Value>,
         take: usize,
         skip: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), RsError> {
-        self.inner.run_query(&self.tenant, query, take, skip).await
+        self.inner.run_query(&self.tenant, query, params, take, skip).await
     }
 
     pub fn quote(&self, value: &serde_json::Value) -> Result<String, RsError> {

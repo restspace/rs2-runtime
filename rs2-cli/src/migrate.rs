@@ -102,6 +102,16 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
             config.insert("enforceSchema".to_string(), serde_json::json!(true));
         }
 
+        if service == "query" {
+            warnings.push(format!(
+                "{base_path}: v1 query files live in the service's private file store and cannot \
+                 be migrated automatically — re-PUT each as an RS2 envelope \
+                 {{\"query\": <template>, \"params\": <schema>}} to the new mount; \
+                 ${{name}} placeholders carry over (now structural in JSON templates), \
+                 $0 subpath params carry over as trailing URL segments"
+            ));
+        }
+
         if service == "auth" {
             if let Some(pattern) = svc.get("userUrlPattern").and_then(|v| v.as_str()) {
                 warnings.push(format!(

@@ -155,11 +155,20 @@ M2 deviations (tracked):
 ## M3 status (PRD §16, "Surface & migration")
 
 Done:
-- **`query` service** (PRD §10.4): stored query templates as config objects;
-  named `${param}` + positional `$0…` parameters; parameter schemas
-  validated *before* execution; adapter quoting (failures are structured
-  400s); `X-Total-Count` paging. `QueryStore` capability + reference
-  adapter scanning any `DataStore` (SQL adapters push down).
+- **`query` service** (PRD §10.4): stored queries **authored like files**
+  (v1's store-view pattern — `PUT` an envelope, `POST` to execute, no
+  tenant-config round trip), language-agnostic by design: JSON templates
+  (Mongo aggregates, Elastic DSL, the reference adapter) substitute
+  **structurally** — `"${name}"` nodes take the param's JSON value, so
+  templates are valid JSON at rest and injection-safe by construction;
+  `"${name?}"` optionals elide their enclosing clause (generalizing v1
+  Mongo's `ignoreEmptyVariables`); string (SQL) templates pass to the
+  adapter **unsubstituted** with validated params for real bind parameters.
+  Param schemas apply `default`s and validate before execution; positional
+  params from trailing URL segments (longest stored prefix wins); missing
+  params are 400s, never silent. `QueryStore` capability (the v1
+  `IQueryAdapter` equivalent, now bind-capable) + reference adapter
+  scanning any `DataStore`.
 - **Agent surface** (PRD §12), generated per tenant and filtered by the
   caller's read permission and `?surface=` against `x-expose`:
   - `/.well-known/rs2/services` — mount catalogue with x-agent/x-policy

@@ -78,9 +78,17 @@ impl QueryStore for MemQueryStore {
         &self,
         tenant: &str,
         query: &serde_json::Value,
+        _params: &serde_json::Map<String, serde_json::Value>,
         take: usize,
         skip: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), RsError> {
+        // JSON templates arrive structurally substituted; string-language
+        // (SQL) templates are for binding adapters, not this one.
+        if query.is_string() {
+            return Err(RsError::engine_unavailable(
+                "this query adapter executes JSON templates; sql/text queries need a SQL adapter",
+            ));
+        }
         let dataset = query
             .get("dataset")
             .and_then(|v| v.as_str())

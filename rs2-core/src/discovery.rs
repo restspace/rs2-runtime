@@ -28,8 +28,10 @@ pub fn is_discovery_path(path: &str) -> bool {
 }
 
 /// Handle a discovery request. The caller's principal must already be
-/// attached (read-permission filtering depends on it).
-pub fn handle(tenant: &Tenant, msg: &Message) -> Result<Message, RsError> {
+/// attached (read-permission filtering depends on it). Takes the message by
+/// value: the agent surface awaits store reads, and a `&Message` may not be
+/// held across an await (request bodies are not Sync).
+pub async fn handle(tenant: &Tenant, msg: Message) -> Result<Message, RsError> {
     if msg.method != http::Method::GET {
         return Err(RsError::new(
             405,
@@ -38,14 +40,45 @@ pub fn handle(tenant: &Tenant, msg: &Message) -> Result<Message, RsError> {
             "the discovery surface is read-only",
         ));
     }
-    match &msg.url.path[WELL_KNOWN_PREFIX.len()..] {
-        "services" => Ok(msg.ok_json(&services_doc(tenant, msg))),
-        "agent-surface" => Ok(msg.ok_json(&agent_surface_doc(tenant, msg))),
-        "openapi" => Ok(msg.ok_json(&openapi_doc(tenant, msg))),
-        other => Err(RsError::not_found(format!(
-            "no discovery document '{other}' (have: services, agent-surface, openapi)"
-        ))),
+    let doc = match &msg.url.path[WELL_KNOWN_PREFIX.len()..] {
+        "services" => services_doc(tenant, &msg),
+        "agent-surface" => {
+            let mounts = readable_mounts(tenant, &msg);
+            let surface = msg.url.query_param("surface");
+            agent_surface_doc(tenant, mounts, surface, msg.tenant.clone()).await
+        }
+        "openapi" => openapi_doc(tenant, &msg),
+        other => {
+            return Err(RsError::not_found(format!(
+                "no discovery document '{other}' (have: services, agent-surface, openapi)"
+            )))
+        }
+    };
+    Ok(msg.ok_json(&doc))
+}
+
+/// Stored query specs for a query mount (top-level, capped): each entry's
+/// envelope contributes its `params`/`output` schemas to the surface.
+async fn stored_queries(tenant: &Tenant, mount: &Mount) -> Vec<(String, Value)> {
+    let Some((_, ctx)) = tenant.instance(&mount.base_path) else { return vec![] };
+    let Some(files) = &ctx.files else { return vec![] };
+    let prefix = format!("{}{}", crate::services::QUERY_PREFIX, mount.base_path);
+    let Ok((entries, _)) = files.list(&format!("{prefix}/"), 100, 0).await else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        if entry.dir {
+            continue;
+        }
+        let name = entry.name.clone();
+        let Ok(mut body) = files.read(&format!("{prefix}/{name}"), None).await else { continue };
+        let Ok(bytes) = body.materialize(1024 * 1024).await else { continue };
+        if let Ok(doc) = serde_json::from_slice::<Value>(bytes) {
+            out.push((name, doc));
+        }
     }
+    out
 }
 
 /// Mounts the caller may read, with their agent metadata.
@@ -95,7 +128,7 @@ fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
         "file" => ("store", vec!["range", "confirm-delete"]),
         "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
         "pipeline" => ("transform", vec![]),
-        "query" => ("store-view", vec![]),
+        "query" => ("store-view", vec!["positional-params"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),
@@ -128,13 +161,17 @@ fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
     json!({ "tenant": msg.tenant, "services": services })
 }
 
-fn agent_surface_doc(tenant: &Tenant, msg: &Message) -> Value {
-    let surface = msg.url.query_param("surface");
+async fn agent_surface_doc(
+    tenant: &Tenant,
+    mounts: Vec<&Mount>,
+    surface: Option<String>,
+    tenant_name: String,
+) -> Value {
     let mut entities = Vec::new();
     let mut actions = Vec::new();
     let mut queries = Vec::new();
 
-    for mount in readable_mounts(tenant, msg) {
+    for mount in mounts {
         if !exposed_on(mount, surface.as_deref()) {
             continue;
         }
@@ -171,23 +208,21 @@ fn agent_surface_doc(tenant: &Tenant, msg: &Message) -> Value {
                 actions.push(with_pattern(entry, mount));
             }
             "query" => {
-                if let Some(defs) = mount.config.get("queries").and_then(|q| q.as_object()) {
-                    for (name, def) in defs {
-                        let mut entry = json!({
-                            "path": format!("{base}/{name}"),
-                            "kind": "query",
-                            "method": "POST",
-                            "effect": "pure",
-                            "params": def.get("params").cloned().unwrap_or(json!({})),
-                        });
-                        if let Some(output) = def.get("output") {
-                            entry["output"] = output.clone();
-                        }
-                        for (k, v) in meta(mount) {
-                            entry[k] = v.clone();
-                        }
-                        queries.push(with_pattern(entry, mount));
+                for (name, doc) in stored_queries(tenant, mount).await {
+                    let mut entry = json!({
+                        "path": format!("{base}/{name}"),
+                        "kind": "query",
+                        "method": "POST",
+                        "effect": "pure",
+                        "params": doc.get("params").cloned().unwrap_or(json!({})),
+                    });
+                    if let Some(output) = doc.get("output") {
+                        entry["output"] = output.clone();
                     }
+                    for (k, v) in meta(mount) {
+                        entry[k] = v.clone();
+                    }
+                    queries.push(with_pattern(entry, mount));
                 }
             }
             _ => {}
@@ -195,7 +230,7 @@ fn agent_surface_doc(tenant: &Tenant, msg: &Message) -> Value {
     }
 
     json!({
-        "tenant": msg.tenant,
+        "tenant": tenant_name,
         "entities": entities,
         "actions": actions,
         "queries": queries,
@@ -267,19 +302,16 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                 );
             }
             "query" => {
-                if let Some(defs) = mount.config.get("queries").and_then(|q| q.as_object()) {
-                    for (name, def) in defs {
-                        let mut post = op(&format!("Execute stored query '{name}'"), "pure");
-                        if let Some(params) = def.get("params") {
-                            // The same schema enforced before execution.
-                            post["requestBody"] = json!({
-                                "required": true,
-                                "content": { "application/json": { "schema": params } }
-                            });
-                        }
-                        paths.insert(format!("{base}/{name}"), json!({ "post": post }));
-                    }
-                }
+                // A store of executable specs: container listings share the
+                // store shape; children are query specs (POST executes).
+                paths.insert(
+                    format!("{base}/"),
+                    json!({ "$ref": "#/components/pathItems/StoreContainer" }),
+                );
+                paths.insert(
+                    format!("{base}/{{queryPath}}"),
+                    json!({ "$ref": "#/components/pathItems/QueryChild" }),
+                );
             }
             "auth" => {
                 paths.insert(format!("{base}/login"), json!({
@@ -332,6 +364,13 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     "post": op("Upsert and return the stored representation (stores with the 'echo' facet)", "unsafe"),
                     "patch": op("JSON merge-patch (stores with the 'patch' facet)", "unsafe"),
                     "delete": op("Delete the resource", "idempotent"),
+                },
+                // store-view: children are executable specs.
+                "QueryChild": {
+                    "get": op("Read the stored query envelope ({language?, query, params?, output?})", "pure"),
+                    "put": op("Author/replace the query envelope (validated at write time)", "idempotent"),
+                    "post": op("Execute: body = params object (or array for $0…); extra path segments append positional params; results page with X-Total-Count", "pure"),
+                    "delete": op("Delete the stored query", "idempotent"),
                 }
             },
             "responses": {

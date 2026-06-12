@@ -36,6 +36,8 @@ fn catalogue() -> serde_json::Value {
             { "name": "pipeline", "description": "Pipeline-as-a-service (PRD §10.3)",
               "configSchema": { "type": "object", "required": ["pipeline"], "properties": {
                   "pipeline": {}, "retry": { "type": "object" } } } },
+            { "name": "query", "description": "Stored parameterized queries, authored like files: PUT an envelope {language?, query, params?, output?}, POST to execute (PRD §10.4)",
+              "configSchema": { "type": "object", "properties": {} } },
             { "name": "auth", "description": "Authentication & RBAC (PRD §10.5)",
               "configSchema": { "type": "object", "properties": {
                   "userDataset": { "type": "string" } } } },

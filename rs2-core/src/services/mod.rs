@@ -9,6 +9,7 @@ mod data;
 mod file;
 mod pipeline_service;
 mod query;
+pub mod query_template;
 mod services_config;
 
 pub use auth::AuthService;
@@ -16,7 +17,7 @@ pub use code::CodeService;
 pub use data::DataService;
 pub use file::FileService;
 pub use pipeline_service::PipelineService;
-pub use query::QueryService;
+pub use query::{QueryService, QUERY_PREFIX};
 pub use services_config::ServicesService;
 
 use std::sync::Arc;

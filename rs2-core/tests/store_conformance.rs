@@ -49,7 +49,8 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
     );
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
         { "path": "/files", "service": "file" },
-        { "path": "/data", "service": "data" }
+        { "path": "/data", "service": "data" },
+        { "path": "/q", "service": "query" }
     ]})));
     Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
 }
@@ -178,6 +179,18 @@ async fn data_service_satisfies_the_store_contract() {
     let rt = rt(dir.path());
     assert_store_contract(&rt, "/data", "/things", |i| {
         Body::from_json(&json!({ "n": i }))
+    })
+    .await;
+}
+
+/// The query mount is a store of executable specs (v1's store-view): the
+/// authoring surface satisfies the same contract as file and data.
+#[tokio::test]
+async fn query_service_satisfies_the_store_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt(dir.path());
+    assert_store_contract(&rt, "/q", "/reports", |i| {
+        Body::from_json(&json!({ "query": { "dataset": "orders", "v": i } }))
     })
     .await;
 }

@@ -45,19 +45,7 @@ fn surface_config() -> serde_json::Value {
     json!({
         "mounts": [
             { "path": "/data", "service": "data" },
-            { "path": "/q", "service": "query", "config": {
-                "x-expose": ["mcp"],
-                "queries": {
-                    "open-orders": {
-                        "query": { "dataset": "orders",
-                                   "where": { "status": "${status}", "total": { "op": ">=", "value": "${min}" } },
-                                   "orderBy": "total" },
-                        "params": { "type": "object", "required": ["status", "min"],
-                                    "properties": { "status": { "type": "string" },
-                                                    "min": { "type": "number" } } }
-                    }
-                }
-            } },
+            { "path": "/q", "service": "query", "config": { "x-expose": ["mcp"] } },
             { "path": "/summary", "service": "pipeline", "config": {
                 "x-agent": { "kind": "action", "safe": true },
                 "pipeline": [ "GET /data/orders/${id}", { "status": "$.status" } ]
@@ -106,29 +94,75 @@ async fn seed_orders(rt: &Runtime) {
 // query service (PRD §10.4)
 // ---------------------------------------------------------------------------
 
+/// The envelope used across the query tests: structural `${...}` params,
+/// a schema with a default, and an optional clause.
+fn open_orders_envelope() -> serde_json::Value {
+    json!({
+        "query": { "dataset": "orders",
+                   "where": { "status": "${status}",
+                              "total": { "op": ">=", "value": "${min}" },
+                              "name": "${name?}" },
+                   "orderBy": "total" },
+        "params": { "type": "object", "required": ["status"],
+                    "properties": { "status": { "type": "string" },
+                                    "min": { "type": "number", "default": 0 },
+                                    "name": { "type": "string" } } },
+        "output": { "type": "array" }
+    })
+}
+
 #[tokio::test]
-async fn query_service_executes_validated_stored_queries() {
+async fn query_store_authors_validates_and_executes() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt_with(dir.path(), surface_config());
     seed_orders(&rt).await;
 
-    // Valid parameters → filtered, ordered, counted results.
+    // Authoring is a store write: invalid envelopes are refused at PUT time.
+    let bad = req(Method::PUT, "/q/open-orders").with_json(&json!({ "notquery": 1 }));
+    assert_eq!(rt.handle(bad).await.status, Some(StatusCode::BAD_REQUEST));
+    let bad_schema = req(Method::PUT, "/q/open-orders")
+        .with_json(&json!({ "query": {}, "params": { "type": 42 } }));
+    assert_eq!(rt.handle(bad_schema).await.status, Some(StatusCode::BAD_REQUEST));
+
+    // PUT the spec like a file; read it back; it lists as a store child.
+    let put = req(Method::PUT, "/q/open-orders").with_json(&open_orders_envelope());
+    let resp = rt.handle(put).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED));
+    assert!(resp.header("etag").is_some());
+    let mut read = rt.handle(req(Method::GET, "/q/open-orders")).await;
+    assert_eq!(body_json(&mut read).await["query"]["dataset"], "orders");
+    let mut listing = rt.handle(req(Method::GET, "/q/")).await;
+    let listing = body_json(&mut listing).await;
+    assert!(
+        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "open-orders"),
+        "{listing}"
+    );
+
+    // Execute: schema default applies (min → 0) and the optional `name`
+    // clause elides when the param is absent.
     let mut resp = rt
-        .handle(req(Method::POST, "/q/open-orders").with_json(&json!({
-            "status": "open", "min": 5
-        })))
+        .handle(req(Method::POST, "/q/open-orders").with_json(&json!({ "status": "open" })))
         .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     assert_eq!(resp.header("x-total-count"), Some("2"));
     let rows = body_json(&mut resp).await;
     let totals: Vec<f64> =
         rows.as_array().unwrap().iter().map(|r| r["total"].as_f64().unwrap()).collect();
-    assert_eq!(totals, vec![10.0, 50.0], "orderBy applied");
+    assert_eq!(totals, vec![10.0, 50.0], "orderBy applied; default min=0 applied");
+
+    // Explicit min narrows; numbers stay numbers (structural substitution).
+    let mut resp = rt
+        .handle(req(Method::POST, "/q/open-orders").with_json(&json!({
+            "status": "open", "min": 20
+        })))
+        .await;
+    assert_eq!(resp.header("x-total-count"), Some("1"));
+    assert_eq!(body_json(&mut resp).await[0]["total"], 50.0);
 
     // Pagination caps results but keeps the true total.
     let mut page = rt
         .handle(req(Method::POST, "/q/open-orders?$take=1").with_json(&json!({
-            "status": "open", "min": 0
+            "status": "open"
         })))
         .await;
     assert_eq!(page.header("x-total-count"), Some("2"));
@@ -144,9 +178,53 @@ async fn query_service_executes_validated_stored_queries() {
     assert!(problem["errors"].as_array().is_some_and(|e| !e.is_empty()));
 
     // Unknown stored query → 404.
-    let missing =
-        rt.handle(req(Method::POST, "/q/nope").with_json(&json!({}))).await;
+    let missing = rt.handle(req(Method::POST, "/q/nope").with_json(&json!({}))).await;
     assert_eq!(missing.status, Some(StatusCode::NOT_FOUND));
+
+    // DELETE removes it like a file.
+    assert_eq!(
+        rt.handle(req(Method::DELETE, "/q/open-orders")).await.status,
+        Some(StatusCode::NO_CONTENT)
+    );
+    assert_eq!(
+        rt.handle(req(Method::GET, "/q/open-orders")).await.status,
+        Some(StatusCode::NOT_FOUND)
+    );
+}
+
+#[tokio::test]
+async fn query_positional_url_params_and_sql_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), surface_config());
+    seed_orders(&rt).await;
+
+    // Positional params: trailing URL segments beyond the stored spec
+    // become "0", "1", … (v1's subpath params, no silent failures).
+    let by_status = json!({
+        "query": { "dataset": "orders", "where": { "status": "${0}" } }
+    });
+    let put = req(Method::PUT, "/q/orders/by-status").with_json(&by_status);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED), "nested spec path");
+    let mut resp = rt.handle(req(Method::POST, "/q/orders/by-status/closed")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
+    assert_eq!(resp.header("x-total-count"), Some("1"));
+    assert_eq!(body_json(&mut resp).await[0]["total"], 99.0);
+
+    // A missing positional is a 400, never a silent empty string.
+    let missing = rt.handle(req(Method::POST, "/q/orders/by-status")).await;
+    assert_eq!(missing.status, Some(StatusCode::BAD_REQUEST));
+
+    // String-language (SQL) templates store fine but pass through to the
+    // adapter unsubstituted — the reference adapter declines them.
+    let sql = json!({ "language": "sql", "query": "SELECT * FROM orders WHERE status = ${status}" });
+    assert_eq!(
+        rt.handle(req(Method::PUT, "/q/sql-orders").with_json(&sql)).await.status,
+        Some(StatusCode::CREATED)
+    );
+    let resp = rt
+        .handle(req(Method::POST, "/q/sql-orders").with_json(&json!({ "status": "open" })))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::NOT_IMPLEMENTED), "reference adapter is JSON-only");
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +235,10 @@ async fn query_service_executes_validated_stored_queries() {
 async fn discovery_surface_filters_and_advertises() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt_with(dir.path(), surface_config());
+
+    // Stored queries surface from the store, not config: author one first.
+    let put = req(Method::PUT, "/q/open-orders").with_json(&open_orders_envelope());
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
 
     // /services catalogue: anonymous caller sees readable mounts only —
     // /secret (readRoles: "A") is filtered out.
@@ -189,20 +271,22 @@ async fn discovery_surface_filters_and_advertises() {
     let doc = body_json(&mut mcp).await;
     assert_eq!(doc["queries"].as_array().unwrap().len(), 1);
 
-    // OpenAPI 3.1: generated paths + the problem schema; the stored query's
-    // param schema is the request body schema (no drift by construction).
+    // OpenAPI 3.1: generated paths + the problem schema; store-patterned
+    // mounts reference one shared shape (client polymorphism), and the
+    // query mount's children share the QueryChild shape (POST executes).
     let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
     let doc = body_json(&mut openapi).await;
     assert_eq!(doc["openapi"], "3.1.0");
-    // Store-patterned mounts reference one shared shape (client polymorphism).
     assert_eq!(
         doc["paths"]["/data/{dataset}/{key}"]["$ref"],
         "#/components/pathItems/StoreChild"
     );
     assert!(doc["components"]["pathItems"]["StoreContainer"]["get"].is_object());
-    let query_body =
-        &doc["paths"]["/q/open-orders"]["post"]["requestBody"]["content"]["application/json"]["schema"];
-    assert_eq!(query_body["required"][0], "status");
+    assert_eq!(
+        doc["paths"]["/q/{queryPath}"]["$ref"],
+        "#/components/pathItems/QueryChild"
+    );
+    assert!(doc["components"]["pathItems"]["QueryChild"]["post"].is_object());
     assert!(doc["components"]["schemas"]["Problem"].is_object());
 
     // The surface is read-only.
