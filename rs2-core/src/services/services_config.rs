@@ -33,11 +33,13 @@ fn catalogue() -> serde_json::Value {
             { "name": "data", "description": "Schema-validated JSON store (PRD §10.2)",
               "configSchema": { "type": "object", "properties": {
                   "enforceSchema": { "type": "boolean" } } } },
-            { "name": "pipeline", "description": "Pipeline-as-a-service (PRD §10.3)",
-              "configSchema": { "type": "object", "required": ["pipeline"], "properties": {
-                  "pipeline": {}, "retry": { "type": "object" } } } },
-            { "name": "query", "description": "Stored parameterized queries, authored like files: PUT an envelope {language?, query, params?, output?}, POST to execute (PRD §10.4)",
-              "configSchema": { "type": "object", "properties": {} } },
+            { "name": "pipeline", "description": "Pipeline store (PRD §10.3): PUT spec envelopes to /<mount>/.pipelines/<name> (.root governs the mount root); every other path on any verb executes the longest-prefix match",
+              "configSchema": { "type": "object", "properties": {
+                  "retry": { "type": "object" },
+                  "store": { "type": "object", "properties": { "root": { "type": "string" } } } } } },
+            { "name": "query", "description": "Stored parameterized queries (PRD §10.4): PUT envelopes {language?, query, params?, output?} to /<mount>/.queries/<name>; any verb elsewhere executes the longest-prefix match",
+              "configSchema": { "type": "object", "properties": {
+                  "store": { "type": "object", "properties": { "root": { "type": "string" } } } } } },
             { "name": "auth", "description": "Authentication & RBAC (PRD §10.5)",
               "configSchema": { "type": "object", "properties": {
                   "userDataset": { "type": "string" } } } },

@@ -73,12 +73,7 @@ fn demo_config() -> serde_json::Value {
             { "path": "/auth", "service": "auth" },
             { "path": "/admin", "service": "file",
               "config": { "access": { "readRoles": "all", "writeRoles": "A" } } },
-            { "path": "/order-summary", "service": "pipeline", "config": {
-                "pipeline": [
-                    "GET /data/orders/${id} :$order",
-                    { "total": "$sum($order.lines.price)", "status": "$order.status" }
-                ]
-            } },
+            { "path": "/order-summary", "service": "pipeline" },
             { "path": "/services", "service": "services",
               "config": { "access": { "readRoles": "all", "writeRoles": "A" } } }
         ]
@@ -96,6 +91,17 @@ fn demo_runtime(file_root: &std::path::Path) -> Arc<Runtime> {
 
 fn req(method: Method, path: &str) -> Message {
     Message::request(method, path, "demo")
+}
+
+/// Author the demo pipeline (string DSL envelope) as the mount-root spec.
+async fn author_order_summary(rt: &Runtime) {
+    let envelope = json!({ "pipeline": [
+        "GET /data/orders/${id} :$order",
+        { "total": "$sum($order.lines.price)", "status": "$order.status" }
+    ]});
+    let put = req(Method::PUT, "/order-summary/.pipelines/.root").with_json(&envelope);
+    let resp = rt.handle(put).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
@@ -118,21 +124,29 @@ async fn demo_tenant_pipeline_runs_end_to_end() {
     }));
     assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED));
 
-    // The pipeline (written in the string DSL): fetch the order into a
-    // variable, then a JSONata transform builds the summary.
+    // Author the pipeline like a file (the .root spec governs the mount),
+    // then plain GET executes it — verb passthrough intact.
+    author_order_summary(&rt).await;
     let mut resp = rt.handle(req(Method::GET, "/order-summary?id=o1")).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     let summary = body_json(&mut resp).await;
     assert_eq!(summary["total"].as_f64(), Some(7.0), "{summary}");
     assert_eq!(summary["status"], "open");
 
-    // ?$plan introspection: the transform forces a segment boundary.
-    let mut plan_resp = rt.handle(req(Method::GET, "/order-summary?$plan")).await;
+    // ?$plan introspection on the authoring path: the transform forces a
+    // segment boundary, and the stored form is typed (DSL canonicalized).
+    let mut plan_resp =
+        rt.handle(req(Method::GET, "/order-summary/.pipelines/.root?$plan")).await;
     assert_eq!(plan_resp.status, Some(StatusCode::OK));
     let plan = body_json(&mut plan_resp).await;
     let segments = plan["plan"]["segments"].as_array().unwrap();
     assert_eq!(segments.len(), 2, "call | transform = two segments: {plan}");
     assert!(plan["pipeline"]["steps"][0]["call"].is_object(), "stored form is typed: {plan}");
+
+    // The .root spec governs every subpath of the mount (wrap-the-mount):
+    // arbitrary deeper paths still execute it, verb and URL intact.
+    let wrapped = rt.handle(req(Method::GET, "/order-summary/any/deeper/path?id=o1")).await;
+    assert_eq!(wrapped.status, Some(StatusCode::OK), "{:?}", wrapped.body);
 }
 
 #[tokio::test]
@@ -261,7 +275,7 @@ async fn self_config_hot_reload_swaps_atomically() {
     put.set_header("authorization", &bearer);
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::BAD_REQUEST));
     assert_eq!(
-        rt.handle(req(Method::GET, "/order-summary?$plan")).await.status,
+        rt.handle(req(Method::GET, "/order-summary/.pipelines/")).await.status,
         Some(StatusCode::OK),
         "running tenant untouched after invalid PUT"
     );
@@ -433,6 +447,7 @@ async fn g7_pipeline_dispatch_benchmark() {
         "lines": [ { "price": 1.0 } ]
     }));
     assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED));
+    author_order_summary(&rt).await;
 
     // Warm the tenant + pipeline plan.
     let _ = rt.handle(req(Method::GET, "/order-summary?id=o1")).await;

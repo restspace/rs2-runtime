@@ -129,6 +129,44 @@ impl QueryEnvelope {
     }
 }
 
+/// Parse query-string pairs into params, coerced to the params schema's
+/// declared property types (`number`/`integer`/`boolean` parse; everything
+/// else stays a string; unparseable values stay strings so schema
+/// validation reports them). `$`-prefixed keys (`$take`, `$skip`, …) are
+/// runtime controls, not params.
+pub fn url_params(query: &str, schema: Option<&Value>) -> Map<String, Value> {
+    let props = schema.and_then(|s| s.get("properties")).and_then(|p| p.as_object());
+    let mut out = Map::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k.starts_with('$') {
+            continue;
+        }
+        let key = percent_encoding::percent_decode_str(k)
+            .decode_utf8_lossy()
+            .replace('+', " ");
+        let raw = percent_encoding::percent_decode_str(v)
+            .decode_utf8_lossy()
+            .replace('+', " ");
+        let declared = props
+            .and_then(|p| p.get(&key))
+            .and_then(|prop| prop.get("type"))
+            .and_then(|t| t.as_str());
+        let value = match declared {
+            Some("number") => raw.parse::<f64>().map(Value::from).unwrap_or(Value::String(raw)),
+            Some("integer") => raw.parse::<i64>().map(Value::from).unwrap_or(Value::String(raw)),
+            Some("boolean") => match raw.as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => Value::String(raw),
+            },
+            _ => Value::String(raw),
+        };
+        out.insert(key, value);
+    }
+    out
+}
+
 /// One placeholder: `${name}` / `${name?}` / `$0`.
 struct Placeholder {
     name: String,
@@ -378,6 +416,23 @@ mod tests {
             substitute_json(&template, &params(json!({ "who": "ada", "0": "seven" })), &q).unwrap();
         assert_eq!(out["q"], "name:ada AND idx-seven");
         assert_eq!(out["plain"], "$ 5 cost", "a bare $ is not a placeholder");
+    }
+
+    #[test]
+    fn url_params_coerce_to_schema_types() {
+        let schema = json!({ "properties": {
+            "min": { "type": "number" }, "n": { "type": "integer" },
+            "active": { "type": "boolean" }, "name": { "type": "string" } } });
+        let out = url_params("min=2.5&n=7&active=true&name=a+b%21&$take=5&loose=x", Some(&schema));
+        assert_eq!(out["min"], json!(2.5));
+        assert_eq!(out["n"], json!(7));
+        assert_eq!(out["active"], json!(true));
+        assert_eq!(out["name"], "a b!");
+        assert_eq!(out["loose"], "x", "undeclared params stay strings");
+        assert!(!out.contains_key("$take"), "$-controls are not params");
+        // Unparseable values stay strings for the validator to report.
+        let out = url_params("min=notanumber", Some(&schema));
+        assert_eq!(out["min"], "notanumber");
     }
 
     #[test]

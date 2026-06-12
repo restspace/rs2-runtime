@@ -155,9 +155,23 @@ M2 deviations (tracked):
 ## M3 status (PRD §16, "Surface & migration")
 
 Done:
+- **`pipeline` + `query` are spec stores** (v1's store-transform/store-view
+  patterns): authoring is a full store-contract surface under the reserved
+  dot-subtree (`/<mount>/.pipelines/…`, `/<mount>/.queries/…` — guard with
+  `manageRoles`); every other path on **any HTTP verb** executes the
+  longest-prefix-matched spec, with a `.root` spec governing the mount root
+  (so a pipeline can transparently wrap another service — the reason verbs
+  pass through; replaces v1's modal manage header). DRY by construction:
+  the `SpecStore` façade owns a real `FileService` and delegates (validate
+  → canonicalize → forward), with `PrefixedFileStore` as the seam where
+  per-store named infra (PRD §9.1) plugs in later
+  (`"store": {"root"}` today). The instruction plane of a tenant is now
+  exactly: tenant config + `.rs2-code/` + `.rs2-pipelines/` +
+  `.rs2-queries/` — mechanically extractable for git change control.
 - **`query` service** (PRD §10.4): stored queries **authored like files**
-  (v1's store-view pattern — `PUT` an envelope, `POST` to execute, no
-  tenant-config round trip), language-agnostic by design: JSON templates
+  (no tenant-config round trip), executable on any verb (query-string
+  params coerce to the params schema's types), language-agnostic by
+  design: JSON templates
   (Mongo aggregates, Elastic DSL, the reference adapter) substitute
   **structurally** — `"${name}"` nodes take the param's JSON value, so
   templates are valid JSON at rest and injection-safe by construction;

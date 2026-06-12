@@ -11,13 +11,14 @@ mod pipeline_service;
 mod query;
 pub mod query_template;
 mod services_config;
+pub mod spec_store;
 
 pub use auth::AuthService;
 pub use code::CodeService;
 pub use data::DataService;
 pub use file::FileService;
-pub use pipeline_service::PipelineService;
-pub use query::{QueryService, QUERY_PREFIX};
+pub use pipeline_service::{PipelineService, PIPELINE_PREFIX, PIPELINE_SUBTREE};
+pub use query::{QueryService, QUERY_PREFIX, QUERY_SUBTREE};
 pub use services_config::ServicesService;
 
 use std::sync::Arc;

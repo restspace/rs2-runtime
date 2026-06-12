@@ -130,6 +130,61 @@ impl ScopedQueryStore {
     }
 }
 
+/// A [`FileStore`] decorator that roots every call under a path prefix.
+/// The seam for spec stores (and, later, per-store named infra): the
+/// wrapped consumer stays oblivious to where its files actually live.
+pub struct PrefixedFileStore {
+    inner: Arc<dyn FileStore>,
+    prefix: String,
+}
+
+impl PrefixedFileStore {
+    pub fn new(inner: Arc<dyn FileStore>, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        PrefixedFileStore { inner, prefix: prefix.trim_matches('/').to_string() }
+    }
+
+    fn join(&self, path: &str) -> String {
+        let rel = path.trim_start_matches('/');
+        if rel.is_empty() {
+            format!("/{}", self.prefix)
+        } else {
+            format!("/{}/{rel}", self.prefix)
+        }
+    }
+}
+
+#[async_trait]
+impl FileStore for PrefixedFileStore {
+    async fn head(&self, tenant: &str, path: &str) -> Result<FileMeta, RsError> {
+        self.inner.head(tenant, &self.join(path)).await
+    }
+
+    async fn read(&self, tenant: &str, path: &str, range: Option<ByteRange>) -> Result<Body, RsError> {
+        self.inner.read(tenant, &self.join(path), range).await
+    }
+
+    async fn write(&self, tenant: &str, path: &str, body: Body) -> Result<bool, RsError> {
+        self.inner.write(tenant, &self.join(path), body).await
+    }
+
+    async fn delete(&self, tenant: &str, path: &str) -> Result<(), RsError> {
+        self.inner.delete(tenant, &self.join(path)).await
+    }
+
+    async fn delete_dir(&self, tenant: &str, path: &str) -> Result<(), RsError> {
+        self.inner.delete_dir(tenant, &self.join(path)).await
+    }
+
+    async fn delete_dir_all(&self, tenant: &str, path: &str) -> Result<(), RsError> {
+        self.inner.delete_dir_all(tenant, &self.join(path)).await
+    }
+
+    async fn list(&self, tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
+        self.inner.list(tenant, &self.join(path), take, skip).await
+    }
+}
+
 /// A [`FileStore`] handle pre-scoped to one tenant — the only form services see.
 #[derive(Clone)]
 pub struct ScopedFileStore {

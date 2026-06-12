@@ -14,8 +14,6 @@ use serde_json::{json, Map, Value};
 
 use crate::error::RsError;
 use crate::message::Message;
-use crate::pipeline::PipelineSpec;
-use crate::retry::EffectClass;
 use crate::router::Mount;
 use crate::tenant::Tenant;
 use crate::wrapper::check_access;
@@ -57,13 +55,15 @@ pub async fn handle(tenant: &Tenant, msg: Message) -> Result<Message, RsError> {
     Ok(msg.ok_json(&doc))
 }
 
-/// Stored query specs for a query mount (top-level, capped): each entry's
-/// envelope contributes its `params`/`output` schemas to the surface.
-async fn stored_queries(tenant: &Tenant, mount: &Mount) -> Vec<(String, Value)> {
+/// Stored specs for a spec-store mount (top-level, capped): each entry's
+/// envelope contributes its schemas/metadata to the surface. Respects the
+/// mount's `"store": {"root"}` override via [`spec_store::store_root`].
+async fn stored_specs(tenant: &Tenant, mount: &Mount, kind_prefix: &str) -> Vec<(String, Value)> {
     let Some((_, ctx)) = tenant.instance(&mount.base_path) else { return vec![] };
     let Some(files) = &ctx.files else { return vec![] };
-    let prefix = format!("{}{}", crate::services::QUERY_PREFIX, mount.base_path);
-    let Ok((entries, _)) = files.list(&format!("{prefix}/"), 100, 0).await else {
+    let root =
+        crate::services::spec_store::store_root(kind_prefix, &mount.base_path, &mount.config);
+    let Ok((entries, _)) = files.list(&format!("{root}/"), 100, 0).await else {
         return vec![];
     };
     let mut out = Vec::new();
@@ -72,7 +72,7 @@ async fn stored_queries(tenant: &Tenant, mount: &Mount) -> Vec<(String, Value)> 
             continue;
         }
         let name = entry.name.clone();
-        let Ok(mut body) = files.read(&format!("{prefix}/{name}"), None).await else { continue };
+        let Ok(mut body) = files.read(&format!("{root}/{name}"), None).await else { continue };
         let Ok(bytes) = body.materialize(1024 * 1024).await else { continue };
         if let Ok(doc) = serde_json::from_slice::<Value>(bytes) {
             out.push((name, doc));
@@ -127,8 +127,8 @@ fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
     match mount.service.as_str() {
         "file" => ("store", vec!["range", "confirm-delete"]),
         "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
-        "pipeline" => ("transform", vec![]),
-        "query" => ("store-view", vec!["positional-params"]),
+        "pipeline" => ("store-transform", vec!["any-verb"]),
+        "query" => ("store-view", vec!["positional-params", "url-params", "any-verb"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),
@@ -190,29 +190,40 @@ async fn agent_surface_doc(
                 entities.push(with_pattern(entry, mount));
             }
             "pipeline" => {
-                let effect = mount
-                    .config
-                    .get("effect")
-                    .cloned()
-                    .unwrap_or(json!("unsafe"));
-                let mut entry = json!({
-                    "path": base,
-                    "kind": "action",
-                    "effect": effect,
-                    "plan": format!("{base}?$plan"),
-                    "idempotency": { "header": "Idempotency-Key", "honored": true },
-                });
-                for (k, v) in meta(mount) {
-                    entry[k] = v;
+                for (name, doc) in
+                    stored_specs(tenant, mount, crate::services::PIPELINE_PREFIX).await
+                {
+                    // `.root` governs the mount root itself.
+                    let exec_path = if name == crate::services::spec_store::ROOT_SPEC {
+                        base.to_string()
+                    } else {
+                        format!("{base}/{name}")
+                    };
+                    let mut entry = json!({
+                        "path": exec_path,
+                        "kind": "action",
+                        "effect": doc.get("effect").cloned().unwrap_or(json!("unsafe")),
+                        "plan": format!("{base}/{}/{name}?$plan", crate::services::PIPELINE_SUBTREE),
+                        "idempotency": { "header": "Idempotency-Key", "honored": true },
+                    });
+                    // Envelope metadata wins over mount metadata.
+                    for (k, v) in meta(mount) {
+                        entry[k] = v.clone();
+                    }
+                    for key in ["x-agent", "x-policy", "description"] {
+                        if let Some(v) = doc.get(key) {
+                            entry[key] = v.clone();
+                        }
+                    }
+                    actions.push(with_pattern(entry, mount));
                 }
-                actions.push(with_pattern(entry, mount));
             }
             "query" => {
-                for (name, doc) in stored_queries(tenant, mount).await {
+                for (name, doc) in stored_specs(tenant, mount, crate::services::QUERY_PREFIX).await
+                {
                     let mut entry = json!({
                         "path": format!("{base}/{name}"),
                         "kind": "query",
-                        "method": "POST",
                         "effect": "pure",
                         "params": doc.get("params").cloned().unwrap_or(json!({})),
                     });
@@ -278,39 +289,49 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     }),
                 );
             }
+            // Spec-store mounts: authoring under the reserved dot-subtree
+            // shares the store shape; everything else executes.
             "pipeline" => {
-                // The mounted pipeline spec drives the doc; the segment plan
-                // is linked, not inlined.
-                let effect = mount
-                    .config
-                    .get("pipeline")
-                    .and_then(|p| PipelineSpec::from_value(p).ok())
-                    .map(|spec| {
-                        let has_unsafe = spec
-                            .steps
-                            .iter()
-                            .any(|s| s.effect_class() == Some(EffectClass::Unsafe));
-                        if has_unsafe { "unsafe" } else { "idempotent" }
-                    })
-                    .unwrap_or("unsafe");
+                let subtree = crate::services::PIPELINE_SUBTREE;
                 paths.insert(
-                    base.clone(),
+                    format!("{base}/{subtree}/"),
+                    json!({ "$ref": "#/components/pathItems/StoreContainer" }),
+                );
+                paths.insert(
+                    format!("{base}/{subtree}/{{specPath}}"),
+                    json!({ "$ref": "#/components/pathItems/SpecChild" }),
+                );
+                paths.insert(
+                    format!("{base}/{{path}}"),
                     json!({
-                        "get": op("Run the pipeline", effect),
-                        "post": op("Run the pipeline with a body", effect),
+                        "description": "Execute the longest-prefix-matched stored pipeline \
+                                        (.root governs the mount root). All HTTP verbs pass \
+                                        through to the pipeline.",
+                        "get": op("Run the matched stored pipeline", "unsafe"),
+                        "post": op("Run the matched stored pipeline with a body", "unsafe"),
                     }),
                 );
             }
             "query" => {
-                // A store of executable specs: container listings share the
-                // store shape; children are query specs (POST executes).
+                let subtree = crate::services::QUERY_SUBTREE;
                 paths.insert(
-                    format!("{base}/"),
+                    format!("{base}/{subtree}/"),
                     json!({ "$ref": "#/components/pathItems/StoreContainer" }),
                 );
                 paths.insert(
+                    format!("{base}/{subtree}/{{specPath}}"),
+                    json!({ "$ref": "#/components/pathItems/SpecChild" }),
+                );
+                paths.insert(
                     format!("{base}/{{queryPath}}"),
-                    json!({ "$ref": "#/components/pathItems/QueryChild" }),
+                    json!({
+                        "description": "Execute the longest-prefix-matched stored query; \
+                                        extra path segments append positional params; params \
+                                        come from the query string (schema-coerced) and/or a \
+                                        JSON body; results page with X-Total-Count.",
+                        "get": op("Execute the stored query (params from the query string)", "pure"),
+                        "post": op("Execute the stored query (params from the body)", "pure"),
+                    }),
                 );
             }
             "auth" => {
@@ -365,12 +386,12 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     "patch": op("JSON merge-patch (stores with the 'patch' facet)", "unsafe"),
                     "delete": op("Delete the resource", "idempotent"),
                 },
-                // store-view: children are executable specs.
-                "QueryChild": {
-                    "get": op("Read the stored query envelope ({language?, query, params?, output?})", "pure"),
-                    "put": op("Author/replace the query envelope (validated at write time)", "idempotent"),
-                    "post": op("Execute: body = params object (or array for $0…); extra path segments append positional params; results page with X-Total-Count", "pure"),
-                    "delete": op("Delete the stored query", "idempotent"),
+                // Spec stores: children under the authoring dot-subtree
+                // (.pipelines/, .queries/) are validated documents.
+                "SpecChild": {
+                    "get": op("Read the stored spec envelope (pipelines: ?$plan returns the segment plan)", "pure"),
+                    "put": op("Author/replace the spec (validated and canonicalized at write time)", "idempotent"),
+                    "delete": op("Delete the stored spec", "idempotent"),
                 }
             },
             "responses": {

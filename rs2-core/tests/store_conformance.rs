@@ -50,7 +50,8 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
         { "path": "/files", "service": "file" },
         { "path": "/data", "service": "data" },
-        { "path": "/q", "service": "query" }
+        { "path": "/q", "service": "query" },
+        { "path": "/pipes", "service": "pipeline" }
     ]})));
     Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
 }
@@ -183,14 +184,26 @@ async fn data_service_satisfies_the_store_contract() {
     .await;
 }
 
-/// The query mount is a store of executable specs (v1's store-view): the
-/// authoring surface satisfies the same contract as file and data.
+/// Spec stores' authoring subtrees satisfy the same contract as file and
+/// data — by construction: they delegate to an owned FileService (the
+/// SpecStore façade), so this suite tests one implementation through
+/// several doors.
 #[tokio::test]
-async fn query_service_satisfies_the_store_contract() {
+async fn query_authoring_subtree_satisfies_the_store_contract() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt(dir.path());
-    assert_store_contract(&rt, "/q", "/reports", |i| {
+    assert_store_contract(&rt, "/q/.queries", "/reports", |i| {
         Body::from_json(&json!({ "query": { "dataset": "orders", "v": i } }))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn pipeline_authoring_subtree_satisfies_the_store_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt(dir.path());
+    assert_store_contract(&rt, "/pipes/.pipelines", "/flows", |i| {
+        Body::from_json(&json!({ "pipeline": [ format!("GET /step{i}") ] }))
     })
     .await;
 }

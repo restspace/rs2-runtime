@@ -47,15 +47,9 @@ fn surface_config() -> serde_json::Value {
             { "path": "/data", "service": "data" },
             { "path": "/q", "service": "query", "config": { "x-expose": ["mcp"] } },
             { "path": "/summary", "service": "pipeline", "config": {
-                "x-agent": { "kind": "action", "safe": true },
-                "pipeline": [ "GET /data/orders/${id}", { "status": "$.status" } ]
+                "x-agent": { "kind": "action", "safe": true }
             } },
-            { "path": "/broken", "service": "pipeline", "config": {
-                "pipeline": { "onFail": "stop", "steps": [
-                    { "call": { "method": "GET", "url": "/data/orders/missing-one" } },
-                    { "transform": { "x": "$" } }
-                ] }
-            } },
+            { "path": "/broken", "service": "pipeline" },
             { "path": "/services", "service": "services" },
             { "path": "/secret", "service": "file",
               "config": { "access": { "readRoles": "A", "writeRoles": "A" } } }
@@ -78,6 +72,19 @@ fn req(method: Method, path: &str) -> Message {
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
     msg.body.as_mut().expect("body").as_json(10 * 1024 * 1024).await.expect("json body")
+}
+
+/// Author the two demo pipelines as `.root` specs (one DSL, one typed).
+async fn author_pipelines(rt: &Runtime) {
+    let summary = json!({ "pipeline": [ "GET /data/orders/${id}", { "status": "$.status" } ] });
+    let put = req(Method::PUT, "/summary/.pipelines/.root").with_json(&summary);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
+    let broken = json!({ "pipeline": { "onFail": "stop", "steps": [
+        { "call": { "method": "GET", "url": "/data/orders/missing-one" } },
+        { "transform": { "x": "$" } }
+    ] } });
+    let put = req(Method::PUT, "/broken/.pipelines/.root").with_json(&broken);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
 }
 
 async fn seed_orders(rt: &Runtime) {
@@ -117,21 +124,23 @@ async fn query_store_authors_validates_and_executes() {
     let rt = rt_with(dir.path(), surface_config());
     seed_orders(&rt).await;
 
-    // Authoring is a store write: invalid envelopes are refused at PUT time.
-    let bad = req(Method::PUT, "/q/open-orders").with_json(&json!({ "notquery": 1 }));
+    // Authoring is a store write under the reserved subtree: invalid
+    // envelopes are refused at PUT time.
+    let bad = req(Method::PUT, "/q/.queries/open-orders").with_json(&json!({ "notquery": 1 }));
     assert_eq!(rt.handle(bad).await.status, Some(StatusCode::BAD_REQUEST));
-    let bad_schema = req(Method::PUT, "/q/open-orders")
+    let bad_schema = req(Method::PUT, "/q/.queries/open-orders")
         .with_json(&json!({ "query": {}, "params": { "type": 42 } }));
     assert_eq!(rt.handle(bad_schema).await.status, Some(StatusCode::BAD_REQUEST));
 
     // PUT the spec like a file; read it back; it lists as a store child.
-    let put = req(Method::PUT, "/q/open-orders").with_json(&open_orders_envelope());
+    let put = req(Method::PUT, "/q/.queries/open-orders").with_json(&open_orders_envelope());
     let resp = rt.handle(put).await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED));
-    assert!(resp.header("etag").is_some());
-    let mut read = rt.handle(req(Method::GET, "/q/open-orders")).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
+    let mut read = rt.handle(req(Method::GET, "/q/.queries/open-orders")).await;
+    assert_eq!(read.status, Some(StatusCode::OK));
+    assert!(read.header("etag").is_some(), "FileService ETag on the spec read");
     assert_eq!(body_json(&mut read).await["query"]["dataset"], "orders");
-    let mut listing = rt.handle(req(Method::GET, "/q/")).await;
+    let mut listing = rt.handle(req(Method::GET, "/q/.queries/")).await;
     let listing = body_json(&mut listing).await;
     assert!(
         listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "open-orders"),
@@ -168,6 +177,13 @@ async fn query_store_authors_validates_and_executes() {
     assert_eq!(page.header("x-total-count"), Some("2"));
     assert_eq!(body_json(&mut page).await.as_array().unwrap().len(), 1);
 
+    // Any-verb execution: plain GET with query-string params, coerced to
+    // the schema's declared types (min: number).
+    let mut got = rt.handle(req(Method::GET, "/q/open-orders?status=open&min=20")).await;
+    assert_eq!(got.status, Some(StatusCode::OK), "{:?}", got.body);
+    assert_eq!(got.header("x-total-count"), Some("1"));
+    assert_eq!(body_json(&mut got).await[0]["total"], 50.0);
+
     // Parameters are schema-validated before execution → 422 with details.
     let mut invalid = rt
         .handle(req(Method::POST, "/q/open-orders").with_json(&json!({ "status": 42 })))
@@ -181,13 +197,19 @@ async fn query_store_authors_validates_and_executes() {
     let missing = rt.handle(req(Method::POST, "/q/nope").with_json(&json!({}))).await;
     assert_eq!(missing.status, Some(StatusCode::NOT_FOUND));
 
-    // DELETE removes it like a file.
+    // DELETE removes it like a file; execution then 404s too.
     assert_eq!(
-        rt.handle(req(Method::DELETE, "/q/open-orders")).await.status,
+        rt.handle(req(Method::DELETE, "/q/.queries/open-orders")).await.status,
         Some(StatusCode::NO_CONTENT)
     );
     assert_eq!(
-        rt.handle(req(Method::GET, "/q/open-orders")).await.status,
+        rt.handle(req(Method::GET, "/q/.queries/open-orders")).await.status,
+        Some(StatusCode::NOT_FOUND)
+    );
+    assert_eq!(
+        rt.handle(req(Method::POST, "/q/open-orders").with_json(&json!({ "status": "open" })))
+            .await
+            .status,
         Some(StatusCode::NOT_FOUND)
     );
 }
@@ -203,7 +225,7 @@ async fn query_positional_url_params_and_sql_passthrough() {
     let by_status = json!({
         "query": { "dataset": "orders", "where": { "status": "${0}" } }
     });
-    let put = req(Method::PUT, "/q/orders/by-status").with_json(&by_status);
+    let put = req(Method::PUT, "/q/.queries/orders/by-status").with_json(&by_status);
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED), "nested spec path");
     let mut resp = rt.handle(req(Method::POST, "/q/orders/by-status/closed")).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
@@ -218,7 +240,7 @@ async fn query_positional_url_params_and_sql_passthrough() {
     // adapter unsubstituted — the reference adapter declines them.
     let sql = json!({ "language": "sql", "query": "SELECT * FROM orders WHERE status = ${status}" });
     assert_eq!(
-        rt.handle(req(Method::PUT, "/q/sql-orders").with_json(&sql)).await.status,
+        rt.handle(req(Method::PUT, "/q/.queries/sql-orders").with_json(&sql)).await.status,
         Some(StatusCode::CREATED)
     );
     let resp = rt
@@ -236,9 +258,10 @@ async fn discovery_surface_filters_and_advertises() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt_with(dir.path(), surface_config());
 
-    // Stored queries surface from the store, not config: author one first.
-    let put = req(Method::PUT, "/q/open-orders").with_json(&open_orders_envelope());
+    // Stored specs surface from their stores, not config: author them first.
+    let put = req(Method::PUT, "/q/.queries/open-orders").with_json(&open_orders_envelope());
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
+    author_pipelines(&rt).await;
 
     // /services catalogue: anonymous caller sees readable mounts only —
     // /secret (readRoles: "A") is filtered out.
@@ -255,10 +278,19 @@ async fn discovery_surface_filters_and_advertises() {
     let mut surface = rt.handle(req(Method::GET, "/.well-known/rs2/agent-surface")).await;
     let doc = body_json(&mut surface).await;
     assert_eq!(doc["entities"][0]["path"], "/data");
-    let action = &doc["actions"][0];
-    assert_eq!(action["path"], "/summary");
+    // Stored pipelines list as actions; the .root spec's path is the mount.
+    let action = doc["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["path"] == "/summary")
+        .unwrap_or_else(|| panic!("stored pipeline missing from actions: {doc}"));
     assert_eq!(action["idempotency"]["header"], "Idempotency-Key");
     assert_eq!(action["x-agent"]["kind"], "action");
+    assert!(
+        action["plan"].as_str().unwrap().contains("/.pipelines/.root?$plan"),
+        "{action}"
+    );
     let query = &doc["queries"][0];
     assert_eq!(query["path"], "/q/open-orders");
     assert_eq!(query["params"]["required"][0], "status");
@@ -272,8 +304,8 @@ async fn discovery_surface_filters_and_advertises() {
     assert_eq!(doc["queries"].as_array().unwrap().len(), 1);
 
     // OpenAPI 3.1: generated paths + the problem schema; store-patterned
-    // mounts reference one shared shape (client polymorphism), and the
-    // query mount's children share the QueryChild shape (POST executes).
+    // mounts reference one shared shape (client polymorphism), and spec
+    // stores expose the authoring subtree + an execution path item.
     let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
     let doc = body_json(&mut openapi).await;
     assert_eq!(doc["openapi"], "3.1.0");
@@ -283,10 +315,16 @@ async fn discovery_surface_filters_and_advertises() {
     );
     assert!(doc["components"]["pathItems"]["StoreContainer"]["get"].is_object());
     assert_eq!(
-        doc["paths"]["/q/{queryPath}"]["$ref"],
-        "#/components/pathItems/QueryChild"
+        doc["paths"]["/q/.queries/{specPath}"]["$ref"],
+        "#/components/pathItems/SpecChild"
     );
-    assert!(doc["components"]["pathItems"]["QueryChild"]["post"].is_object());
+    assert_eq!(
+        doc["paths"]["/summary/.pipelines/{specPath}"]["$ref"],
+        "#/components/pathItems/SpecChild"
+    );
+    assert!(doc["paths"]["/q/{queryPath}"]["get"].is_object(), "any-verb query execution");
+    assert!(doc["paths"]["/summary/{path}"]["get"].is_object(), "pipeline execution");
+    assert!(doc["components"]["pathItems"]["SpecChild"]["put"].is_object());
     assert!(doc["components"]["schemas"]["Problem"].is_object());
 
     // The surface is read-only.
@@ -302,6 +340,7 @@ async fn discovery_surface_filters_and_advertises() {
 async fn pipeline_failures_name_the_failing_step() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt_with(dir.path(), surface_config());
+    author_pipelines(&rt).await;
 
     let mut resp = rt.handle(req(Method::GET, "/broken")).await;
     assert_eq!(resp.status, Some(StatusCode::NOT_FOUND), "step failure propagates");

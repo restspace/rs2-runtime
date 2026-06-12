@@ -66,8 +66,10 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
             config.insert("retry".to_string(), retry.clone());
         }
 
-        // Pipelines: convert the string DSL to the typed spec now, so the
-        // migrated config is the stored (validated) form.
+        // Pipelines are stored specs now, not config: convert the string
+        // DSL to the typed envelope and hand it to the user to PUT (a v1
+        // single-pipeline mount maps to the `.root` spec, preserving its
+        // any-verb surface exactly).
         if service == "pipeline" {
             let spec_value = svc
                 .get("pipeline")
@@ -75,10 +77,15 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
             match spec_value {
                 Some(value) => match PipelineSpec::from_value(value) {
                     Ok(spec) => {
-                        config.insert(
-                            "pipeline".to_string(),
-                            serde_json::to_value(&spec).unwrap(),
-                        );
+                        let envelope = serde_json::json!({
+                            "pipeline": serde_json::to_value(&spec).unwrap()
+                        });
+                        warnings.push(format!(
+                            "{base_path}: pipelines are stored specs in RS2 — after deploying \
+                             this config, PUT the converted envelope below to \
+                             {base_path}/.pipelines/.root\n{}",
+                            serde_json::to_string_pretty(&envelope).unwrap()
+                        ));
                     }
                     Err(e) => {
                         warnings.push(format!("{base_path}: pipeline failed conversion: {e}"));

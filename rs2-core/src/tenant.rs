@@ -105,8 +105,38 @@ impl Tenant {
             let service: Arc<dyn Service> = match mount.service.as_str() {
                 "file" => Arc::new(FileService::new()),
                 "data" => Arc::new(DataService::new()),
-                "pipeline" => Arc::new(crate::services::PipelineService::from_config(&mount.config)?),
-                "query" => Arc::new(crate::services::QueryService::from_config(&mount.config)?),
+                "pipeline" => {
+                    let root = crate::services::spec_store::store_root(
+                        crate::services::PIPELINE_PREFIX,
+                        &mount.base_path,
+                        &mount.config,
+                    );
+                    let store = crate::services::spec_store::SpecStore::new(
+                        adapters.files.clone(),
+                        name,
+                        &root,
+                        crate::services::PIPELINE_SUBTREE,
+                        limits.invocation_limits(),
+                        crate::services::PipelineService::validator(),
+                    );
+                    Arc::new(crate::services::PipelineService::from_config(&mount.config, store)?)
+                }
+                "query" => {
+                    let root = crate::services::spec_store::store_root(
+                        crate::services::QUERY_PREFIX,
+                        &mount.base_path,
+                        &mount.config,
+                    );
+                    let store = crate::services::spec_store::SpecStore::new(
+                        adapters.files.clone(),
+                        name,
+                        &root,
+                        crate::services::QUERY_SUBTREE,
+                        limits.invocation_limits(),
+                        crate::services::QueryService::validator(),
+                    );
+                    Arc::new(crate::services::QueryService::from_config(&mount.config, store)?)
+                }
                 "auth" => Arc::new(crate::services::AuthService::from_config(
                     &mount.config,
                     config.auth.as_ref(),
