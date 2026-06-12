@@ -165,6 +165,282 @@ fn restore_at(incoming: &mut serde_json::Value, current: &serde_json::Value) {
     }
 }
 
+impl ServicesService {
+    /// The store-patterned deployed-code subtree (`/<mount>/code/…`).
+    ///
+    /// Store contract mapping: trailing-slash dir+json listings at every
+    /// level (bundle names as directories, versions as children, annotated
+    /// `mountedAt` where the live config references them); GET child reads
+    /// the bundle (ETag = version, immutable caching); **deploy = keyless
+    /// POST to `/code/<name>/`** (the child name derives from content);
+    /// PUT child succeeds only when the name matches the content hash (the
+    /// `content-addressed` facet — idempotent for sync tools, impossible to
+    /// mislabel); DELETE child/container with the usual `?confirm=` guard,
+    /// plus: a version referenced by a live mount cannot be deleted.
+    async fn handle_code_store(
+        &self,
+        mut msg: Message,
+        ctx: &ServiceContext,
+        control: &std::sync::Arc<dyn crate::runtime::TenantControl>,
+        rest: &[&str],
+    ) -> Result<Message, RsError> {
+        let files = ctx
+            .files
+            .as_ref()
+            .ok_or_else(|| RsError::internal("services service has no file capability"))?
+            .prefixed(super::code::CODE_PREFIX);
+
+        // Versions the live config references, per bundle name.
+        let mounted = |config: &serde_json::Value, name: &str| -> Vec<(String, String)> {
+            let wanted = format!("code:{name}@");
+            config
+                .get("mounts")
+                .and_then(|m| m.as_array())
+                .map(|ms| {
+                    ms.iter()
+                        .filter_map(|m| {
+                            let service = m.get("service")?.as_str()?;
+                            let version = service.strip_prefix(wanted.as_str())?;
+                            let path = m.get("path")?.as_str()?;
+                            Some((path.to_string(), version.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        match (&msg.method, rest) {
+            // ---- listings (store contract: dir+json at every level;
+            // one-segment GETs list with or without the trailing slash) ----
+            (&http::Method::GET, []) | (&http::Method::GET, [_]) => {
+                let dir_path = if rest.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}/", rest[0])
+                };
+                let (take, skip) = super::pagination(&msg);
+                let (mut entries, total) = match files.list(&dir_path, take, skip).await {
+                    Ok(listing) => listing,
+                    // An empty store lists as empty, not absent.
+                    Err(e) if e.code == crate::error::codes::NOT_FOUND && rest.is_empty() => {
+                        (vec![], 0)
+                    }
+                    Err(e) if e.code == crate::error::codes::NOT_FOUND => {
+                        return Err(RsError::not_found(format!("no deployed code '{}'", rest[0])))
+                    }
+                    Err(e) => return Err(e),
+                };
+                // Annotate version entries with where the live config
+                // mounts them (extra entry fields are contract-legal).
+                let mut listing_entries: Vec<serde_json::Value> =
+                    entries.drain(..).map(|e| serde_json::to_value(e).unwrap()).collect();
+                if let [name] = rest {
+                    if let Ok((config, _)) = control.raw_config(&msg.tenant).await {
+                        let live = mounted(&config, name);
+                        for entry in &mut listing_entries {
+                            let stem = entry["name"]
+                                .as_str()
+                                .unwrap_or("")
+                                .trim_end_matches(".wasm")
+                                .trim_end_matches(".js")
+                                .to_string();
+                            let at: Vec<&String> = live
+                                .iter()
+                                .filter(|(_, v)| *v == stem)
+                                .map(|(p, _)| p)
+                                .collect();
+                            if !at.is_empty() {
+                                entry["mountedAt"] = serde_json::json!(at);
+                            }
+                        }
+                    }
+                }
+                let listing = serde_json::json!({
+                    "path": dir_path, "entries": listing_entries, "total": total
+                });
+                let mut resp = msg.ok(Some(crate::message::Body::from_bytes(
+                    listing.to_string(),
+                    crate::message::MediaType::dir_json(),
+                )));
+                resp.set_header("x-total-count", &total.to_string());
+                Ok(resp)
+            }
+
+            // ---- read a bundle: immutable per version ----
+            (&http::Method::GET, [name, version]) => {
+                let stem = version.trim_end_matches(".wasm").trim_end_matches(".js");
+                let candidates = [
+                    (format!("/{name}/{version}"), None),
+                    (format!("/{name}/{stem}.wasm"), Some("application/wasm")),
+                    (format!("/{name}/{stem}.js"), Some("application/javascript")),
+                ];
+                for (path, forced_type) in candidates {
+                    if let Ok(mut body) = files.read(&path, None).await {
+                        if let Some(t) = forced_type {
+                            body.media_type = crate::message::MediaType::new(t);
+                        } else {
+                            body.media_type = crate::message::MediaType::for_path(&path);
+                        }
+                        let mut resp = msg.ok(Some(body));
+                        resp.set_header("etag", &format!("\"{stem}\""));
+                        resp.set_header("cache-control", "private, max-age=31536000, immutable");
+                        return Ok(resp);
+                    }
+                }
+                Err(RsError::not_found(format!("no deployed code '{name}@{version}'")))
+            }
+
+            // ---- deploy: keyless POST to a bundle's container ----
+            (&http::Method::POST, [name]) => {
+                let name = name.to_string();
+                if name.is_empty() || name.contains(['/', '\\', '.']) {
+                    return Err(RsError::bad_request("invalid code bundle name"));
+                }
+                let (bytes, is_js, validated) = self.validate_bundle(&mut msg, ctx).await?;
+                let version = super::code::version_of(&bytes);
+                let (child, media_type) = if is_js {
+                    (format!("{version}.js"), "application/javascript")
+                } else {
+                    (format!("{version}.wasm"), "application/wasm")
+                };
+                files
+                    .write(
+                        &format!("/{name}/{child}"),
+                        crate::message::Body::from_bytes(
+                            bytes,
+                            crate::message::MediaType::new(media_type),
+                        ),
+                    )
+                    .await?;
+                let mut resp = msg.response(
+                    http::StatusCode::CREATED,
+                    Some(crate::message::Body::from_json(&serde_json::json!({
+                        "name": name,
+                        "version": version,
+                        "ref": format!("code:{name}@{version}"),
+                        "validated": validated,
+                    }))),
+                );
+                resp.set_header(
+                    "location",
+                    &format!("{}/code/{name}/{child}", msg.url.base_path),
+                );
+                Ok(resp)
+            }
+
+            // ---- PUT child: only at its true content-derived name ----
+            (&http::Method::PUT, [name, version]) => {
+                let (name, version) = (name.to_string(), version.to_string());
+                let stem =
+                    version.trim_end_matches(".wasm").trim_end_matches(".js").to_string();
+                let (bytes, is_js, _) = self.validate_bundle(&mut msg, ctx).await?;
+                let computed = super::code::version_of(&bytes);
+                if computed != stem {
+                    return Err(RsError::conflict(format!(
+                        "versions are content-addressed: these bytes are '{computed}', not \
+                         '{stem}' — POST {}/code/{name}/ to deploy them",
+                        msg.url.base_path
+                    )));
+                }
+                let child = if is_js { format!("{stem}.js") } else { format!("{stem}.wasm") };
+                let created = files
+                    .write(
+                        &format!("/{name}/{child}"),
+                        crate::message::Body::from_bytes(
+                            bytes,
+                            crate::message::MediaType::for_path(&child),
+                        ),
+                    )
+                    .await?;
+                let mut resp = msg.response(
+                    if created { http::StatusCode::CREATED } else { http::StatusCode::OK },
+                    None,
+                );
+                resp.set_header("etag", &format!("\"{stem}\""));
+                Ok(resp)
+            }
+
+            // ---- deletes, guarded by liveness ----
+            (&http::Method::DELETE, [name, version]) => {
+                let stem = version.trim_end_matches(".wasm").trim_end_matches(".js");
+                let (config, _) = control.raw_config(&msg.tenant).await?;
+                let live = mounted(&config, name);
+                if let Some((path, _)) = live.iter().find(|(_, v)| v == stem) {
+                    return Err(RsError::conflict(format!(
+                        "version '{stem}' is mounted at '{path}' — repoint the mount first"
+                    )));
+                }
+                for candidate in [
+                    format!("/{name}/{version}"),
+                    format!("/{name}/{stem}.wasm"),
+                    format!("/{name}/{stem}.js"),
+                ] {
+                    if files.delete(&candidate).await.is_ok() {
+                        return Ok(msg.no_content());
+                    }
+                }
+                Err(RsError::not_found(format!("no deployed code '{name}@{stem}'")))
+            }
+            (&http::Method::DELETE, [name]) => {
+                let (config, _) = control.raw_config(&msg.tenant).await?;
+                let live = mounted(&config, name);
+                if let Some((path, version)) = live.first() {
+                    return Err(RsError::conflict(format!(
+                        "version '{version}' is mounted at '{path}' — repoint the mount first"
+                    )));
+                }
+                if msg.url.query_param("confirm").as_deref() == Some(*name) {
+                    files.delete_dir_all(&format!("/{name}")).await?;
+                } else {
+                    files.delete_dir(&format!("/{name}")).await?;
+                }
+                Ok(msg.no_content())
+            }
+
+            _ => Err(RsError::not_found(
+                "code store: GET listings/bundles, POST <name>/ deploys, PUT <name>/<version> \
+                 (content-addressed), DELETE <name>/<version> | <name>/?confirm=",
+            )),
+        }
+    }
+
+    /// Materialize and smoke-test an uploaded bundle; returns
+    /// (bytes, is_js, validated).
+    async fn validate_bundle(
+        &self,
+        msg: &mut Message,
+        ctx: &ServiceContext,
+    ) -> Result<(bytes::Bytes, bool, bool), RsError> {
+        let is_js = msg
+            .body
+            .as_ref()
+            .map(|b| b.media_type.essence().contains("javascript"))
+            .unwrap_or(false);
+        let bytes = match &mut msg.body {
+            Some(b) => b.materialize(ctx.limits.materialized_body_bytes).await?.clone(),
+            None => return Err(RsError::bad_request("deploying requires a bundle body")),
+        };
+        #[allow(unused_mut, unused_assignments)]
+        let mut validated = false;
+        if is_js {
+            #[cfg(feature = "js")]
+            {
+                let source = std::str::from_utf8(&bytes)
+                    .map_err(|_| RsError::bad_request("JS bundle is not valid UTF-8"))?;
+                crate::engines::js::JsEngine::new().compile_check(source)?;
+                validated = true;
+            }
+        } else {
+            #[cfg(feature = "wasm")]
+            {
+                crate::engines::wasm::WasmEngine::new()?.compile_check(&bytes)?;
+                validated = true;
+            }
+        }
+        Ok((bytes, is_js, validated))
+    }
+}
+
 #[async_trait]
 impl Service for ServicesService {
     async fn handle(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
@@ -175,6 +451,14 @@ impl Service for ServicesService {
             .control
             .clone()
             .ok_or_else(|| RsError::internal("services service has no control capability"))?;
+
+        // The deployed-code subtree is store-patterned (an editor UI can
+        // browse/read/create/delete it with the generic store client),
+        // with the `content-addressed` facet: child names derive from
+        // content, so deploy = keyless POST and PUT must name the true hash.
+        if segments.first() == Some(&"code") {
+            return self.handle_code_store(msg, ctx, &control, &segments[1..]).await;
+        }
 
         match (&msg.method, segments.as_slice()) {
             (&http::Method::GET, ["catalogue"]) => Ok(msg.ok_json(&catalogue())),
@@ -231,136 +515,9 @@ impl Service for ServicesService {
                 Ok(resp)
             }
 
-            // Custom service deployment (PRD §10.6): content-addressed,
-            // immutable per version. Mounts reference `code:<name>@<version>`.
-            (&http::Method::PUT, ["code", name]) => {
-                let name = name.to_string();
-                if name.is_empty() || name.contains(['/', '\\', '.']) {
-                    return Err(RsError::bad_request("invalid code bundle name"));
-                }
-                let is_js = msg
-                    .body
-                    .as_ref()
-                    .map(|b| b.media_type.essence().contains("javascript"))
-                    .unwrap_or(false);
-                let bytes = match &mut msg.body {
-                    Some(b) => b.materialize(ctx.limits.materialized_body_bytes).await?.clone(),
-                    None => return Err(RsError::bad_request("PUT /code/<name> requires a component body")),
-                };
-                // Validation: a compile smoke test in a quarantine sandbox
-                // when the matching engine is in this build.
-                #[allow(unused_mut, unused_assignments)]
-                let mut validated = false;
-                if is_js {
-                    #[cfg(feature = "js")]
-                    {
-                        let source = std::str::from_utf8(&bytes).map_err(|_| {
-                            RsError::bad_request("JS bundle is not valid UTF-8")
-                        })?;
-                        crate::engines::js::JsEngine::new().compile_check(source)?;
-                        validated = true;
-                    }
-                } else {
-                    #[cfg(feature = "wasm")]
-                    {
-                        crate::engines::wasm::WasmEngine::new()?.compile_check(&bytes)?;
-                        validated = true;
-                    }
-                }
-
-                let version = super::code::version_of(&bytes);
-                let files = ctx
-                    .files
-                    .as_ref()
-                    .ok_or_else(|| RsError::internal("services service has no file capability"))?;
-                let (path, media_type) = if is_js {
-                    (super::code::code_path_js(&name, &version), "application/javascript")
-                } else {
-                    (super::code::code_path(&name, &version), "application/wasm")
-                };
-                let body = crate::message::Body::from_bytes(
-                    bytes,
-                    crate::message::MediaType::new(media_type),
-                );
-                files.write(&path, body).await?;
-                Ok(msg.response(
-                    http::StatusCode::CREATED,
-                    Some(crate::message::Body::from_json(&serde_json::json!({
-                        "name": name,
-                        "version": version,
-                        "ref": format!("code:{name}@{version}"),
-                        "validated": validated,
-                    }))),
-                ))
-            }
-
-            (&http::Method::GET, ["code", name]) => {
-                let files = ctx
-                    .files
-                    .as_ref()
-                    .ok_or_else(|| RsError::internal("services service has no file capability"))?;
-                let (entries, _) = files
-                    .list(&format!("{}/{name}/", super::code::CODE_PREFIX), 1000, 0)
-                    .await
-                    .map_err(|_| RsError::not_found(format!("no deployed code '{name}'")))?;
-                let versions: Vec<String> = entries
-                    .iter()
-                    .map(|e| e.name.trim_end_matches(".wasm").trim_end_matches(".js").to_string())
-                    .collect();
-                // "current": the version(s) the live config actually mounts
-                // (the deployment store itself has no notion of liveness).
-                let (config, _) = control.raw_config(&msg.tenant).await?;
-                let wanted = format!("code:{name}@");
-                let current: Vec<serde_json::Value> = config
-                    .get("mounts")
-                    .and_then(|m| m.as_array())
-                    .map(|ms| {
-                        ms.iter()
-                            .filter_map(|m| {
-                                let service = m.get("service")?.as_str()?;
-                                let version = service.strip_prefix(wanted.as_str())?;
-                                Some(serde_json::json!({
-                                    "path": m.get("path"),
-                                    "version": version,
-                                }))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(msg.ok_json(&serde_json::json!({
-                    "name": name,
-                    "versions": versions,
-                    "current": current,
-                })))
-            }
-
-            // Read back a deployed bundle: immutable per version, so the
-            // version is the ETag and the response may cache forever.
-            (&http::Method::GET, ["code", name, version]) => {
-                let files = ctx
-                    .files
-                    .as_ref()
-                    .ok_or_else(|| RsError::internal("services service has no file capability"))?;
-                let (name, version) = (name.to_string(), version.to_string());
-                let candidates = [
-                    (super::code::code_path(&name, &version), "application/wasm"),
-                    (super::code::code_path_js(&name, &version), "application/javascript"),
-                ];
-                for (path, media_type) in candidates {
-                    if let Ok(mut body) = files.read(&path, None).await {
-                        body.media_type = crate::message::MediaType::new(media_type);
-                        let mut resp = msg.ok(Some(body));
-                        resp.set_header("etag", &format!("\"{version}\""));
-                        resp.set_header("cache-control", "private, max-age=31536000, immutable");
-                        return Ok(resp);
-                    }
-                }
-                Err(RsError::not_found(format!("no deployed code '{name}@{version}'")))
-            }
-
             _ => Err(RsError::not_found(format!(
-                "services endpoint '{}' (have: GET catalogue/services/raw/code, \
-                 GET code/<name>/<version>, PUT raw, PUT code/<name>)",
+                "services endpoint '{}' (have: GET catalogue/services/raw, PUT raw, \
+                 store-patterned code/ subtree)",
                 msg.url.service_path
             ))),
         }

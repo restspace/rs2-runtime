@@ -364,7 +364,7 @@ async fn code_deploys_content_addressed_and_mounts() {
     // A header-valid but bogus component: with the engine in the build the
     // deployment-time smoke test rejects it outright (PRD §10.6).
     let fake_component = b"\0asm-fake-component".to_vec();
-    let deploy = req(Method::PUT, "/services/code/echo").with_body(Body::from_bytes(
+    let deploy = req(Method::POST, "/services/code/echo/").with_body(Body::from_bytes(
         fake_component.clone(),
         MediaType::new("application/wasm"),
     ));
@@ -373,35 +373,63 @@ async fn code_deploys_content_addressed_and_mounts() {
         assert_eq!(resp.status.unwrap().as_u16(), 502, "smoke test rejects non-components");
         return;
     }
-    // Featureless build: accepted unvalidated, content-addressed.
+    // Featureless build: accepted unvalidated. Deploy is the store
+    // contract's keyless POST: content-derived child name + Location.
     assert_eq!(resp.status, Some(StatusCode::CREATED));
+    let location = resp.header("location").unwrap().to_string();
+    assert!(location.starts_with("/services/code/echo/"), "{location}");
     let body = body_json(&mut resp).await;
     let code_ref = body["ref"].as_str().unwrap().to_string();
+    let version = body["version"].as_str().unwrap().to_string();
     assert!(code_ref.starts_with("code:echo@"), "{code_ref}");
 
     // Re-deploying identical bytes yields the same version (immutable,
     // content-addressed — PRD §14).
-    let again = req(Method::PUT, "/services/code/echo")
-        .with_body(Body::from_bytes(fake_component, MediaType::new("application/wasm")));
+    let again = req(Method::POST, "/services/code/echo/")
+        .with_body(Body::from_bytes(fake_component.clone(), MediaType::new("application/wasm")));
     let mut resp2 = rt.handle(again).await;
     assert_eq!(body_json(&mut resp2).await["ref"].as_str().unwrap(), code_ref);
 
-    // Versions list; nothing mounts it yet, so `current` is empty.
-    let mut list = rt.handle(req(Method::GET, "/services/code/echo")).await;
+    // Store-contract listings: bundle names at the root (dir entries),
+    // versions inside; the standard dir+json shape an editor UI walks.
+    let mut root = rt.handle(req(Method::GET, "/services/code/")).await;
+    let root_listing = body_json(&mut root).await;
+    assert!(
+        root_listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"].as_str().unwrap().trim_end_matches('/') == "echo"
+                && e["dir"] == true),
+        "{root_listing}"
+    );
+    let mut list = rt.handle(req(Method::GET, "/services/code/echo/")).await;
+    assert_eq!(list.header("x-total-count"), Some("1"));
     let listing = body_json(&mut list).await;
-    assert_eq!(listing["versions"].as_array().unwrap().len(), 1);
-    assert_eq!(listing["current"].as_array().unwrap().len(), 0);
+    let entry = &listing["entries"][0];
+    let child_name = entry["name"].as_str().unwrap().to_string();
+    assert!(child_name.starts_with(&version), "{listing}");
+    assert!(entry.get("mountedAt").is_none(), "nothing mounts it yet");
 
-    // Read back the deployed bundle: immutable, ETag = version.
-    let version = code_ref.strip_prefix("code:echo@").unwrap().to_string();
-    let mut read = rt.handle(req(Method::GET, &format!("/services/code/echo/{version}"))).await;
-    assert_eq!(read.status, Some(StatusCode::OK));
-    assert_eq!(read.header("etag").unwrap(), format!("\"{version}\""));
-    assert!(read.header("cache-control").unwrap().contains("immutable"));
-    let bytes = read.body.as_mut().unwrap().materialize(65536).await.unwrap();
-    assert_eq!(&bytes[..4], b"\0asm", "the stored bytes round-trip");
+    // Read back via the listing's child name AND the bare version.
+    for path in [format!("/services/code/echo/{child_name}"), format!("/services/code/echo/{version}")] {
+        let mut read = rt.handle(req(Method::GET, &path)).await;
+        assert_eq!(read.status, Some(StatusCode::OK), "{path}");
+        assert_eq!(read.header("etag").unwrap(), format!("\"{version}\""));
+        assert!(read.header("cache-control").unwrap().contains("immutable"));
+        let bytes = read.body.as_mut().unwrap().materialize(65536).await.unwrap();
+        assert_eq!(&bytes[..4], b"\0asm", "the stored bytes round-trip");
+    }
     let missing = rt.handle(req(Method::GET, "/services/code/echo/feedf00ddeadbeef")).await;
     assert_eq!(missing.status, Some(StatusCode::NOT_FOUND));
+
+    // PUT child: content-addressed — only the true hash name is accepted.
+    let put_ok = req(Method::PUT, &format!("/services/code/echo/{version}"))
+        .with_body(Body::from_bytes(fake_component.clone(), MediaType::new("application/wasm")));
+    assert_eq!(rt.handle(put_ok).await.status, Some(StatusCode::OK), "idempotent re-upload");
+    let put_lie = req(Method::PUT, "/services/code/echo/0000000000000000")
+        .with_body(Body::from_bytes(fake_component, MediaType::new("application/wasm")));
+    assert_eq!(rt.handle(put_lie).await.status, Some(StatusCode::CONFLICT));
 
     // Mount it via self-config; without the wasm feature the mount builds
     // but serves a structured 501 at request time.
@@ -413,15 +441,31 @@ async fn code_deploys_content_addressed_and_mounts() {
     let put = req(Method::PUT, "/services/raw").with_json(&config);
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::NO_CONTENT));
 
-    // The listing now reports where (and which version) is live.
-    let mut list = rt.handle(req(Method::GET, "/services/code/echo")).await;
+    // The listing now annotates the live version with its mount path…
+    let mut list = rt.handle(req(Method::GET, "/services/code/echo/")).await;
     let listing = body_json(&mut list).await;
-    assert_eq!(listing["current"][0]["path"], "/custom", "{listing}");
-    assert_eq!(listing["current"][0]["version"], version);
+    assert_eq!(listing["entries"][0]["mountedAt"][0], "/custom", "{listing}");
+
+    // …and a mounted version refuses deletion (repoint first).
+    let blocked = rt
+        .handle(req(Method::DELETE, &format!("/services/code/echo/{version}")))
+        .await;
+    assert_eq!(blocked.status, Some(StatusCode::CONFLICT));
 
     let mut hit = rt.handle(req(Method::GET, "/custom/hello")).await;
     assert_eq!(hit.status, Some(StatusCode::NOT_IMPLEMENTED));
     assert_eq!(body_json(&mut hit).await["code"], "engine_unavailable");
+
+    // Repoint away (back to the base config), then deletion works and the
+    // container can be confirm-deleted.
+    let put = req(Method::PUT, "/services/raw").with_json(&surface_config());
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::NO_CONTENT));
+    let gone = rt
+        .handle(req(Method::DELETE, &format!("/services/code/echo/{version}")))
+        .await;
+    assert_eq!(gone.status, Some(StatusCode::NO_CONTENT));
+    let dir_gone = rt.handle(req(Method::DELETE, "/services/code/echo/?confirm=echo")).await;
+    assert_eq!(dir_gone.status, Some(StatusCode::NO_CONTENT));
 }
 
 /// With the JS engine in the build: deploy a JS bundle through the
@@ -445,7 +489,7 @@ async fn deployed_js_bundle_serves_requests_with_grants() {
             };
         };
     "#;
-    let deploy = req(Method::PUT, "/services/code/order-view").with_body(Body::from_bytes(
+    let deploy = req(Method::POST, "/services/code/order-view/").with_body(Body::from_bytes(
         bundle.as_bytes().to_vec(),
         MediaType::new("application/javascript"),
     ));
@@ -471,7 +515,7 @@ async fn deployed_js_bundle_serves_requests_with_grants() {
     assert_eq!(out["orderStatus"], "open", "grant round-tripped into the data service");
 
     // A broken bundle is rejected at deploy time by the compile smoke test.
-    let bad = req(Method::PUT, "/services/code/broken").with_body(Body::from_bytes(
+    let bad = req(Method::POST, "/services/code/broken/").with_body(Body::from_bytes(
         b"export default ((((".to_vec(),
         MediaType::new("application/javascript"),
     ));
@@ -493,7 +537,7 @@ async fn deployed_wasm_component_serves_requests() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt_with(dir.path(), surface_config());
 
-    let deploy = req(Method::PUT, "/services/code/echo")
+    let deploy = req(Method::POST, "/services/code/echo/")
         .with_body(Body::from_bytes(bytes, MediaType::new("application/wasm")));
     let mut resp = rt.handle(deploy).await;
     assert_eq!(resp.status, Some(StatusCode::CREATED));

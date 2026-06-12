@@ -353,9 +353,23 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     "get": op("Available services and config schemas", "pure")
                 }));
                 paths.insert(format!("{base}/raw"), json!({
-                    "get": op("The tenant's raw config (ETag-versioned)", "pure"),
+                    "get": op("The tenant's raw config (ETag-versioned; secrets masked)", "pure"),
                     "put": op("Replace the tenant config (validated, atomic; If-Match)", "idempotent"),
                 }));
+                // The deployed-code store (content-addressed facet: deploy
+                // is keyless POST; PUT only at the true hash name).
+                paths.insert(
+                    format!("{base}/code/"),
+                    json!({ "$ref": "#/components/pathItems/StoreContainer" }),
+                );
+                paths.insert(
+                    format!("{base}/code/{{name}}/"),
+                    json!({ "$ref": "#/components/pathItems/StoreContainer" }),
+                );
+                paths.insert(
+                    format!("{base}/code/{{name}}/{{version}}"),
+                    json!({ "$ref": "#/components/pathItems/StoreChild" }),
+                );
             }
             _ => {}
         }

@@ -202,8 +202,10 @@ fn deploy(component: &str, name: &str, server: &str, token: Option<&str>) -> Res
     } else {
         return Err(format!("{component} is neither a .js bundle nor a WebAssembly binary"));
     };
-    let url = format!("{}/code/{name}", server.trim_end_matches('/'));
-    let mut req = ureq::put(&url).set("content-type", content_type);
+    // Deploy = keyless POST to the bundle's container (the code store is
+    // content-addressed: the server derives the version name).
+    let url = format!("{}/code/{name}/", server.trim_end_matches('/'));
+    let mut req = ureq::post(&url).set("content-type", content_type);
     if let Some(token) = token {
         req = req.set("authorization", &format!("Bearer {token}"));
     }

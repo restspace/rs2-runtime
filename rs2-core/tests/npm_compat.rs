@@ -384,7 +384,7 @@ async fn e2e_http_out_grant_allows_and_denies_by_host() {
         Arc::new(Loader(config)),
         LimitTable::default(),
     );
-    let deploy = Message::request(Method::PUT, "/services/code/pay", "t").with_body(
+    let deploy = Message::request(Method::POST, "/services/code/pay/", "t").with_body(
         Body::from_bytes(bundle.as_bytes().to_vec(), MediaType::new("application/javascript")),
     );
     assert_eq!(rt.handle(deploy).await.status, Some(StatusCode::CREATED));

@@ -197,6 +197,15 @@ impl ScopedFileStore {
         ScopedFileStore { inner, tenant: tenant.to_string() }
     }
 
+    /// A view of this handle rooted under a path prefix (composing the
+    /// [`PrefixedFileStore`] decorator inside the tenant scope).
+    pub fn prefixed(&self, prefix: &str) -> ScopedFileStore {
+        ScopedFileStore {
+            inner: Arc::new(PrefixedFileStore::new(self.inner.clone(), prefix)),
+            tenant: self.tenant.clone(),
+        }
+    }
+
     pub async fn head(&self, path: &str) -> Result<FileMeta, RsError> {
         self.inner.head(&self.tenant, path).await
     }

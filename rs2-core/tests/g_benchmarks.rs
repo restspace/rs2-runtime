@@ -177,7 +177,7 @@ async fn g3_pathological_tenant_cannot_degrade_neighbors() {
 
     // Deploy the pathological services into the evil tenant.
     for (name, source) in [("spin", SPIN), ("hog", HOG)] {
-        let deploy = Message::request(Method::PUT, &format!("/services/code/{name}"), "evil")
+        let deploy = Message::request(Method::POST, &format!("/services/code/{name}/"), "evil")
             .with_body(Body::from_bytes(
                 source.as_bytes().to_vec(),
                 MediaType::new("application/javascript"),
