@@ -136,6 +136,13 @@ Done:
   lockout; argon2id hashes with bcrypt migration verify; per-mount role
   specs (`readRoles`/`writeRoles`/`createRoles`, path-scoped grants like
   `"U /user/{email}"`) enforced in the wrapper.
+- **CORS, host-enforced** (PRD §5.2; v1's `trustedDomains` posture): tenant
+  `cors` block — trusted origins get credentialed CORS and `SameSite=None;
+  Secure` login cookies; allowed origins get plain CORS with bearer-only
+  login (no cookie); preflights answered before routing; error responses
+  decorated; an always-on CSRF guard rejects cookie-authenticated unsafe
+  requests from untrusted cross-site origins; `auth.allowedLoginOrigins`
+  optionally allowlists login/refresh callers.
 - **`services` self-config** (PRD §10.6): `GET catalogue|services|raw`,
   `PUT raw` validates the whole config (dry tenant build), persists through
   the config loader, and hot-swaps atomically; `If-Match` optimistic

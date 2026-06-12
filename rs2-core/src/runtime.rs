@@ -175,14 +175,28 @@ impl Runtime {
         self.tenants.write().await.remove(name);
     }
 
-    /// Handle a message; failures become problem+json responses.
+    /// Handle a message; failures become problem+json responses. CORS
+    /// response headers are added here — the single choke point — so error
+    /// responses carry them too (browsers can't read un-decorated errors).
     pub async fn handle(&self, msg: Message) -> Message {
         // Capture enough context to build an error response after `msg` moves.
         let template = msg.response(StatusCode::OK, None);
-        match self.dispatch(msg).await {
+        let origin = msg.header("origin").map(str::to_string);
+        let request_host = msg.header("host").map(str::to_string);
+        let tenant_name = msg.tenant.clone();
+        let external = msg.source == crate::message::Source::External;
+        let mut resp = match self.dispatch(msg).await {
             Ok(resp) => resp,
             Err(err) => template.error_response(&err),
+        };
+        if external {
+            if let Some(origin) = origin {
+                if let Some(tenant) = self.tenants.read().await.get(&tenant_name) {
+                    tenant.cors.decorate(&mut resp, &origin, request_host.as_deref());
+                }
+            }
         }
+        resp
     }
 
     async fn dispatch(&self, mut msg: Message) -> Result<Message, RsError> {
@@ -194,6 +208,22 @@ impl Runtime {
         // repeatedly fails fast here, before holding any node resources.
         self.breaker.check(&msg.tenant)?;
         let tenant = self.tenant(&msg.tenant).await?;
+
+        // CORS (PRD §5.2: external-only): answer permitted preflights
+        // without routing, and enforce the cookie-CSRF guard.
+        if msg.source == crate::message::Source::External {
+            if let Some(origin) = msg.header("origin").map(str::to_string) {
+                let request_host = msg.header("host").map(str::to_string);
+                if msg.method == http::Method::OPTIONS {
+                    if let Some(preflight) =
+                        tenant.cors.preflight(&msg, &origin, request_host.as_deref())
+                    {
+                        return Ok(preflight);
+                    }
+                }
+                tenant.cors.check_cookie_csrf(&msg, &origin, request_host.as_deref())?;
+            }
+        }
 
         // Verify any presented token into a principal (PRD §10.5); a bad
         // token is rejected outright rather than treated as anonymous.

@@ -77,6 +77,7 @@ impl SpecStore {
             data: None,
             query: None,
             http: None,
+            cors: Arc::new(crate::wrapper::CorsPolicy::default()),
             limits,
             requester: None,
             control: None,

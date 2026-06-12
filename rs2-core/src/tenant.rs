@@ -23,6 +23,9 @@ pub struct TenantConfig {
     /// Auth settings consumed by the `auth` service and the RBAC wrapper.
     #[serde(default)]
     pub auth: Option<serde_json::Value>,
+    /// CORS policy (PRD §5.2: an external-only wrapper concern).
+    #[serde(default)]
+    pub cors: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +77,8 @@ pub struct Tenant {
     pub mounts: MountTable,
     /// Tenant auth settings (signing key etc.) for the RBAC wrapper.
     pub auth: Option<serde_json::Value>,
+    /// Host-enforced CORS policy.
+    pub cors: Arc<crate::wrapper::CorsPolicy>,
     /// Service instance + granted context per mount base path.
     instances: HashMap<String, (Arc<dyn Service>, Arc<ServiceContext>)>,
 }
@@ -163,6 +168,7 @@ impl Tenant {
                     name,
                 )),
                 http: adapters.http.clone(),
+                cors: Arc::new(crate::wrapper::CorsPolicy::from_config(config.cors.as_ref())),
                 limits: limits.invocation_limits(),
                 requester: requester.clone(),
                 control: control.clone(),
@@ -171,7 +177,13 @@ impl Tenant {
             };
             instances.insert(mount.base_path.clone(), (service, Arc::new(ctx)));
         }
-        Ok(Tenant { name: name.to_string(), mounts, instances, auth: config.auth.clone() })
+        Ok(Tenant {
+            name: name.to_string(),
+            mounts,
+            instances,
+            auth: config.auth.clone(),
+            cors: Arc::new(crate::wrapper::CorsPolicy::from_config(config.cors.as_ref())),
+        })
     }
 
     pub fn instance(&self, base_path: &str) -> Option<&(Arc<dyn Service>, Arc<ServiceContext>)> {

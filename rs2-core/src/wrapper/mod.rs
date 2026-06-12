@@ -58,6 +58,132 @@ impl LimitTable {
     }
 }
 
+/// CORS policy (per tenant, host-enforced — carried over from v1 where the
+/// runtime enforced `trustedDomains`). Trusted origins receive credentialed
+/// CORS and may send cookie-authenticated unsafe requests; allowed origins
+/// receive plain CORS (bearer-token browser apps); everything else gets no
+/// CORS headers. Same-origin requests never involve this policy.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CorsPolicy {
+    /// Credentialed CORS + cross-site cookies (`SameSite=None; Secure`).
+    pub trusted_origins: Vec<String>,
+    /// Non-credentialed CORS.
+    pub allowed_origins: Vec<String>,
+}
+
+/// Response headers other than the CORS-safelisted set that browsers may
+/// read from RS2 responses.
+const EXPOSED_HEADERS: &str =
+    "etag, location, link, x-total-count, x-trace-id, idempotency-replayed, retry-after";
+
+/// Match an origin (`scheme://host[:port]`) against a pattern: `*`, a full
+/// origin, a bare hostname, or a `*.suffix` host wildcard (matching the
+/// apex too).
+pub fn origin_matches(pattern: &str, origin: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let origin = origin.to_ascii_lowercase();
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.contains("://") {
+        return pattern.trim_end_matches('/') == origin.trim_end_matches('/');
+    }
+    // Host-level patterns compare against the origin's host (port ignored
+    // unless the pattern carries one).
+    let host_port = origin.split_once("://").map(|(_, hp)| hp).unwrap_or(&origin);
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return host == suffix || host.ends_with(&format!(".{suffix}"));
+    }
+    if pattern.contains(':') {
+        return host_port == pattern;
+    }
+    host == pattern
+}
+
+/// Whether the Origin header names the same host the request was sent to —
+/// in which case CORS does not apply at all.
+pub fn is_same_origin(origin: &str, request_host: Option<&str>) -> bool {
+    let Some(request_host) = request_host else { return false };
+    let origin_host = origin.split_once("://").map(|(_, hp)| hp).unwrap_or(origin);
+    origin_host.eq_ignore_ascii_case(request_host.trim())
+}
+
+impl CorsPolicy {
+    pub fn from_config(value: Option<&serde_json::Value>) -> CorsPolicy {
+        value
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn is_trusted(&self, origin: &str) -> bool {
+        self.trusted_origins.iter().any(|p| origin_matches(p, origin))
+    }
+
+    pub fn is_allowed(&self, origin: &str) -> bool {
+        self.is_trusted(origin) || self.allowed_origins.iter().any(|p| origin_matches(p, origin))
+    }
+
+    /// Add CORS response headers for a permitted cross-origin caller.
+    /// No-op for same-origin or unpermitted origins.
+    pub fn decorate(&self, resp: &mut Message, origin: &str, request_host: Option<&str>) {
+        if is_same_origin(origin, request_host) || !self.is_allowed(origin) {
+            return;
+        }
+        resp.set_header("access-control-allow-origin", origin);
+        resp.set_header("vary", "origin");
+        resp.set_header("access-control-expose-headers", EXPOSED_HEADERS);
+        if self.is_trusted(origin) {
+            resp.set_header("access-control-allow-credentials", "true");
+        }
+    }
+
+    /// Answer a preflight (`OPTIONS` + `Origin` + request-method header)
+    /// from a permitted origin; `None` lets the request route normally.
+    pub fn preflight(&self, msg: &Message, origin: &str, request_host: Option<&str>) -> Option<Message> {
+        if is_same_origin(origin, request_host) || !self.is_allowed(origin) {
+            return None;
+        }
+        let requested_method = msg.header("access-control-request-method")?;
+        let mut resp = msg.response(http::StatusCode::NO_CONTENT, None);
+        resp.set_header("access-control-allow-origin", origin);
+        resp.set_header("vary", "origin");
+        resp.set_header("access-control-allow-methods", requested_method);
+        let allow_headers = msg
+            .header("access-control-request-headers")
+            .unwrap_or("authorization, content-type, idempotency-key, if-match");
+        resp.set_header("access-control-allow-headers", allow_headers);
+        resp.set_header("access-control-max-age", "86400");
+        if self.is_trusted(origin) {
+            resp.set_header("access-control-allow-credentials", "true");
+        }
+        Some(resp)
+    }
+
+    /// The CSRF guard (v1 rule, host-enforced): a cookie-authenticated
+    /// **unsafe** request from a cross-site, untrusted origin is rejected
+    /// before routing. Bearer-token and non-browser requests are unaffected.
+    pub fn check_cookie_csrf(&self, msg: &Message, origin: &str, request_host: Option<&str>) -> Result<(), RsError> {
+        if is_same_origin(origin, request_host) || self.is_trusted(origin) {
+            return Ok(());
+        }
+        let unsafe_method =
+            !matches!(msg.method, http::Method::GET | http::Method::HEAD | http::Method::OPTIONS);
+        let has_auth_cookie = msg
+            .header("cookie")
+            .map(|c| c.split(';').any(|p| p.trim_start().starts_with("rs-auth=")))
+            .unwrap_or(false);
+        if unsafe_method && has_auth_cookie {
+            return Err(RsError::forbidden(format!(
+                "cookie-authenticated cross-origin request from untrusted origin '{origin}' \
+                 (add it to cors.trustedOrigins, or use a bearer token)"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Per-tenant circuit breaker (PRD §9.3): repeated resource-limit breaches
 /// trip the tenant open — its requests fail fast with 503 + Retry-After
 /// instead of re-occupying engine threads and degrading neighbors.
@@ -285,6 +411,48 @@ mod tests {
         // Releasing a permit re-admits.
         drop(_p1);
         assert!(limiter.admit("t1", 2).await.is_ok());
+    }
+
+    #[test]
+    fn origin_patterns_match_origins() {
+        assert!(origin_matches("*", "https://x.y"));
+        assert!(origin_matches("https://app.acme.com", "https://app.acme.com"));
+        assert!(!origin_matches("https://app.acme.com", "http://app.acme.com"), "scheme matters for full-origin patterns");
+        assert!(origin_matches("app.acme.com", "https://app.acme.com:8443"), "bare hostname ignores scheme+port");
+        assert!(origin_matches("*.acme.dev", "https://x.acme.dev"));
+        assert!(origin_matches("*.acme.dev", "https://acme.dev"), "wildcard matches apex");
+        assert!(!origin_matches("*.acme.dev", "https://evil-acme.dev"));
+        assert!(is_same_origin("https://api.acme.com", Some("api.acme.com")));
+        assert!(is_same_origin("https://api.acme.com:8443", Some("api.acme.com:8443")));
+        assert!(!is_same_origin("https://other.com", Some("api.acme.com")));
+        assert!(!is_same_origin("https://api.acme.com", None));
+    }
+
+    #[test]
+    fn csrf_guard_blocks_untrusted_cookie_writes_only() {
+        let policy = CorsPolicy {
+            trusted_origins: vec!["https://app.acme.com".into()],
+            allowed_origins: vec![],
+        };
+        let cookie_post = |origin_ok: bool| {
+            let mut msg = Message::request(Method::POST, "/data/x", "t");
+            msg.set_header("cookie", "rs-auth=tok");
+            let origin = if origin_ok { "https://app.acme.com" } else { "https://evil.com" };
+            policy.check_cookie_csrf(&msg, origin, Some("api.acme.com"))
+        };
+        assert!(cookie_post(true).is_ok(), "trusted origin may write with a cookie");
+        assert!(cookie_post(false).is_err(), "untrusted cross-origin cookie write rejected");
+
+        // Reads, bearer auth, and same-origin writes all pass.
+        let mut read = Message::request(Method::GET, "/data/x", "t");
+        read.set_header("cookie", "rs-auth=tok");
+        assert!(policy.check_cookie_csrf(&read, "https://evil.com", Some("api.acme.com")).is_ok());
+        let mut bearer = Message::request(Method::POST, "/data/x", "t");
+        bearer.set_header("authorization", "Bearer tok");
+        assert!(policy.check_cookie_csrf(&bearer, "https://evil.com", Some("api.acme.com")).is_ok());
+        let mut same = Message::request(Method::POST, "/data/x", "t");
+        same.set_header("cookie", "rs-auth=tok");
+        assert!(policy.check_cookie_csrf(&same, "https://api.acme.com", Some("api.acme.com")).is_ok());
     }
 
     #[test]

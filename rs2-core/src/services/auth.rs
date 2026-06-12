@@ -38,6 +38,10 @@ pub struct AuthSettings {
     pub lock_minutes: u64,
     /// Dataset holding user records keyed by email.
     pub user_dataset: String,
+    /// Browser origins allowed to call login/refresh (v1's
+    /// `allowedLoginDomains`); empty = no origin restriction. Same-origin
+    /// requests are always allowed.
+    pub allowed_login_origins: Vec<String>,
 }
 
 impl Default for AuthSettings {
@@ -48,6 +52,7 @@ impl Default for AuthSettings {
             max_attempts: 5,
             lock_minutes: 10,
             user_dataset: "users".to_string(),
+            allowed_login_origins: vec![],
         }
     }
 }
@@ -241,18 +246,57 @@ impl AuthService {
         Ok((sign(&claims, &self.settings.jwt_secret)?, exp))
     }
 
-    fn token_response(&self, msg: &Message, token: &str, exp: u64) -> Message {
+    /// v1's login-origin allowlist: when configured, cross-origin browser
+    /// calls to login/refresh must come from a listed origin.
+    fn check_login_origin(&self, msg: &Message) -> Result<(), RsError> {
+        let Some(origin) = msg.header("origin") else { return Ok(()) };
+        if crate::wrapper::is_same_origin(origin, msg.header("host")) {
+            return Ok(());
+        }
+        if self.settings.allowed_login_origins.is_empty()
+            || self
+                .settings
+                .allowed_login_origins
+                .iter()
+                .any(|p| crate::wrapper::origin_matches(p, origin))
+        {
+            Ok(())
+        } else {
+            Err(RsError::forbidden(format!("login origin '{origin}' is not allowed")))
+        }
+    }
+
+    /// Cookie attributes by origin trust (v1's matrix): same-origin (or
+    /// non-browser) → `SameSite=Strict`; trusted cross-origin →
+    /// `SameSite=None; Secure`; untrusted origin → no cookie, the body
+    /// token is the credential.
+    fn token_response(&self, msg: &Message, ctx: &ServiceContext, token: &str, exp: u64) -> Message {
         let mut resp = msg.ok_json(&serde_json::json!({ "token": token, "exp": exp }));
         let max_age = self.settings.session_minutes * 60;
-        if let Ok(v) = http::HeaderValue::from_str(&format!(
-            "rs-auth={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
-        )) {
-            resp.headers.insert(http::header::SET_COOKIE, v);
+        let cookie = match msg.header("origin") {
+            None => Some(format!(
+                "rs-auth={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
+            )),
+            Some(origin) if crate::wrapper::is_same_origin(origin, msg.header("host")) => {
+                Some(format!(
+                    "rs-auth={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
+                ))
+            }
+            Some(origin) if ctx.cors.is_trusted(origin) => Some(format!(
+                "rs-auth={token}; HttpOnly; SameSite=None; Secure; Path=/; Max-Age={max_age}"
+            )),
+            Some(_) => None, // untrusted browser origin: bearer-only
+        };
+        if let Some(cookie) = cookie {
+            if let Ok(v) = http::HeaderValue::from_str(&cookie) {
+                resp.headers.insert(http::header::SET_COOKIE, v);
+            }
         }
         resp
     }
 
     async fn login(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
+        self.check_login_origin(&msg)?;
         let body = match &mut msg.body {
             Some(b) => b.as_json(ctx.limits.materialized_body_bytes).await?,
             None => return Err(RsError::bad_request("login requires a JSON body")),
@@ -300,12 +344,13 @@ impl AuthService {
         };
         let kind = user.get("kind").and_then(|v| v.as_str()).unwrap_or("user");
         let (token, exp) = self.issue(&email, &roles, kind)?;
-        Ok(self.token_response(&msg, &token, exp))
+        Ok(self.token_response(&msg, ctx, &token, exp))
     }
 
     /// Sliding refresh: a valid token past 50% of its session re-issues
     /// (PRD §10.5).
-    fn refresh(&self, msg: Message) -> Result<Message, RsError> {
+    fn refresh(&self, msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
+        self.check_login_origin(&msg)?;
         let token = extract_token(&msg)
             .ok_or_else(|| RsError::unauthorized("refresh requires a token"))?;
         let claims = verify(&token, &self.settings.jwt_secret)?;
@@ -316,7 +361,7 @@ impl AuthService {
             return Ok(msg.ok_json(&serde_json::json!({ "token": token, "exp": claims.exp })));
         }
         let (token, exp) = self.issue(&claims.sub, &claims.roles, &claims.kind)?;
-        Ok(self.token_response(&msg, &token, exp))
+        Ok(self.token_response(&msg, ctx, &token, exp))
     }
 
     fn logout(&self, msg: Message) -> Message {
@@ -338,7 +383,7 @@ impl Service for AuthService {
         let segments: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
         match (&msg.method, segments.as_slice()) {
             (&http::Method::POST, ["login"]) => self.login(msg, ctx).await,
-            (&http::Method::POST, ["refresh"]) => self.refresh(msg),
+            (&http::Method::POST, ["refresh"]) => self.refresh(msg, ctx),
             (&http::Method::POST, ["logout"]) => Ok(self.logout(msg)),
             (&http::Method::GET, ["user"]) => match &msg.principal {
                 Some(p) => Ok(msg.ok_json(&serde_json::json!({

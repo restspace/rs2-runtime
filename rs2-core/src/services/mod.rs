@@ -45,6 +45,9 @@ pub struct ServiceContext {
     pub requester: Option<Arc<dyn Requester>>,
     /// Control-plane capability (`services` self-config only).
     pub control: Option<Arc<dyn crate::runtime::TenantControl>>,
+    /// Tenant CORS policy (the auth service consults it for cookie
+    /// attributes; enforcement is the host's).
+    pub cors: Arc<crate::wrapper::CorsPolicy>,
     /// Tenant-level retry default (PRD §7.3 resolution chain).
     pub tenant_retry: Option<RetryPolicy>,
     /// Pipeline wall-clock budget (PRD §9.3: 120 s default).
