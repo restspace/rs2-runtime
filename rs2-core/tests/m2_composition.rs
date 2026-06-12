@@ -260,11 +260,13 @@ async fn self_config_hot_reload_swaps_atomically() {
         Some(StatusCode::NOT_FOUND)
     );
 
-    // Read current config + version.
+    // Read current config + version. Secrets are write-only (PRD §9.2):
+    // the signing key reads back masked.
     let mut raw = rt.handle(req(Method::GET, "/services/raw")).await;
     assert_eq!(raw.status, Some(StatusCode::OK));
     let etag = raw.header("etag").unwrap().trim_matches('"').to_string();
     let mut config = body_json(&mut raw).await;
+    assert_eq!(config["auth"]["jwtSecret"], "<secret>", "secret never readable back");
 
     // An invalid config is rejected wholesale; the running tenant is intact.
     let mut broken = config.clone();
@@ -295,6 +297,15 @@ async fn self_config_hot_reload_swaps_atomically() {
     let write = req(Method::PUT, "/notes/x.txt")
         .with_body(Body::from_string("note", MediaType::new("text/plain")));
     assert_eq!(rt.handle(write).await.status, Some(StatusCode::CREATED));
+
+    // The masked secret round-tripped: the real signing key survived the
+    // GET → edit → PUT cycle, so logins still verify after the hot swap.
+    let relogin = rt
+        .handle(req(Method::POST, "/auth/login").with_json(&json!({
+            "email": "ada@demo.test", "password": "adapw"
+        })))
+        .await;
+    assert_eq!(relogin.status, Some(StatusCode::OK), "secret preserved through round trip");
 
     // A stale If-Match now conflicts.
     let mut stale = req(Method::PUT, "/services/raw").with_json(&config);

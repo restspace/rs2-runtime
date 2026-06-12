@@ -49,6 +49,122 @@ fn catalogue() -> serde_json::Value {
     })
 }
 
+/// The placeholder secrets read back as. A PUT carrying it means "keep the
+/// stored value".
+pub const SECRET_MASK: &str = "<secret>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn secrets_redact_and_round_trip() {
+        let stored = json!({
+            "auth": { "jwtSecret": "real-secret", "sessionMinutes": 60 },
+            "secrets": { "stripe": "sk_live_x", "nested": { "k": "v" } },
+            "mounts": []
+        });
+
+        // Read: secrets masked, structure intact.
+        let mut read = stored.clone();
+        redact_secrets(&mut read);
+        assert_eq!(read["auth"]["jwtSecret"], SECRET_MASK);
+        assert_eq!(read["auth"]["sessionMinutes"], 60);
+        assert_eq!(read["secrets"]["stripe"], SECRET_MASK);
+        assert_eq!(read["secrets"]["nested"]["k"], SECRET_MASK);
+
+        // Write-back of the masked doc restores the stored values.
+        let mut incoming = read.clone();
+        incoming["mounts"] = json!([{ "path": "/x", "service": "file" }]);
+        restore_secrets(&mut incoming, &stored).unwrap();
+        assert_eq!(incoming["auth"]["jwtSecret"], "real-secret");
+        assert_eq!(incoming["secrets"]["nested"]["k"], "v");
+        assert_eq!(incoming["mounts"][0]["path"], "/x", "edits preserved");
+
+        // Supplying a new real value is untouched.
+        let mut rotated = read.clone();
+        rotated["auth"]["jwtSecret"] = json!("new-secret");
+        restore_secrets(&mut rotated, &stored).unwrap();
+        assert_eq!(rotated["auth"]["jwtSecret"], "new-secret");
+
+        // A mask with no stored counterpart is refused, not stored.
+        let mut orphan = json!({ "auth": { "jwtSecret": SECRET_MASK }, "mounts": [] });
+        assert!(restore_secrets(&mut orphan, &json!({ "mounts": [] })).is_err());
+    }
+}
+
+/// Walk the config and mask secret values: `auth.jwtSecret`, plus every
+/// string leaf under a top-level `secrets` object (forward-compatible with
+/// the PRD's encrypted tenant-secrets block).
+fn redact_secrets(config: &mut serde_json::Value) {
+    if let Some(secret) = config.pointer_mut("/auth/jwtSecret") {
+        if secret.is_string() {
+            *secret = serde_json::json!(SECRET_MASK);
+        }
+    }
+    if let Some(secrets) = config.get_mut("secrets") {
+        mask_leaves(secrets);
+    }
+}
+
+fn mask_leaves(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(_) => *value = serde_json::json!(SECRET_MASK),
+        serde_json::Value::Object(o) => o.values_mut().for_each(mask_leaves),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(mask_leaves),
+        _ => {}
+    }
+}
+
+/// Replace [`SECRET_MASK`] markers in an incoming config with the stored
+/// values at the same locations (structural walk), so read-modify-write
+/// round trips preserve secrets. A marker with no stored counterpart is an
+/// error — accepting it would store the literal mask as a (weak) secret.
+fn restore_secrets(
+    incoming: &mut serde_json::Value,
+    current: &serde_json::Value,
+) -> Result<(), RsError> {
+    restore_at(incoming, current);
+    if has_mask(incoming) {
+        return Err(RsError::bad_request(format!(
+            "config contains the secret placeholder '{SECRET_MASK}' at a location with no \
+             stored value to restore — supply the real value there"
+        )));
+    }
+    Ok(())
+}
+
+fn has_mask(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s == SECRET_MASK,
+        serde_json::Value::Object(o) => o.values().any(has_mask),
+        serde_json::Value::Array(a) => a.iter().any(has_mask),
+        _ => false,
+    }
+}
+
+fn restore_at(incoming: &mut serde_json::Value, current: &serde_json::Value) {
+    match incoming {
+        serde_json::Value::String(s) if s == SECRET_MASK => {
+            if current.is_string() {
+                *incoming = current.clone();
+            }
+        }
+        serde_json::Value::Object(o) => {
+            for (k, v) in o.iter_mut() {
+                restore_at(v, current.get(k).unwrap_or(&serde_json::Value::Null));
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for (i, v) in a.iter_mut().enumerate() {
+                restore_at(v, current.get(i).unwrap_or(&serde_json::Value::Null));
+            }
+        }
+        _ => {}
+    }
+}
+
 #[async_trait]
 impl Service for ServicesService {
     async fn handle(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
@@ -85,7 +201,10 @@ impl Service for ServicesService {
             }
 
             (&http::Method::GET, ["raw"]) => {
-                let (config, version) = control.raw_config(&msg.tenant).await?;
+                let (mut config, version) = control.raw_config(&msg.tenant).await?;
+                // Secrets are write-only through the self-config API
+                // (PRD §9.2): never readable back.
+                redact_secrets(&mut config);
                 let mut resp = msg.ok_json(&config);
                 resp.set_header("etag", &format!("\"{version}\""));
                 Ok(resp)
@@ -94,10 +213,15 @@ impl Service for ServicesService {
             // Full config replace: validate → persist → atomic swap
             // (PRD §10.6). `If-Match` gives optimistic concurrency.
             (&http::Method::PUT, ["raw"]) => {
-                let body = match &mut msg.body {
+                let mut body = match &mut msg.body {
                     Some(b) => b.as_json(ctx.limits.materialized_body_bytes).await?,
                     None => return Err(RsError::bad_request("PUT /raw requires a JSON body")),
                 };
+                // Read-modify-write safety: redaction markers in the
+                // incoming config are replaced with the stored values, so
+                // a GET → edit → PUT round trip never destroys a secret.
+                let (current, _) = control.raw_config(&msg.tenant).await.unwrap_or_default();
+                restore_secrets(&mut body, &current)?;
                 let if_match = msg
                     .header("if-match")
                     .map(|v| v.trim().trim_matches('"').to_string());
