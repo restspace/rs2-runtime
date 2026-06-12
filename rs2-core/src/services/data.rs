@@ -226,7 +226,7 @@ impl Service for DataService {
                         let value = data.get(&dataset, &key).await?;
                         let etag = record_etag(&value);
                         // Conditional GET: revalidate without resending.
-                        if super::if_none_match_hits(&msg, &etag) {
+                        if super::if_none_match_hits(msg.header("if-none-match"), &etag) {
                             let mut not_modified = msg.response(StatusCode::NOT_MODIFIED, None);
                             not_modified.set_header("etag", &etag);
                             return Ok(not_modified);

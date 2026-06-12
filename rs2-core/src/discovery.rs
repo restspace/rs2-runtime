@@ -125,7 +125,15 @@ fn meta(mount: &Mount) -> Map<String, Value> {
 /// capabilities within the shape (feature-detect, don't special-case).
 fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
     match mount.service.as_str() {
-        "file" => ("store", vec!["range", "confirm-delete"]),
+        "file" => {
+            let mut facets = vec!["range", "confirm-delete"];
+            if mount.config.get("defaultResource").is_some()
+                || mount.config.get("spaFallback").is_some()
+            {
+                facets.push("static-site");
+            }
+            ("store", facets)
+        }
         "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
         "pipeline" => ("store-transform", vec!["any-verb"]),
         "query" => ("store-view", vec!["positional-params", "url-params", "any-verb"]),

@@ -95,6 +95,12 @@ Done:
   PUT/POST/DELETE semantics, the 409 + `?confirm=` container guard, ETags on
   children. Mounts declare `pattern` + `facets` on the discovery surface;
   the generated OpenAPI `$ref`s one shared store path-item shape.
+- **Static-site mode on `file`** (no separate service — config):
+  `defaultResource` serves a default document for directory GETs,
+  `spaFallback` serves the root app shell for extension-less misses
+  (asset misses stay 404), `listings: false` disables browsing; mounts
+  with it declare the `static-site` facet. Pair with `caching` for CDN
+  headers.
 - Host-enforced tenant scoping on every store capability; local-fs and
   in-memory adapters.
 

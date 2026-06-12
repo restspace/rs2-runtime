@@ -193,6 +193,90 @@ async fn auth_stub_gates_protected_mounts() {
     assert_eq!(resp.status, Some(StatusCode::NOT_FOUND));
 }
 
+/// Static-site mode (v1's static-site service, as file config): default
+/// resource, SPA fallback, suppressed listings.
+#[tokio::test]
+async fn file_static_site_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/site", "service": "file", "config": {
+            "spaFallback": true, "listings": false,
+            "caching": { "mode": "cache", "maxAgeSeconds": 300, "public": true } } },
+        { "path": "/files", "service": "file" }
+    ]})));
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t1".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
+
+    // Author the site (the mount is still a store for writes).
+    for (path, content, mt) in [
+        ("/site/index.html", "<html>app</html>", "text/html"),
+        ("/site/app.js", "boot()", "application/javascript"),
+        ("/site/docs/index.html", "<html>docs</html>", "text/html"),
+    ] {
+        let put =
+            req(Method::PUT, path).with_body(Body::from_string(content, MediaType::new(mt)));
+        assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED), "{path}");
+    }
+
+    // Directory GETs serve the default resource, not a listing.
+    let mut root = rt.handle(req(Method::GET, "/site/")).await;
+    assert_eq!(root.status, Some(StatusCode::OK));
+    assert_eq!(root.body.as_ref().unwrap().media_type.essence(), "text/html");
+    let bytes = root.body.as_mut().unwrap().materialize(65536).await.unwrap();
+    assert_eq!(&bytes[..], b"<html>app</html>");
+    assert_eq!(root.header("cache-control"), Some("public, max-age=300"));
+    let mut docs = rt.handle(req(Method::GET, "/site/docs/")).await;
+    let bytes = docs.body.as_mut().unwrap().materialize(65536).await.unwrap();
+    assert_eq!(&bytes[..], b"<html>docs</html>", "nearest default doc wins");
+
+    // SPA fallback: extension-less routes serve the root index with 200…
+    let mut route = rt.handle(req(Method::GET, "/site/users/42/profile")).await;
+    assert_eq!(route.status, Some(StatusCode::OK));
+    let bytes = route.body.as_mut().unwrap().materialize(65536).await.unwrap();
+    assert_eq!(&bytes[..], b"<html>app</html>");
+
+    // …while missing assets stay honest 404s.
+    let asset = rt.handle(req(Method::GET, "/site/missing.js")).await;
+    assert_eq!(asset.status, Some(StatusCode::NOT_FOUND));
+    // And real assets serve normally.
+    let js = rt.handle(req(Method::GET, "/site/app.js")).await;
+    assert_eq!(js.status, Some(StatusCode::OK));
+
+    // Listings are suppressed on the site mount, intact on the plain one.
+    // (A directory with no default doc 404s rather than listing.)
+    let put = req(Method::PUT, "/site/assets/x.png")
+        .with_body(Body::from_string("png", MediaType::new("image/png")));
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
+    // /site/assets/ has no index.html → SPA fallback serves the app shell
+    // (it is an extension-less navigation), proving routes under asset
+    // dirs still work; the listing never leaks.
+    let mut assets = rt.handle(req(Method::GET, "/site/assets/")).await;
+    assert_eq!(assets.status, Some(StatusCode::OK));
+    let bytes = assets.body.as_mut().unwrap().materialize(65536).await.unwrap();
+    assert_eq!(&bytes[..], b"<html>app</html>");
+    let listing = rt.handle(req(Method::GET, "/files/")).await;
+    assert_eq!(listing.body.as_ref().unwrap().media_type.essence(), "application/vnd.rs2.dir+json");
+
+    // The discovery surface declares the facet.
+    let mut services = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
+    let doc = services.body.as_mut().unwrap().as_json(65536).await.unwrap();
+    let site = doc["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["path"] == "/site")
+        .unwrap();
+    assert!(site["facets"].as_array().unwrap().iter().any(|f| f == "static-site"), "{site}");
+}
+
 #[tokio::test]
 async fn tenant_storage_is_host_scoped() {
     let dir = tempfile::tempdir().unwrap();

@@ -18,6 +18,87 @@ impl FileService {
     pub fn new() -> Self {
         FileService
     }
+
+    /// Serve one stored file with Range/ETag/304 semantics. Takes owned
+    /// request facts rather than `&Message` (request bodies are not Sync,
+    /// so a `&Message` may not be held across awaits).
+    async fn serve_file(
+        &self,
+        template: Message,
+        range: Option<ByteRange>,
+        if_none_match: Option<String>,
+        files: &crate::capabilities::ScopedFileStore,
+        path: &str,
+    ) -> Result<Message, RsError> {
+        let body = files.read(path, range).await?;
+        let mut resp = if range.is_some() {
+            template.response(StatusCode::PARTIAL_CONTENT, Some(body))
+        } else {
+            template.ok(Some(body))
+        };
+        resp.set_header("accept-ranges", "bytes");
+        let (etag, last_modified) = match &resp.body {
+            Some(b) => (
+                match &b.provenance {
+                    Provenance::Replayable { version, .. } => Some(format!("\"{version}\"")),
+                    _ => None,
+                },
+                b.last_modified
+                    .and_then(|lm| lm.format(&time::format_description::well_known::Rfc2822).ok()),
+            ),
+            None => (None, None),
+        };
+        if let Some(etag) = &etag {
+            resp.set_header("etag", etag);
+        }
+        if let Some(lm) = &last_modified {
+            resp.set_header("last-modified", lm);
+        }
+        // Conditional GET: a matching If-None-Match revalidates the
+        // caller's copy without resending the body.
+        if let Some(etag) = &etag {
+            if super::if_none_match_hits(if_none_match.as_deref(), etag) {
+                let mut not_modified = resp.response(StatusCode::NOT_MODIFIED, None);
+                not_modified.set_header("etag", etag);
+                if let Some(lm) = &last_modified {
+                    not_modified.set_header("last-modified", lm);
+                }
+                not_modified.set_header("accept-ranges", "bytes");
+                return Ok(not_modified);
+            }
+        }
+        Ok(resp)
+    }
+}
+
+/// Static-site options on a file mount (v1's static-site manifest variant,
+/// expressed as config — the same module, the same store underneath).
+struct SiteOptions {
+    /// Directory GETs serve this file instead of a listing.
+    default_resource: Option<String>,
+    /// Extension-less misses serve the mount-root default resource with
+    /// 200 (client-side routing); asset misses (paths with extensions)
+    /// still 404.
+    spa_fallback: bool,
+    /// Suppress dir+json listings (a public site shouldn't be browsable).
+    listings: bool,
+}
+
+impl SiteOptions {
+    fn from_config(config: &serde_json::Value) -> SiteOptions {
+        let spa_fallback =
+            config.get("spaFallback").and_then(|v| v.as_bool()).unwrap_or(false);
+        let default_resource = config
+            .get("defaultResource")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| spa_fallback.then(|| "index.html".to_string()));
+        SiteOptions {
+            default_resource,
+            spa_fallback,
+            listings: config.get("listings").and_then(|v| v.as_bool()).unwrap_or(true),
+        }
+    }
 }
 
 /// Extension for a server-named file from its declared media type
@@ -62,8 +143,44 @@ impl Service for FileService {
             .ok_or_else(|| RsError::capability_denied("files"))?;
         let path = msg.url.service_path.clone();
 
+        let site = SiteOptions::from_config(&ctx.config);
+        let range = msg.header("range").and_then(parse_range);
+        let if_none_match = msg.header("if-none-match").map(String::from);
+
         match msg.method {
             Method::GET if msg.url.is_directory() => {
+                // Static-site mode: directories serve the default resource.
+                if let Some(default) = &site.default_resource {
+                    match self
+                        .serve_file(
+                            msg.response(StatusCode::OK, None),
+                            range,
+                            if_none_match.clone(),
+                            files,
+                            &format!("{path}{default}"),
+                        )
+                        .await
+                    {
+                        Ok(resp) => return Ok(resp),
+                        Err(e) if e.code != crate::error::codes::NOT_FOUND => return Err(e),
+                        // No default doc here: SPA routes fall to the root.
+                        Err(_) if site.spa_fallback && path != "/" => {
+                            return self
+                                .serve_file(
+                                    msg.response(StatusCode::OK, None),
+                                    range,
+                                    if_none_match,
+                                    files,
+                                    &format!("/{default}"),
+                                )
+                                .await
+                        }
+                        Err(_) => {}
+                    }
+                }
+                if !site.listings {
+                    return Err(RsError::not_found(format!("'{path}' does not exist")));
+                }
                 let (take, skip) = pagination(&msg);
                 let (entries, total) = files.list(&path, take, skip).await?;
                 let listing = json!({
@@ -76,46 +193,25 @@ impl Service for FileService {
                 Ok(resp)
             }
             Method::GET => {
-                let range = msg.header("range").and_then(parse_range);
-                let body = files.read(&path, range).await?;
-                let mut resp = if range.is_some() {
-                    msg.response(StatusCode::PARTIAL_CONTENT, Some(body))
-                } else {
-                    msg.ok(Some(body))
-                };
-                resp.set_header("accept-ranges", "bytes");
-                let (etag, last_modified) = match &resp.body {
-                    Some(b) => (
-                        match &b.provenance {
-                            Provenance::Replayable { version, .. } => Some(format!("\"{version}\"")),
-                            _ => None,
-                        },
-                        b.last_modified
-                            .and_then(|lm| lm.format(&time::format_description::well_known::Rfc2822).ok()),
-                    ),
-                    None => (None, None),
-                };
-                if let Some(etag) = &etag {
-                    resp.set_header("etag", etag);
-                }
-                if let Some(lm) = &last_modified {
-                    resp.set_header("last-modified", lm);
-                }
-                // Conditional GET: a matching If-None-Match revalidates the
-                // caller's copy without resending the body.
-                if let Some(etag) = &etag {
-                    if super::if_none_match_hits(&msg, etag) {
-                        let mut not_modified =
-                            msg.response(StatusCode::NOT_MODIFIED, None);
-                        not_modified.set_header("etag", etag);
-                        if let Some(lm) = &last_modified {
-                            not_modified.set_header("last-modified", lm);
-                        }
-                        not_modified.set_header("accept-ranges", "bytes");
-                        return Ok(not_modified);
+                match self
+                    .serve_file(msg.response(StatusCode::OK, None), range, if_none_match.clone(), files, &path)
+                    .await
+                {
+                    Ok(resp) => Ok(resp),
+                    // SPA fallback: an extension-less miss is a client-side
+                    // route — serve the root default with 200. Asset misses
+                    // (paths with extensions) stay honest 404s.
+                    Err(e)
+                        if e.code == crate::error::codes::NOT_FOUND
+                            && site.spa_fallback
+                            && !path.rsplit('/').next().unwrap_or("").contains('.') =>
+                    {
+                        let default = site.default_resource.as_deref().unwrap_or("index.html");
+                        self.serve_file(msg.response(StatusCode::OK, None), range, if_none_match, files, &format!("/{default}"))
+                            .await
                     }
+                    Err(e) => Err(e),
                 }
-                Ok(resp)
             }
             Method::HEAD => {
                 let meta = files.head(&path).await?;
