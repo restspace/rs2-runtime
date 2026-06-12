@@ -152,9 +152,10 @@ async fn data_crud_schema_validation_and_confirm_delete() {
     let listing = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     assert_eq!(listing["total"], 2);
 
-    // Dataset delete needs the explicit confirm token.
+    // Dataset delete needs the explicit confirm token (409 per the store
+    // contract's non-empty-container guard).
     let resp = rt.handle(req(Method::DELETE, "/data/people")).await;
-    assert_eq!(resp.status, Some(StatusCode::BAD_REQUEST));
+    assert_eq!(resp.status, Some(StatusCode::CONFLICT));
     let resp = rt.handle(req(Method::DELETE, "/data/people?confirm=people")).await;
     assert_eq!(resp.status, Some(StatusCode::NO_CONTENT));
     let resp = rt.handle(req(Method::GET, "/data/people/ada")).await;

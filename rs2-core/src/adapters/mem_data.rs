@@ -71,6 +71,16 @@ impl DataStore for MemDataStore {
         Ok((keys, total))
     }
 
+    async fn list_datasets(&self, tenant: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
+        let tenants = self.tenants.read().await;
+        let Some(t) = tenants.get(tenant) else {
+            return Ok((vec![], 0));
+        };
+        let total = t.len() as u64;
+        let names = t.keys().skip(skip).take(take).cloned().collect();
+        Ok((names, total))
+    }
+
     async fn get_schema(&self, tenant: &str, dataset: &str) -> Result<Option<serde_json::Value>, RsError> {
         Ok(self
             .tenants

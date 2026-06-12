@@ -48,6 +48,8 @@ pub trait FileStore: Send + Sync {
     async fn delete(&self, tenant: &str, path: &str) -> Result<(), RsError>;
     /// Delete a directory; fails unless empty.
     async fn delete_dir(&self, tenant: &str, path: &str) -> Result<(), RsError>;
+    /// Delete a directory and all its contents (the `?confirm=` path).
+    async fn delete_dir_all(&self, tenant: &str, path: &str) -> Result<(), RsError>;
     /// Paginated listing; returns (entries, total count).
     async fn list(&self, tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError>;
 }
@@ -61,6 +63,8 @@ pub trait DataStore: Send + Sync {
     async fn delete(&self, tenant: &str, dataset: &str, key: &str) -> Result<(), RsError>;
     /// Paginated key listing; returns (keys, total count).
     async fn list_keys(&self, tenant: &str, dataset: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError>;
+    /// Paginated dataset enumeration; returns (names, total count).
+    async fn list_datasets(&self, tenant: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError>;
     async fn get_schema(&self, tenant: &str, dataset: &str) -> Result<Option<serde_json::Value>, RsError>;
     async fn put_schema(&self, tenant: &str, dataset: &str, schema: serde_json::Value) -> Result<(), RsError>;
     async fn delete_dataset(&self, tenant: &str, dataset: &str) -> Result<(), RsError>;
@@ -149,6 +153,10 @@ impl ScopedFileStore {
         self.inner.delete_dir(&self.tenant, path).await
     }
 
+    pub async fn delete_dir_all(&self, path: &str) -> Result<(), RsError> {
+        self.inner.delete_dir_all(&self.tenant, path).await
+    }
+
     pub async fn list(&self, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
         self.inner.list(&self.tenant, path, take, skip).await
     }
@@ -176,6 +184,10 @@ impl ScopedDataStore {
 
     pub async fn delete(&self, dataset: &str, key: &str) -> Result<(), RsError> {
         self.inner.delete(&self.tenant, dataset, key).await
+    }
+
+    pub async fn list_datasets(&self, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
+        self.inner.list_datasets(&self.tenant, take, skip).await
     }
 
     pub async fn list_keys(&self, dataset: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {

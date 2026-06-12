@@ -63,6 +63,14 @@ impl DataService {
     }
 }
 
+/// Record version for ETags: a stable hash of the serialized value, so
+/// optimistic concurrency reads identically to the file store's ETags.
+fn record_etag(value: &Value) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.to_string().hash(&mut hasher);
+    format!("\"{:016x}\"", hasher.finish())
+}
+
 /// RFC 7386 JSON merge patch.
 fn merge_patch(target: &mut Value, patch: &Value) {
     if let Value::Object(patch_obj) = patch {
@@ -91,21 +99,52 @@ impl Service for DataService {
         let schema_base = format!("{}", msg.url.base_path);
 
         match segments.as_slice() {
-            [] => Err(RsError::bad_request("specify a dataset: /<dataset>/<key>")),
+            // ---- mount root: enumerate datasets (store contract: every
+            // container level lists in dir+json) ----
+            [] => match msg.method {
+                Method::GET => {
+                    let (take, skip) = pagination(&msg);
+                    let (names, total) = data.list_datasets(take, skip).await?;
+                    let entries: Vec<Value> = names
+                        .iter()
+                        .map(|n| json!({ "name": format!("{n}/"), "dir": true }))
+                        .collect();
+                    let listing = json!({ "path": "/", "entries": entries, "total": total });
+                    let mut resp =
+                        msg.ok(Some(Body::from_bytes(listing.to_string(), MediaType::dir_json())));
+                    resp.set_header("x-total-count", &total.to_string());
+                    Ok(resp)
+                }
+                _ => Err(RsError::bad_request("the mount root supports GET (dataset listing)")),
+            },
 
-            // ---- dataset level ----
+            // ---- dataset level (a store container) ----
             [dataset] => {
                 let dataset = dataset.clone();
                 match msg.method {
                     Method::GET => {
                         let (take, skip) = pagination(&msg);
                         let (keys, total) = data.list_keys(&dataset, take, skip).await?;
-                        let listing = json!({ "path": format!("/{dataset}/"), "keys": keys, "total": total });
+                        // One listing shape across all stores (PRD patterns):
+                        // keys are child entries; the schema is a fixed child.
+                        let mut entries: Vec<Value> = keys
+                            .iter()
+                            .map(|k| json!({ "name": k, "dir": false }))
+                            .collect();
+                        if data.get_schema(&dataset).await?.is_some() {
+                            entries.push(json!({ "name": SCHEMA_RESOURCE, "dir": false, "fixed": true }));
+                        }
+                        let listing = json!({
+                            "path": format!("/{dataset}/"),
+                            "entries": entries,
+                            "total": total,
+                        });
                         let mut resp = msg.ok(Some(Body::from_bytes(listing.to_string(), MediaType::dir_json())));
                         resp.set_header("x-total-count", &total.to_string());
                         Ok(resp)
                     }
-                    // Keyless POST creates a record under a generated key.
+                    // Keyless POST to a container creates under a generated
+                    // key and returns the stored representation + Location.
                     Method::POST => {
                         let body = msg
                             .body
@@ -118,16 +157,26 @@ impl Service for DataService {
                             }
                         }
                         let key = uuid::Uuid::new_v4().simple().to_string();
-                        data.put(&dataset, &key, value).await?;
-                        let mut resp = msg.response(StatusCode::CREATED, None);
+                        data.put(&dataset, &key, value.clone()).await?;
+                        let schema_url = format!("{schema_base}/{dataset}/{SCHEMA_RESOURCE}");
+                        let mut resp = msg.response(
+                            StatusCode::CREATED,
+                            Some(
+                                Body::from_bytes(value.to_string(), MediaType::json())
+                                    .with_schema(schema_url),
+                            ),
+                        );
                         resp.set_header("location", &format!("{schema_base}/{dataset}/{key}"));
+                        resp.set_header("etag", &record_etag(&value));
                         Ok(resp)
                     }
                     Method::DELETE => {
-                        // Explicit confirm token replaces emptiness heuristics.
+                        // Explicit confirm token replaces emptiness
+                        // heuristics. 409 matches the store contract's
+                        // non-empty-container guard across all stores.
                         let confirm = msg.url.query_param("confirm");
                         if confirm.as_deref() != Some(dataset.as_str()) {
-                            return Err(RsError::bad_request(format!(
+                            return Err(RsError::conflict(format!(
                                 "dataset delete requires '?confirm={dataset}'"
                             )));
                         }
@@ -179,9 +228,13 @@ impl Service for DataService {
                             Body::from_bytes(value.to_string(), MediaType::json()).with_schema(schema_url.clone()),
                         ));
                         resp.set_header("link", &format!("<{schema_url}>; rel=\"describedby\""));
+                        resp.set_header("etag", &record_etag(&value));
                         Ok(resp)
                     }
-                    Method::PUT => {
+                    // Store contract: PUT upserts (empty body); POST upserts
+                    // and returns the stored representation.
+                    Method::PUT | Method::POST => {
+                        let echo = msg.method == Method::POST;
                         let body = msg
                             .body
                             .as_mut()
@@ -192,8 +245,19 @@ impl Service for DataService {
                                 self.validate(&dataset, &schema, &value).await?;
                             }
                         }
-                        let created = data.put(&dataset, &key, value).await?;
-                        Ok(msg.response(if created { StatusCode::CREATED } else { StatusCode::OK }, None))
+                        let created = data.put(&dataset, &key, value.clone()).await?;
+                        let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+                        let stored = if echo {
+                            Some(
+                                Body::from_bytes(value.to_string(), MediaType::json())
+                                    .with_schema(schema_url),
+                            )
+                        } else {
+                            None
+                        };
+                        let mut resp = msg.response(status, stored);
+                        resp.set_header("etag", &record_etag(&value));
+                        Ok(resp)
                     }
                     Method::PATCH => {
                         let body = msg
@@ -218,7 +282,7 @@ impl Service for DataService {
                         data.delete(&dataset, &key).await?;
                         Ok(msg.no_content())
                     }
-                    _ => Err(RsError::bad_request("record level supports GET, PUT, PATCH, DELETE")),
+                    _ => Err(RsError::bad_request("record level supports GET, PUT, POST, PATCH, DELETE")),
                 }
             }
 

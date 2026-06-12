@@ -20,6 +20,27 @@ impl FileService {
     }
 }
 
+/// Extension for a server-named file from its declared media type
+/// (keyless POST to a directory). Unknown types get no extension.
+fn extension_for(media_type: &MediaType) -> &'static str {
+    match media_type.essence() {
+        "application/json" => ".json",
+        "text/plain" => ".txt",
+        "text/html" => ".html",
+        "text/css" => ".css",
+        "text/csv" => ".csv",
+        "application/javascript" | "text/javascript" => ".js",
+        "application/wasm" => ".wasm",
+        "image/png" => ".png",
+        "image/jpeg" => ".jpg",
+        "image/gif" => ".gif",
+        "image/svg+xml" => ".svg",
+        "application/pdf" => ".pdf",
+        "application/zip" => ".zip",
+        _ => "",
+    }
+}
+
 fn parse_range(header: &str) -> Option<ByteRange> {
     // Single range only: `bytes=start-end` | `bytes=start-`.
     let spec = header.strip_prefix("bytes=")?;
@@ -90,9 +111,30 @@ impl Service for FileService {
                 resp.set_header("content-type", &MediaType::for_path(&path).to_string());
                 Ok(resp)
             }
+            // Store contract: keyless POST to a container creates a
+            // server-named child and returns its Location.
+            Method::POST if msg.url.is_directory() => {
+                let body = match msg.body {
+                    Some(b) => b,
+                    None => return Err(RsError::bad_request("write requires a body")),
+                };
+                let name = format!(
+                    "{}{}",
+                    uuid::Uuid::new_v4().simple(),
+                    extension_for(&body.media_type)
+                );
+                let child_path = format!("{path}{name}");
+                files.write(&child_path, body).await?;
+                let location = format!("{}{}", msg.url.base_path, child_path);
+                let template = Message::request(msg.method.clone(), &msg.url.path, &msg.tenant);
+                let mut resp = template.response(StatusCode::CREATED, None);
+                resp.trace = msg.trace.clone();
+                resp.set_header("location", &location);
+                Ok(resp)
+            }
             Method::PUT | Method::POST => {
                 if msg.url.is_directory() {
-                    return Err(RsError::bad_request("cannot write to a directory path"));
+                    return Err(RsError::bad_request("cannot PUT to a directory path"));
                 }
                 let body = match msg.body {
                     Some(b) => b,
@@ -111,7 +153,15 @@ impl Service for FileService {
             }
             Method::DELETE => {
                 if msg.url.is_directory() {
-                    files.delete_dir(&path).await?;
+                    // Store contract guard: non-empty containers delete only
+                    // with `?confirm=<container name>` (matching `data`).
+                    let dir_name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+                    if msg.url.query_param("confirm").as_deref() == Some(dir_name) && !dir_name.is_empty()
+                    {
+                        files.delete_dir_all(&path).await?;
+                    } else {
+                        files.delete_dir(&path).await?;
+                    }
                 } else {
                     files.delete(&path).await?;
                 }

@@ -86,6 +86,31 @@ fn meta(mount: &Mount) -> Map<String, Value> {
     out
 }
 
+/// API pattern + facets (the polymorphism contract, carried over from
+/// Restspace v1): `pattern` names the conversation shape so one client
+/// codepath can drive every mount sharing it; `facets` declare optional
+/// capabilities within the shape (feature-detect, don't special-case).
+fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
+    match mount.service.as_str() {
+        "file" => ("store", vec!["range", "confirm-delete"]),
+        "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
+        "pipeline" => ("transform", vec![]),
+        "query" => ("store-view", vec![]),
+        "auth" | "services" => ("api", vec![]),
+        s if s.starts_with("code:") => ("api", vec![]),
+        _ => ("api", vec![]),
+    }
+}
+
+fn with_pattern(mut entry: Value, mount: &Mount) -> Value {
+    let (pattern, facets) = pattern_of(mount);
+    entry["pattern"] = json!(pattern);
+    if !facets.is_empty() {
+        entry["facets"] = json!(facets);
+    }
+    entry
+}
+
 fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
     let services: Vec<Value> = readable_mounts(tenant, msg)
         .into_iter()
@@ -97,7 +122,7 @@ fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
             for (k, v) in meta(m) {
                 entry[k] = v;
             }
-            entry
+            with_pattern(entry, m)
         })
         .collect();
     json!({ "tenant": msg.tenant, "services": services })
@@ -125,7 +150,7 @@ fn agent_surface_doc(tenant: &Tenant, msg: &Message) -> Value {
                 for (k, v) in meta(mount) {
                     entry[k] = v;
                 }
-                entities.push(entry);
+                entities.push(with_pattern(entry, mount));
             }
             "pipeline" => {
                 let effect = mount
@@ -143,7 +168,7 @@ fn agent_surface_doc(tenant: &Tenant, msg: &Message) -> Value {
                 for (k, v) in meta(mount) {
                     entry[k] = v;
                 }
-                actions.push(entry);
+                actions.push(with_pattern(entry, mount));
             }
             "query" => {
                 if let Some(defs) = mount.config.get("queries").and_then(|q| q.as_object()) {
@@ -161,7 +186,7 @@ fn agent_surface_doc(tenant: &Tenant, msg: &Message) -> Value {
                         for (k, v) in meta(mount) {
                             entry[k] = v.clone();
                         }
-                        queries.push(entry);
+                        queries.push(with_pattern(entry, mount));
                     }
                 }
             }
@@ -185,32 +210,30 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
     for mount in readable_mounts(tenant, msg) {
         let base = mount.base_path.clone();
         match mount.service.as_str() {
+            // Store-patterned mounts share one pair of path-item shapes —
+            // structurally identical contracts, by construction.
             "file" => {
                 paths.insert(
+                    format!("{base}/{{dirPath}}/"),
+                    json!({ "$ref": "#/components/pathItems/StoreContainer" }),
+                );
+                paths.insert(
                     format!("{base}/{{filePath}}"),
-                    json!({
-                        "get": op("Read a file (Range supported) or list a directory", "pure"),
-                        "put": op("Write a file (streamed)", "idempotent"),
-                        "delete": op("Delete a file or empty directory", "idempotent"),
-                    }),
+                    json!({ "$ref": "#/components/pathItems/StoreChild" }),
                 );
             }
             "data" => {
                 paths.insert(
-                    format!("{base}/{{dataset}}"),
-                    json!({
-                        "get": op("List record keys (paginated)", "pure"),
-                        "post": op("Create a record with a generated key", "unsafe"),
-                    }),
+                    format!("{base}/"),
+                    json!({ "$ref": "#/components/pathItems/StoreContainer" }),
+                );
+                paths.insert(
+                    format!("{base}/{{dataset}}/"),
+                    json!({ "$ref": "#/components/pathItems/StoreContainer" }),
                 );
                 paths.insert(
                     format!("{base}/{{dataset}}/{{key}}"),
-                    json!({
-                        "get": op("Read a record (schema-typed)", "pure"),
-                        "put": op("Write a record (schema-validated)", "idempotent"),
-                        "patch": op("JSON merge-patch a record", "unsafe"),
-                        "delete": op("Delete a record", "idempotent"),
-                    }),
+                    json!({ "$ref": "#/components/pathItems/StoreChild" }),
                 );
                 paths.insert(
                     format!("{base}/{{dataset}}/.schema.json"),
@@ -293,6 +316,24 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
         },
         "paths": Value::Object(paths),
         "components": {
+            "pathItems": {
+                // The store pattern: one conversation shape for every
+                // store-patterned mount. Optional capabilities (Range,
+                // PATCH, schemas) are facets declared per mount on the
+                // discovery surface — feature-detect, don't special-case.
+                "StoreContainer": {
+                    "get": op("List children (application/vnd.rs2.dir+json: {path, entries: [{name, dir, ...}], total}; $take/$skip paginate; X-Total-Count)", "pure"),
+                    "post": op("Keyless create: store the body under a generated child name; 201 + Location (stores with the 'echo' facet return the stored representation)", "unsafe"),
+                    "delete": op("Delete the container; non-empty containers require ?confirm=<container name> (409 without it)", "idempotent"),
+                },
+                "StoreChild": {
+                    "get": op("Read the stored resource; ETag carries the version", "pure"),
+                    "put": op("Upsert; 201 created / 200 overwritten, empty body", "idempotent"),
+                    "post": op("Upsert and return the stored representation (stores with the 'echo' facet)", "unsafe"),
+                    "patch": op("JSON merge-patch (stores with the 'patch' facet)", "unsafe"),
+                    "delete": op("Delete the resource", "idempotent"),
+                }
+            },
             "responses": {
                 "Problem": {
                     "description": "Structured error (RFC 9457)",

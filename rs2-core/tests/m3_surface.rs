@@ -194,7 +194,12 @@ async fn discovery_surface_filters_and_advertises() {
     let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
     let doc = body_json(&mut openapi).await;
     assert_eq!(doc["openapi"], "3.1.0");
-    assert!(doc["paths"]["/data/{dataset}/{key}"]["put"].is_object());
+    // Store-patterned mounts reference one shared shape (client polymorphism).
+    assert_eq!(
+        doc["paths"]["/data/{dataset}/{key}"]["$ref"],
+        "#/components/pathItems/StoreChild"
+    );
+    assert!(doc["components"]["pathItems"]["StoreContainer"]["get"].is_object());
     let query_body =
         &doc["paths"]["/q/open-orders"]["post"]["requestBody"]["content"]["application/json"]["schema"];
     assert_eq!(query_body["required"][0], "status");

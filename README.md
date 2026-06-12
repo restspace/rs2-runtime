@@ -88,7 +88,13 @@ Done:
 - `file` + `data` services with documented PRD §10 semantics (streamed writes,
   Range/206, ETag from store versions, paginated listings, schema-validated
   CRUD with cached compiled validators, JSON merge PATCH, keyless POST,
-  `?confirm=` dataset delete).
+  `?confirm=` dataset delete) — both implementing the **store pattern**, one
+  normative conversation shape pinned by `tests/store_conformance.rs`
+  (carried over from Restspace v1's pattern system for client polymorphism):
+  trailing-slash dir+json listings at every container level, uniform
+  PUT/POST/DELETE semantics, the 409 + `?confirm=` container guard, ETags on
+  children. Mounts declare `pattern` + `facets` on the discovery surface;
+  the generated OpenAPI `$ref`s one shared store path-item shape.
 - Host-enforced tenant scoping on every store capability; local-fs and
   in-memory adapters.
 

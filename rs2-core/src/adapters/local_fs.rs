@@ -168,6 +168,20 @@ impl FileStore for LocalFsFileStore {
         })
     }
 
+    async fn delete_dir_all(&self, tenant: &str, path: &str) -> Result<(), RsError> {
+        if path.split('/').all(|s| s.is_empty()) {
+            return Err(RsError::bad_request("refusing to recursively delete the store root"));
+        }
+        let full = self.resolve(tenant, path)?;
+        tokio::fs::remove_dir_all(&full).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                RsError::not_found("directory does not exist")
+            } else {
+                RsError::internal(format!("recursive delete failed: {e}"))
+            }
+        })
+    }
+
     async fn list(&self, tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
         let full = self.resolve(tenant, path)?;
         let mut rd = match tokio::fs::read_dir(&full).await {
