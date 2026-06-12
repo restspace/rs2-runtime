@@ -60,6 +60,15 @@ pub trait Service: Send + Sync {
     async fn handle(&self, msg: Message, ctx: &ServiceContext) -> Result<Message, RsError>;
 }
 
+/// Whether a request's `If-None-Match` matches the resource's ETag
+/// (list-aware; weak validators compare by value; `*` matches anything).
+pub(crate) fn if_none_match_hits(msg: &Message, etag: &str) -> bool {
+    let Some(inm) = msg.header("if-none-match") else { return false };
+    inm.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.trim_start_matches("W/") == etag
+    })
+}
+
 /// Parse `$take`/`$skip` pagination query params with bounded defaults.
 pub(crate) fn pagination(msg: &Message) -> (usize, usize) {
     let take = msg

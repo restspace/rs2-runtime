@@ -224,11 +224,18 @@ impl Service for DataService {
                 match msg.method {
                     Method::GET => {
                         let value = data.get(&dataset, &key).await?;
+                        let etag = record_etag(&value);
+                        // Conditional GET: revalidate without resending.
+                        if super::if_none_match_hits(&msg, &etag) {
+                            let mut not_modified = msg.response(StatusCode::NOT_MODIFIED, None);
+                            not_modified.set_header("etag", &etag);
+                            return Ok(not_modified);
+                        }
                         let mut resp = msg.ok(Some(
                             Body::from_bytes(value.to_string(), MediaType::json()).with_schema(schema_url.clone()),
                         ));
                         resp.set_header("link", &format!("<{schema_url}>; rel=\"describedby\""));
-                        resp.set_header("etag", &record_etag(&value));
+                        resp.set_header("etag", &etag);
                         Ok(resp)
                     }
                     // Store contract: PUT upserts (empty body); POST upserts

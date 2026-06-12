@@ -136,6 +136,13 @@ Done:
   lockout; argon2id hashes with bcrypt migration verify; per-mount role
   specs (`readRoles`/`writeRoles`/`createRoles`, path-scoped grants like
   `"U /user/{email}"`) enforced in the wrapper.
+- **Caching, host-applied** (v1's universal `caching` config): default
+  `Cache-Control: no-store` on every response; mounts opt in with
+  `{"mode": "noStore"|"revalidate"|"cache", "maxAgeSeconds", "public",
+  "immutable"}` — `public` clamps to `private` + `Vary` on authenticated
+  mounts; `Set-Cookie` and error responses are always uncacheable; `file`
+  and `data` answer matching `If-None-Match` with 304s, so `revalidate`
+  mode is always-fresh at near-zero bandwidth.
 - **CORS, host-enforced** (PRD §5.2; v1's `trustedDomains` posture): tenant
   `cors` block — trusted origins get credentialed CORS and `SameSite=None;
   Secure` login cookies; allowed origins get plain CORS with bearer-only

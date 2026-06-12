@@ -58,6 +58,101 @@ impl LimitTable {
     }
 }
 
+/// Caching policy (per mount, host-applied — v1's universal `caching`
+/// config). The default everywhere is **`no-store`**: RS2 responses are
+/// tenant-scoped and principal-filtered, so nothing caches unless a mount
+/// deliberately opts in. Applied only when the response carries no
+/// `Cache-Control` of its own (so composed services can pass upstream
+/// headers through), never to error responses, and never to responses
+/// that set cookies.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CachePolicy {
+    pub mode: CacheMode,
+    pub max_age_seconds: u64,
+    /// `public` is honored only on mounts anonymously readable (`access`
+    /// absent, `"open"`, or `readRoles: "all"`); otherwise the policy is
+    /// clamped to `private` + `Vary: Authorization, Cookie` — a shared
+    /// cache must never serve one principal's response to another.
+    pub public: bool,
+    pub immutable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CacheMode {
+    /// Never stored anywhere (the default).
+    #[default]
+    NoStore,
+    /// May be stored but must revalidate (`no-cache`) — pairs with the
+    /// store services' conditional-GET 304s: always fresh, bandwidth saved.
+    Revalidate,
+    /// Cached for `maxAgeSeconds`.
+    Cache,
+}
+
+impl CachePolicy {
+    pub fn from_config(value: Option<&serde_json::Value>) -> CachePolicy {
+        value
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Whether a mount's read surface is anonymously readable (the
+    /// precondition for honoring `public`).
+    pub fn mount_is_openly_readable(mount_config: &serde_json::Value) -> bool {
+        match mount_config.get("access") {
+            None => true,
+            Some(serde_json::Value::String(s)) => s == "open",
+            Some(serde_json::Value::Object(spec)) => {
+                spec.get("readRoles").and_then(|v| v.as_str()).unwrap_or("all") == "all"
+            }
+            _ => false,
+        }
+    }
+
+    /// Apply to a successful response lacking its own `Cache-Control`.
+    pub fn apply(&self, resp: &mut Message, openly_readable: bool) {
+        if resp.header("cache-control").is_some()
+            || resp.headers.contains_key(http::header::SET_COOKIE)
+        {
+            return;
+        }
+        let clamped = self.public && !openly_readable;
+        let scope = if self.public && !clamped { "public" } else { "private" };
+        let value = match self.mode {
+            CacheMode::NoStore => "no-store".to_string(),
+            CacheMode::Revalidate => format!("{scope}, no-cache"),
+            CacheMode::Cache => {
+                let immutable = if self.immutable { ", immutable" } else { "" };
+                format!("{scope}, max-age={}{immutable}", self.max_age_seconds)
+            }
+        };
+        resp.set_header("cache-control", &value);
+        if (clamped || !self.public) && self.mode != CacheMode::NoStore {
+            append_header_value(resp, "vary", "authorization, cookie");
+        }
+    }
+}
+
+/// Comma-append to a header without clobbering existing values (Vary is
+/// written by both CORS and caching).
+pub fn append_header_value(resp: &mut Message, name: &'static str, value: &str) {
+    let merged = match resp.header(name) {
+        Some(existing) if !existing.is_empty() => {
+            let has = existing
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(value.trim()));
+            if has {
+                return;
+            }
+            format!("{existing}, {value}")
+        }
+        _ => value.to_string(),
+    };
+    resp.set_header(name, &merged);
+}
+
 /// CORS policy (per tenant, host-enforced — carried over from v1 where the
 /// runtime enforced `trustedDomains`). Trusted origins receive credentialed
 /// CORS and may send cookie-authenticated unsafe requests; allowed origins
@@ -132,7 +227,7 @@ impl CorsPolicy {
             return;
         }
         resp.set_header("access-control-allow-origin", origin);
-        resp.set_header("vary", "origin");
+        append_header_value(resp, "vary", "origin");
         resp.set_header("access-control-expose-headers", EXPOSED_HEADERS);
         if self.is_trusted(origin) {
             resp.set_header("access-control-allow-credentials", "true");
@@ -148,7 +243,7 @@ impl CorsPolicy {
         let requested_method = msg.header("access-control-request-method")?;
         let mut resp = msg.response(http::StatusCode::NO_CONTENT, None);
         resp.set_header("access-control-allow-origin", origin);
-        resp.set_header("vary", "origin");
+        append_header_value(&mut resp, "vary", "origin");
         resp.set_header("access-control-allow-methods", requested_method);
         let allow_headers = msg
             .header("access-control-request-headers")

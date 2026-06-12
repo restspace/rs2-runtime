@@ -196,6 +196,14 @@ impl Runtime {
                 }
             }
         }
+        // Default caching posture: anything that didn't opt in — errors,
+        // discovery docs, preflights, auth responses — is never stored.
+        // (304s are exempt: the cached entry's own policy governs them.)
+        if resp.header("cache-control").is_none()
+            && resp.status != Some(StatusCode::NOT_MODIFIED)
+        {
+            resp.set_header("cache-control", "no-store");
+        }
         resp
     }
 
@@ -256,10 +264,17 @@ impl Runtime {
             .ok_or_else(|| RsError::internal("mount has no built instance"))?;
         let (service, ctx) = (service.clone(), ctx.clone());
 
+        // Caching policy (v1's universal `caching` config, host-applied):
+        // resolved per mount, applied to successful responses below.
+        let cache_policy =
+            crate::wrapper::CachePolicy::from_config(mount.config.get("caching"));
+        let openly_readable =
+            crate::wrapper::CachePolicy::mount_is_openly_readable(&mount.config);
+
         // Idempotency-Key handling (PRD §7.2): dedupe + replay around the
         // service invocation, scoped tenant + mount + method + path.
         let idem_key = msg.header("idempotency-key").map(str::to_string);
-        if let Some(key) = idem_key {
+        let result = if let Some(key) = idem_key {
             if key.len() > idempotency::MAX_KEY_LEN {
                 return Err(RsError::bad_request(format!(
                     "Idempotency-Key exceeds {} characters",
@@ -269,7 +284,7 @@ impl Runtime {
             let scope = idempotency::scope_for(&msg, &mount.base_path);
             let hash = idempotency::payload_hash(&msg);
             let store = self.adapters.idempotency.clone();
-            return match store.begin(&scope, &key, hash.as_deref()).await? {
+            match store.begin(&scope, &key, hash.as_deref()).await? {
                 idempotency::Begin::Replay(stored) => Ok(stored.into_message(&msg)),
                 idempotency::Begin::InFlight => {
                     let mut err = RsError::conflict(
@@ -300,10 +315,20 @@ impl Runtime {
                         }
                     }
                 }
-            };
-        }
+            }
+        } else {
+            self.invoke(service, ctx, msg).await
+        };
 
-        self.invoke(service, ctx, msg).await
+        // Apply the mount's caching policy to successful responses that
+        // didn't set their own Cache-Control (Set-Cookie responses are
+        // exempt inside `apply`; errors get the catch-all `no-store`).
+        result.map(|mut resp| {
+            if resp.is_ok() {
+                cache_policy.apply(&mut resp, openly_readable);
+            }
+            resp
+        })
     }
 
     async fn invoke(

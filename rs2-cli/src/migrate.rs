@@ -66,6 +66,23 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
             config.insert("retry".to_string(), retry.clone());
         }
 
+        // v1 caching ({maxAge?, cache?, sendETag?}) → the RS2 caching block.
+        // sendETag is dropped: RS2 stores always emit ETags.
+        if let Some(caching) = svc.get("caching").and_then(|c| c.as_object()) {
+            let cache_on = caching.get("cache").and_then(|v| v.as_bool()).unwrap_or(false)
+                || caching.get("maxAge").is_some();
+            let mut block = serde_json::Map::new();
+            if cache_on {
+                block.insert("mode".to_string(), serde_json::json!("cache"));
+                if let Some(max_age) = caching.get("maxAge") {
+                    block.insert("maxAgeSeconds".to_string(), max_age.clone());
+                }
+            } else {
+                block.insert("mode".to_string(), serde_json::json!("noStore"));
+            }
+            config.insert("caching".to_string(), serde_json::Value::Object(block));
+        }
+
         // Pipelines are stored specs now, not config: convert the string
         // DSL to the typed envelope and hand it to the user to PUT (a v1
         // single-pipeline mount maps to the `.root` spec, preserving its
@@ -129,7 +146,7 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
             }
         }
 
-        for ignored in ["prePipeline", "postPipeline", "caching", "infraName", "adapterSource"] {
+        for ignored in ["prePipeline", "postPipeline", "infraName", "adapterSource"] {
             if svc.get(ignored).is_some() {
                 warnings.push(format!(
                     "{base_path}: '{ignored}' is not carried over (see the migration guide)"

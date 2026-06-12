@@ -95,11 +95,25 @@ impl Service for FileService {
                     ),
                     None => (None, None),
                 };
-                if let Some(etag) = etag {
-                    resp.set_header("etag", &etag);
+                if let Some(etag) = &etag {
+                    resp.set_header("etag", etag);
                 }
-                if let Some(lm) = last_modified {
-                    resp.set_header("last-modified", &lm);
+                if let Some(lm) = &last_modified {
+                    resp.set_header("last-modified", lm);
+                }
+                // Conditional GET: a matching If-None-Match revalidates the
+                // caller's copy without resending the body.
+                if let Some(etag) = &etag {
+                    if super::if_none_match_hits(&msg, etag) {
+                        let mut not_modified =
+                            msg.response(StatusCode::NOT_MODIFIED, None);
+                        not_modified.set_header("etag", etag);
+                        if let Some(lm) = &last_modified {
+                            not_modified.set_header("last-modified", lm);
+                        }
+                        not_modified.set_header("accept-ranges", "bytes");
+                        return Ok(not_modified);
+                    }
                 }
                 Ok(resp)
             }
