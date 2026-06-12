@@ -386,9 +386,22 @@ async fn code_deploys_content_addressed_and_mounts() {
     let mut resp2 = rt.handle(again).await;
     assert_eq!(body_json(&mut resp2).await["ref"].as_str().unwrap(), code_ref);
 
-    // Versions list.
+    // Versions list; nothing mounts it yet, so `current` is empty.
     let mut list = rt.handle(req(Method::GET, "/services/code/echo")).await;
-    assert_eq!(body_json(&mut list).await["versions"].as_array().unwrap().len(), 1);
+    let listing = body_json(&mut list).await;
+    assert_eq!(listing["versions"].as_array().unwrap().len(), 1);
+    assert_eq!(listing["current"].as_array().unwrap().len(), 0);
+
+    // Read back the deployed bundle: immutable, ETag = version.
+    let version = code_ref.strip_prefix("code:echo@").unwrap().to_string();
+    let mut read = rt.handle(req(Method::GET, &format!("/services/code/echo/{version}"))).await;
+    assert_eq!(read.status, Some(StatusCode::OK));
+    assert_eq!(read.header("etag").unwrap(), format!("\"{version}\""));
+    assert!(read.header("cache-control").unwrap().contains("immutable"));
+    let bytes = read.body.as_mut().unwrap().materialize(65536).await.unwrap();
+    assert_eq!(&bytes[..4], b"\0asm", "the stored bytes round-trip");
+    let missing = rt.handle(req(Method::GET, "/services/code/echo/feedf00ddeadbeef")).await;
+    assert_eq!(missing.status, Some(StatusCode::NOT_FOUND));
 
     // Mount it via self-config; without the wasm feature the mount builds
     // but serves a structured 501 at request time.
@@ -399,6 +412,12 @@ async fn code_deploys_content_addressed_and_mounts() {
         .push(json!({ "path": "/custom", "service": code_ref, "config": { "grants": {} } }));
     let put = req(Method::PUT, "/services/raw").with_json(&config);
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::NO_CONTENT));
+
+    // The listing now reports where (and which version) is live.
+    let mut list = rt.handle(req(Method::GET, "/services/code/echo")).await;
+    let listing = body_json(&mut list).await;
+    assert_eq!(listing["current"][0]["path"], "/custom", "{listing}");
+    assert_eq!(listing["current"][0]["version"], version);
 
     let mut hit = rt.handle(req(Method::GET, "/custom/hello")).await;
     assert_eq!(hit.status, Some(StatusCode::NOT_IMPLEMENTED));

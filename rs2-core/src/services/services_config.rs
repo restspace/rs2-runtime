@@ -307,11 +307,60 @@ impl Service for ServicesService {
                     .iter()
                     .map(|e| e.name.trim_end_matches(".wasm").trim_end_matches(".js").to_string())
                     .collect();
-                Ok(msg.ok_json(&serde_json::json!({ "name": name, "versions": versions })))
+                // "current": the version(s) the live config actually mounts
+                // (the deployment store itself has no notion of liveness).
+                let (config, _) = control.raw_config(&msg.tenant).await?;
+                let wanted = format!("code:{name}@");
+                let current: Vec<serde_json::Value> = config
+                    .get("mounts")
+                    .and_then(|m| m.as_array())
+                    .map(|ms| {
+                        ms.iter()
+                            .filter_map(|m| {
+                                let service = m.get("service")?.as_str()?;
+                                let version = service.strip_prefix(wanted.as_str())?;
+                                Some(serde_json::json!({
+                                    "path": m.get("path"),
+                                    "version": version,
+                                }))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(msg.ok_json(&serde_json::json!({
+                    "name": name,
+                    "versions": versions,
+                    "current": current,
+                })))
+            }
+
+            // Read back a deployed bundle: immutable per version, so the
+            // version is the ETag and the response may cache forever.
+            (&http::Method::GET, ["code", name, version]) => {
+                let files = ctx
+                    .files
+                    .as_ref()
+                    .ok_or_else(|| RsError::internal("services service has no file capability"))?;
+                let (name, version) = (name.to_string(), version.to_string());
+                let candidates = [
+                    (super::code::code_path(&name, &version), "application/wasm"),
+                    (super::code::code_path_js(&name, &version), "application/javascript"),
+                ];
+                for (path, media_type) in candidates {
+                    if let Ok(mut body) = files.read(&path, None).await {
+                        body.media_type = crate::message::MediaType::new(media_type);
+                        let mut resp = msg.ok(Some(body));
+                        resp.set_header("etag", &format!("\"{version}\""));
+                        resp.set_header("cache-control", "private, max-age=31536000, immutable");
+                        return Ok(resp);
+                    }
+                }
+                Err(RsError::not_found(format!("no deployed code '{name}@{version}'")))
             }
 
             _ => Err(RsError::not_found(format!(
-                "services endpoint '{}' (have: GET catalogue/services/raw/code, PUT raw, PUT code/<name>)",
+                "services endpoint '{}' (have: GET catalogue/services/raw/code, \
+                 GET code/<name>/<version>, PUT raw, PUT code/<name>)",
                 msg.url.service_path
             ))),
         }
