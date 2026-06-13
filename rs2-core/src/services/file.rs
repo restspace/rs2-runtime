@@ -86,17 +86,15 @@ struct SiteOptions {
 
 impl SiteOptions {
     fn from_config(config: &serde_json::Value) -> SiteOptions {
-        let spa_fallback =
-            config.get("spaFallback").and_then(|v| v.as_bool()).unwrap_or(false);
-        let default_resource = config
-            .get("defaultResource")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-            .or_else(|| spa_fallback.then(|| "index.html".to_string()));
+        let cfg = serde_json::from_value::<crate::config_schema::FileConfig>(config.clone())
+            .unwrap_or_default();
+        let default_resource = cfg
+            .default_resource
+            .or_else(|| cfg.spa_fallback.then(|| "index.html".to_string()));
         SiteOptions {
             default_resource,
-            spa_fallback,
-            listings: config.get("listings").and_then(|v| v.as_bool()).unwrap_or(true),
+            spa_fallback: cfg.spa_fallback,
+            listings: cfg.listings,
         }
     }
 }

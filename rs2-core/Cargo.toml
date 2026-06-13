@@ -28,6 +28,7 @@ jsonata-rs = "0.3"
 jsonschema.workspace = true
 percent-encoding.workspace = true
 rand = "0.8"
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"

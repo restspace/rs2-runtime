@@ -65,7 +65,7 @@ impl LimitTable {
 /// `Cache-Control` of its own (so composed services can pass upstream
 /// headers through), never to error responses, and never to responses
 /// that set cookies.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CachePolicy {
     pub mode: CacheMode,
@@ -78,7 +78,7 @@ pub struct CachePolicy {
     pub immutable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum CacheMode {
     /// Never stored anywhere (the default).
@@ -158,7 +158,7 @@ pub fn append_header_value(resp: &mut Message, name: &'static str, value: &str) 
 /// CORS and may send cookie-authenticated unsafe requests; allowed origins
 /// receive plain CORS (bearer-token browser apps); everything else gets no
 /// CORS headers. Same-origin requests never involve this policy.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CorsPolicy {
     /// Credentialed CORS + cross-site cookies (`SameSite=None; Secure`).

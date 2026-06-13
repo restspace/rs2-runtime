@@ -23,30 +23,13 @@ impl Default for ServicesService {
     }
 }
 
-/// Catalogue of available services (PRD §10.6). Static for the built-ins;
-/// custom `code:` services join via deployment (M3).
+/// Catalogue of available services with config schemas (PRD §10.6). Built
+/// from the typed config model in [`crate::config_schema`] so the advertised
+/// schemas can't drift from what the runtime deserializes; it also carries
+/// the shared `baseSchema` (mount envelope) and `tenantSchema`. Static for
+/// the built-ins; custom `code:` services join via deployment (M3).
 fn catalogue() -> serde_json::Value {
-    serde_json::json!({
-        "services": [
-            { "name": "file", "description": "Streamed file storage (PRD §10.1)",
-              "configSchema": { "type": "object", "properties": {} } },
-            { "name": "data", "description": "Schema-validated JSON store (PRD §10.2)",
-              "configSchema": { "type": "object", "properties": {
-                  "enforceSchema": { "type": "boolean" } } } },
-            { "name": "pipeline", "description": "Pipeline store (PRD §10.3): PUT spec envelopes to /<mount>/.pipelines/<name> (.root governs the mount root); every other path on any verb executes the longest-prefix match",
-              "configSchema": { "type": "object", "properties": {
-                  "retry": { "type": "object" },
-                  "store": { "type": "object", "properties": { "root": { "type": "string" } } } } } },
-            { "name": "query", "description": "Stored parameterized queries (PRD §10.4): PUT envelopes {language?, query, params?, output?} to /<mount>/.queries/<name>; any verb elsewhere executes the longest-prefix match",
-              "configSchema": { "type": "object", "properties": {
-                  "store": { "type": "object", "properties": { "root": { "type": "string" } } } } } },
-            { "name": "auth", "description": "Authentication & RBAC (PRD §10.5)",
-              "configSchema": { "type": "object", "properties": {
-                  "userDataset": { "type": "string" } } } },
-            { "name": "services", "description": "Self-configuration API (PRD §10.6)",
-              "configSchema": { "type": "object", "properties": {} } }
-        ]
-    })
+    crate::config_schema::catalogue()
 }
 
 /// The placeholder secrets read back as. A PUT carrying it means "keep the

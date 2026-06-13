@@ -94,7 +94,11 @@ fn merge_patch(target: &mut Value, patch: &Value) {
 impl Service for DataService {
     async fn handle(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
         let data = ctx.data.as_ref().ok_or_else(|| RsError::capability_denied("data"))?;
-        let enforce_schema = ctx.config.get("enforceSchema").and_then(|v| v.as_bool()).unwrap_or(false);
+        let enforce_schema = serde_json::from_value::<crate::config_schema::DataConfig>(
+            ctx.config.clone(),
+        )
+        .unwrap_or_default()
+        .enforce_schema;
         let segments: Vec<String> = msg.url.service_segments().iter().map(|s| s.to_string()).collect();
         let schema_base = format!("{}", msg.url.base_path);
 

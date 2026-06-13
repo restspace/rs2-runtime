@@ -1,0 +1,239 @@
+//! Typed tenant/mount configuration and its JSON Schemas (G1).
+//!
+//! Config used to be free-form `serde_json::Value` picked apart field by
+//! field; the only typed slices were `caching`/`cors`/`retry`/`auth`. This
+//! module gives every config slice a Rust type and derives the JSON Schema
+//! from that same type via `schemars`, so the schema a config UI consumes
+//! (`GET /<services-mount>/catalogue`) cannot drift from what the runtime
+//! deserializes.
+//!
+//! Layout mirrors how config is actually shaped: a mount's `config` object
+//! is the **union** of a common envelope ([`MountBaseConfig`] — `access`,
+//! `caching`, `retry`) and the service's own fields (the per-service structs
+//! below). The catalogue therefore advertises a `baseSchema` (envelope), a
+//! `tenantSchema` (top-level `auth`/`cors`/`retry`), and one `configSchema`
+//! per service type.
+//!
+//! `access` is typed here for documentation/forms only; the wrapper still
+//! enforces it from the raw value ([`crate::wrapper::check_access`]) because
+//! the role-spec strings carry a path-scoping mini-DSL the struct doesn't
+//! model.
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::retry::RetryPolicy;
+use crate::services::auth::AuthSettings;
+use crate::wrapper::{CachePolicy, CorsPolicy};
+
+/// Render a type's JSON Schema as a JSON value (draft-07, per `schemars`).
+pub fn schema_of<T: JsonSchema>() -> Value {
+    let root = schemars::gen::SchemaGenerator::default().into_root_schema_for::<T>();
+    serde_json::to_value(root).expect("a derived JSON Schema serializes to JSON")
+}
+
+/// Schema for a write-only secret string. Referenced via `#[schemars(
+/// schema_with = "...")]` on secret fields so a config UI renders them masked
+/// and never round-trips the value back: `GET /raw` masks secrets as
+/// `"<secret>"`, and a PUT keeps the stored value when it sees that marker.
+pub fn secret_string_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    let mut obj = <String as JsonSchema>::json_schema(gen).into_object();
+    obj.format = Some("password".to_string());
+    obj.metadata().write_only = true;
+    schemars::schema::Schema::Object(obj)
+}
+
+/// Per-mount access control (the `access` field). Either a string shorthand
+/// (`"open"` / `"authenticated"`) or an object of space-separated role specs.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AccessControl {
+    /// `"open"` (anonymous) or `"authenticated"` (any valid principal).
+    Shorthand(AccessShorthand),
+    /// Per-verb role specs.
+    Roles(RoleAccess),
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessShorthand {
+    Open,
+    Authenticated,
+}
+
+/// Space-separated role-spec strings per verb class. A token may be followed
+/// by a path pattern (`"U /user/{email}"`) scoping that role.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RoleAccess {
+    pub read_roles: Option<String>,
+    pub write_roles: Option<String>,
+    pub create_roles: Option<String>,
+    pub manage_roles: Option<String>,
+}
+
+/// The common mount-config envelope every service shares (the `baseSchema`).
+/// A mount's full `config` is this merged with the service's own fields.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MountBaseConfig {
+    /// Access control for this mount (default-deny writes, open reads).
+    pub access: Option<AccessControl>,
+    /// Host-applied response caching (default `no-store`).
+    pub caching: Option<CachePolicy>,
+    /// Mount-level retry override in the resolution chain (PRD §7.3).
+    pub retry: Option<RetryPolicy>,
+}
+
+/// Top-level tenant settings outside the mount list (the `tenantSchema`).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TenantSettings {
+    pub auth: Option<AuthSettings>,
+    pub cors: Option<CorsPolicy>,
+    pub retry: Option<RetryPolicy>,
+}
+
+// ---- per-service config -------------------------------------------------
+
+/// `file` service config (beyond the base envelope).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FileConfig {
+    /// Resource served for directory GETs (static-site mode), e.g.
+    /// `index.html`. Defaults to `index.html` when `spaFallback` is set.
+    pub default_resource: Option<String>,
+    /// Extension-less misses serve the root default resource (SPA routing).
+    pub spa_fallback: bool,
+    /// Whether directory GETs return `dir+json` listings (default `true`).
+    pub listings: bool,
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        FileConfig { default_resource: None, spa_fallback: false, listings: true }
+    }
+}
+
+/// `data` service config (beyond the base envelope).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DataConfig {
+    /// Reject writes that fail the dataset's `.schema.json` (default `false`).
+    pub enforce_schema: bool,
+}
+
+/// Storage-root override shared by spec stores.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StoreConfig {
+    /// Storage root; defaults to `.rs2-<kind><mount>`.
+    pub root: Option<String>,
+}
+
+/// `pipeline` service config (beyond the base envelope).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PipelineConfig {
+    pub store: Option<StoreConfig>,
+    pub retry: Option<RetryPolicy>,
+}
+
+/// `query` service config (beyond the base envelope).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QueryConfig {
+    pub store: Option<StoreConfig>,
+}
+
+/// `services` self-config API: no fields beyond the base envelope.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServicesConfig {}
+
+/// The control-surface catalogue (`GET /<services-mount>/catalogue`):
+/// available service types with full config schemas, plus the shared
+/// `baseSchema` (mount envelope) and `tenantSchema` (top-level settings).
+pub fn catalogue() -> Value {
+    serde_json::json!({
+        "baseSchema": schema_of::<MountBaseConfig>(),
+        "tenantSchema": schema_of::<TenantSettings>(),
+        "services": [
+            { "name": "file",
+              "description": "Streamed file storage (PRD §10.1)",
+              "configSchema": schema_of::<FileConfig>() },
+            { "name": "data",
+              "description": "Schema-validated JSON store (PRD §10.2)",
+              "configSchema": schema_of::<DataConfig>() },
+            { "name": "pipeline",
+              "description": "Pipeline store (PRD §10.3): PUT spec envelopes to /<mount>/.pipelines/<name> (.root governs the mount root); every other path on any verb executes the longest-prefix match",
+              "configSchema": schema_of::<PipelineConfig>() },
+            { "name": "query",
+              "description": "Stored parameterized queries (PRD §10.4): PUT envelopes {language?, query, params?, output?} to /<mount>/.queries/<name>; any verb elsewhere executes the longest-prefix match",
+              "configSchema": schema_of::<QueryConfig>() },
+            { "name": "auth",
+              "description": "Authentication & RBAC (PRD §10.5)",
+              "configSchema": schema_of::<AuthSettings>() },
+            { "name": "services",
+              "description": "Self-configuration API (PRD §10.6)",
+              "configSchema": schema_of::<ServicesConfig>() }
+        ]
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every advertised schema must be a valid JSON Schema the runtime's own
+    /// validator can compile — the cheap guard against malformed output.
+    #[test]
+    fn catalogue_schemas_compile() {
+        let cat = catalogue();
+        jsonschema::validator_for(&cat["baseSchema"]).expect("baseSchema compiles");
+        jsonschema::validator_for(&cat["tenantSchema"]).expect("tenantSchema compiles");
+        for svc in cat["services"].as_array().unwrap() {
+            let name = svc["name"].as_str().unwrap();
+            jsonschema::validator_for(&svc["configSchema"])
+                .unwrap_or_else(|e| panic!("{name} configSchema compiles: {e}"));
+        }
+    }
+
+    /// A schema and its deserializer come from the same type, so a config
+    /// that deserializes must also validate against the advertised schema
+    /// (and vice-versa) — the anti-drift round trip.
+    #[test]
+    fn typed_config_round_trips_against_its_schema() {
+        let file_schema = schema_of::<FileConfig>();
+        let validator = jsonschema::validator_for(&file_schema).unwrap();
+
+        let sample = serde_json::json!({ "defaultResource": "index.html", "spaFallback": true });
+        assert!(validator.is_valid(&sample));
+        let typed: FileConfig = serde_json::from_value(sample).unwrap();
+        assert_eq!(typed.default_resource.as_deref(), Some("index.html"));
+        assert!(typed.spa_fallback);
+
+        // The base envelope accepts both access shorthands and role objects.
+        let base_schema = schema_of::<MountBaseConfig>();
+        let base = jsonschema::validator_for(&base_schema).unwrap();
+        assert!(base.is_valid(&serde_json::json!({ "access": "open" })));
+        assert!(base.is_valid(&serde_json::json!({
+            "access": { "readRoles": "all", "writeRoles": "A" }
+        })));
+        serde_json::from_value::<MountBaseConfig>(
+            serde_json::json!({ "access": { "writeRoles": "A E" }, "caching": { "mode": "cache", "maxAgeSeconds": 60 } }),
+        )
+        .expect("envelope deserializes");
+    }
+
+    /// The signing key is advertised as a write-only secret so a config UI
+    /// renders it masked and never expects it back from `GET /raw`.
+    #[test]
+    fn jwt_secret_is_marked_write_only() {
+        let auth = schema_of::<AuthSettings>();
+        let jwt = &auth["properties"]["jwtSecret"];
+        assert_eq!(jwt["writeOnly"], serde_json::json!(true), "schema: {auth:#}");
+        assert_eq!(jwt["format"], serde_json::json!("password"));
+    }
+}

@@ -28,10 +28,11 @@ type HmacSha512 = Hmac<Sha512>;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 /// Tenant auth settings (the tenant config's `auth` object).
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AuthSettings {
     /// Per-tenant token signing key (PRD §10.5).
+    #[schemars(schema_with = "crate::config_schema::secret_string_schema")]
     pub jwt_secret: String,
     pub session_minutes: u64,
     pub max_attempts: u32,

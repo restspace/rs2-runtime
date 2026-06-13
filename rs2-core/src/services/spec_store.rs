@@ -49,10 +49,12 @@ pub struct SpecStore {
 /// `"store": {"root": ...}` or the default `.rs2-<kind><mount base>`.
 /// (Also used by discovery, which lists specs through the tenant handle.)
 pub fn store_root(default_kind_prefix: &str, base_path: &str, config: &Value) -> String {
-    config
+    let store = config
         .get("store")
-        .and_then(|s| s.get("root"))
-        .and_then(|r| r.as_str())
+        .and_then(|s| serde_json::from_value::<crate::config_schema::StoreConfig>(s.clone()).ok())
+        .unwrap_or_default();
+    store
+        .root
         .map(|r| r.trim_matches('/').to_string())
         .unwrap_or_else(|| format!("{default_kind_prefix}{base_path}").trim_matches('/').to_string())
 }

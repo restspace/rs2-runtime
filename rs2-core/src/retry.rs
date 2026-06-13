@@ -51,7 +51,7 @@ impl EffectClass {
 /// Declarative retry policy (PRD §7.3, Restspace shape retained).
 /// Resolution: per-call override → mount config → tenant default → runtime
 /// default ([`RetryPolicy::resolve`]).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct RetryPolicy {
     pub enabled: bool,
@@ -65,7 +65,7 @@ pub struct RetryPolicy {
     pub respect_retry_after: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Jitter {
     None,
