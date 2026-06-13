@@ -126,7 +126,7 @@ fn meta(mount: &Mount) -> Map<String, Value> {
 fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
     match mount.service.as_str() {
         "file" => {
-            let mut facets = vec!["range", "confirm-delete"];
+            let mut facets = vec!["range", "confirm-delete", "move"];
             if mount.config.get("defaultResource").is_some()
                 || mount.config.get("spaFallback").is_some()
             {
@@ -176,7 +176,7 @@ pub fn describe_mount(mount: &Mount) -> Value {
 /// since their verbs are service-defined.
 pub fn allowed_methods(mount: &Mount) -> Vec<&'static str> {
     let (pattern, facets) = pattern_of(mount);
-    match pattern {
+    let mut methods = match pattern {
         "store" if facets.contains(&"patch") => {
             vec!["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"]
         }
@@ -186,7 +186,11 @@ pub fn allowed_methods(mount: &Mount) -> Vec<&'static str> {
         }
         "view" => vec!["GET", "HEAD", "OPTIONS"],
         _ => vec!["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
+    };
+    if facets.contains(&"move") {
+        methods.push("MOVE");
     }
+    methods
 }
 
 fn services_doc(tenant: &Tenant, msg: &Message) -> Value {

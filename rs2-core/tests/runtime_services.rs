@@ -94,6 +94,86 @@ async fn file_write_read_list_delete() {
 }
 
 #[tokio::test]
+async fn file_move_renames_and_lists_content_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = test_runtime(dir.path());
+    let mv = || Method::from_bytes(b"MOVE").unwrap();
+
+    rt.handle(req(Method::PUT, "/files/a.txt").with_body(Body::from_string("x", MediaType::new("text/plain"))))
+        .await;
+
+    // MOVE to a fresh name: created → 201, Location points at the new path.
+    let mut m = req(mv(), "/files/a.txt");
+    m.set_header("destination", "/files/b.txt");
+    let resp = rt.handle(m).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED));
+    assert_eq!(resp.header("location"), Some("/files/b.txt"));
+
+    // Source gone, destination readable.
+    assert_eq!(rt.handle(req(Method::GET, "/files/a.txt")).await.status, Some(StatusCode::NOT_FOUND));
+    let mut got = rt.handle(req(Method::GET, "/files/b.txt")).await;
+    assert_eq!(got.status, Some(StatusCode::OK));
+    assert_eq!(&got.body.as_mut().unwrap().materialize(16).await.unwrap()[..], b"x");
+
+    // Listing carries per-entry contentType (G5).
+    let mut listing = rt.handle(req(Method::GET, "/files/")).await;
+    let doc = listing.body.as_mut().unwrap().as_json(65536).await.unwrap();
+    let entry = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "b.txt")
+        .unwrap();
+    assert!(entry["contentType"].as_str().unwrap().starts_with("text/plain"), "{entry}");
+
+    // MOVE over an existing file overwrites → 200.
+    rt.handle(req(Method::PUT, "/files/c.txt").with_body(Body::from_string("y", MediaType::new("text/plain"))))
+        .await;
+    let mut m2 = req(mv(), "/files/c.txt");
+    m2.set_header("destination", "/files/b.txt");
+    assert_eq!(rt.handle(m2).await.status, Some(StatusCode::OK));
+
+    // Missing source → 404.
+    let mut m3 = req(mv(), "/files/nope.txt");
+    m3.set_header("destination", "/files/x.txt");
+    assert_eq!(rt.handle(m3).await.status, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
+async fn data_schema_index_and_listing_content_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = test_runtime(dir.path());
+
+    let schema = json!({ "type": "object", "properties": { "n": { "type": "integer" } } });
+    assert_eq!(
+        rt.handle(req(Method::PUT, "/data/widgets/.schema.json").with_json(&schema)).await.status,
+        Some(StatusCode::OK)
+    );
+    assert_eq!(
+        rt.handle(req(Method::PUT, "/data/widgets/w1").with_json(&json!({ "n": 1 }))).await.status,
+        Some(StatusCode::CREATED)
+    );
+
+    // .schemas indexes every dataset's installed schema in one call (G6).
+    let mut idx = rt.handle(req(Method::GET, "/data/.schemas")).await;
+    assert_eq!(idx.status, Some(StatusCode::OK));
+    let doc = idx.body.as_mut().unwrap().as_json(65536).await.unwrap();
+    assert_eq!(doc["schemas"]["widgets"]["schemaUrl"], "/data/widgets/.schema.json");
+    assert_eq!(doc["schemas"]["widgets"]["schema"]["properties"]["n"]["type"], "integer");
+
+    // Record listings carry contentType (G5).
+    let mut listing = rt.handle(req(Method::GET, "/data/widgets/")).await;
+    let doc = listing.body.as_mut().unwrap().as_json(65536).await.unwrap();
+    let entry = doc["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "w1")
+        .unwrap();
+    assert_eq!(entry["contentType"], "application/json");
+}
+
+#[tokio::test]
 async fn path_traversal_is_rejected_at_the_router() {
     let dir = tempfile::tempdir().unwrap();
     let rt = test_runtime(dir.path());

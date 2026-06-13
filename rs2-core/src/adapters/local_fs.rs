@@ -156,6 +156,33 @@ impl FileStore for LocalFsFileStore {
         Ok(())
     }
 
+    async fn rename(&self, tenant: &str, from: &str, to: &str) -> Result<bool, RsError> {
+        let src = self.resolve(tenant, from)?;
+        let dst = self.resolve(tenant, to)?;
+        let smd = tokio::fs::metadata(&src)
+            .await
+            .map_err(|_| RsError::not_found("source does not exist"))?;
+        if smd.is_dir() {
+            return Err(RsError::bad_request("source is a directory; file move only"));
+        }
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let existed = match tokio::fs::metadata(&dst).await {
+            Ok(md) if md.is_dir() => {
+                return Err(RsError::conflict("destination is a directory"))
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        // On Windows rename-over-existing fails; remove the target first.
+        if existed {
+            let _ = tokio::fs::remove_file(&dst).await;
+        }
+        tokio::fs::rename(&src, &dst).await?;
+        Ok(!existed)
+    }
+
     async fn delete_dir(&self, tenant: &str, path: &str) -> Result<(), RsError> {
         let full = self.resolve(tenant, path)?;
         // remove_dir only removes empty directories, matching the contract.
@@ -203,6 +230,7 @@ impl FileStore for LocalFsFileStore {
             }
             let md = entry.metadata().await?;
             let is_dir = md.is_dir();
+            let content_type = if is_dir { None } else { Some(MediaType::for_path(&name).to_string()) };
             entries.push(DirEntry {
                 name: if is_dir { format!("{name}/") } else { name },
                 size: if is_dir { 0 } else { md.len() },
@@ -212,6 +240,7 @@ impl FileStore for LocalFsFileStore {
                     .map(OffsetDateTime::from)
                     .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
                 dir: is_dir,
+                content_type,
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));

@@ -145,6 +145,32 @@ impl Service for FileService {
         let range = msg.header("range").and_then(parse_range);
         let if_none_match = msg.header("if-none-match").map(String::from);
 
+        // MOVE renames a file within this store (the `move` facet). The
+        // `Destination` header is addressed like any path; map it into the
+        // mount's store space (cross-mount moves aren't supported).
+        if msg.method.as_str() == "MOVE" {
+            if msg.url.is_directory() {
+                return Err(RsError::bad_request("MOVE source must be a file, not a directory"));
+            }
+            let dest_raw = msg
+                .header("destination")
+                .ok_or_else(|| RsError::bad_request("MOVE requires a 'Destination' header"))?
+                .to_string();
+            let base = msg.url.base_path.as_str();
+            let rel = dest_raw.strip_prefix(base).unwrap_or(&dest_raw);
+            let dest = if rel.starts_with('/') { rel.to_string() } else { format!("/{rel}") };
+            if dest.ends_with('/') {
+                return Err(RsError::bad_request("MOVE destination must be a file path"));
+            }
+            let created = files.rename(&path, &dest).await?;
+            let mut resp = msg.response(
+                if created { StatusCode::CREATED } else { StatusCode::OK },
+                None,
+            );
+            resp.set_header("location", &format!("{base}{dest}"));
+            return Ok(resp);
+        }
+
         match msg.method {
             Method::GET if msg.url.is_directory() => {
                 // Static-site mode: directories serve the default resource.

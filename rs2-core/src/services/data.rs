@@ -18,6 +18,9 @@ use crate::error::RsError;
 use crate::message::{Body, MediaType, Message};
 
 const SCHEMA_RESOURCE: &str = ".schema.json";
+/// Mount-level schema index: `GET /<mount>/.schemas` returns every dataset's
+/// installed schema in one call (G6).
+const SCHEMAS_RESOURCE: &str = ".schemas";
 
 #[derive(Default)]
 pub struct DataService {
@@ -122,6 +125,32 @@ impl Service for DataService {
                 _ => Err(RsError::bad_request("the mount root supports GET (dataset listing)")),
             },
 
+            // ---- mount-level schema index: every dataset's installed schema
+            // in one call, so a generic client can discover all shapes up
+            // front instead of fetching each `.schema.json` by name ----
+            [reserved] if reserved == SCHEMAS_RESOURCE => match msg.method {
+                Method::GET => {
+                    let (names, _) = data.list_datasets(10_000, 0).await?;
+                    let mut schemas = serde_json::Map::new();
+                    for name in names {
+                        if let Some(schema) = data.get_schema(&name).await? {
+                            schemas.insert(
+                                name.clone(),
+                                json!({
+                                    "schemaUrl": format!("{schema_base}/{name}/{SCHEMA_RESOURCE}"),
+                                    "schema": schema,
+                                }),
+                            );
+                        }
+                    }
+                    Ok(msg.ok(Some(Body::from_bytes(
+                        json!({ "schemas": schemas }).to_string(),
+                        MediaType::json(),
+                    ))))
+                }
+                _ => Err(RsError::bad_request(".schemas supports GET")),
+            },
+
             // ---- dataset level (a store container) ----
             [dataset] => {
                 let dataset = dataset.clone();
@@ -133,7 +162,7 @@ impl Service for DataService {
                         // keys are child entries; the schema is a fixed child.
                         let mut entries: Vec<Value> = keys
                             .iter()
-                            .map(|k| json!({ "name": k, "dir": false }))
+                            .map(|k| json!({ "name": k, "dir": false, "contentType": "application/json" }))
                             .collect();
                         if data.get_schema(&dataset).await?.is_some() {
                             entries.push(json!({ "name": SCHEMA_RESOURCE, "dir": false, "fixed": true }));

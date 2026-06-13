@@ -34,6 +34,10 @@ pub struct DirEntry {
     #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
     pub dir: bool,
+    /// Media type of a file entry, so a client can pick an icon/editor
+    /// without a `HEAD` per item. `None` for directories.
+    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
 }
 
 /// Streamed file storage. `tenant` is supplied by the host-side scoping
@@ -46,6 +50,9 @@ pub trait FileStore: Send + Sync {
     /// Returns `true` if the resource was created (vs. overwritten).
     async fn write(&self, tenant: &str, path: &str, body: Body) -> Result<bool, RsError>;
     async fn delete(&self, tenant: &str, path: &str) -> Result<(), RsError>;
+    /// Move/rename a file. Returns `true` if the destination was created
+    /// (vs. overwritten). Fails if the source is missing or a directory.
+    async fn rename(&self, tenant: &str, from: &str, to: &str) -> Result<bool, RsError>;
     /// Delete a directory; fails unless empty.
     async fn delete_dir(&self, tenant: &str, path: &str) -> Result<(), RsError>;
     /// Delete a directory and all its contents (the `?confirm=` path).
@@ -172,6 +179,10 @@ impl FileStore for PrefixedFileStore {
         self.inner.delete(tenant, &self.join(path)).await
     }
 
+    async fn rename(&self, tenant: &str, from: &str, to: &str) -> Result<bool, RsError> {
+        self.inner.rename(tenant, &self.join(from), &self.join(to)).await
+    }
+
     async fn delete_dir(&self, tenant: &str, path: &str) -> Result<(), RsError> {
         self.inner.delete_dir(tenant, &self.join(path)).await
     }
@@ -220,6 +231,10 @@ impl ScopedFileStore {
 
     pub async fn delete(&self, path: &str) -> Result<(), RsError> {
         self.inner.delete(&self.tenant, path).await
+    }
+
+    pub async fn rename(&self, from: &str, to: &str) -> Result<bool, RsError> {
+        self.inner.rename(&self.tenant, from, to).await
     }
 
     pub async fn delete_dir(&self, path: &str) -> Result<(), RsError> {
