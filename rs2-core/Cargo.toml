@@ -9,8 +9,8 @@ description = "RS2 sandboxed composable-service runtime — core crate (0.x, uns
 default = []
 # Wasmtime component engine for Rust/Wasm custom services
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
-# V8 isolate engine for TS/JS custom services
-js = ["dep:v8"]
+# V8 isolate engine for TS/JS custom services (deno_core: modules, ops, extensions)
+js = ["dep:deno_core", "dep:deno_error"]
 # Outbound HTTP adapter (ureq) for httpOut capability grants
 http = ["dep:ureq"]
 
@@ -21,6 +21,8 @@ base64 = "0.22"
 bcrypt = "0.17"
 bumpalo = "3.20.3"
 bytes.workspace = true
+deno_core = { version = "0.404", optional = true }
+deno_error = { version = "0.7", optional = true }
 futures.workspace = true
 hmac = "0.12"
 http.workspace = true
@@ -37,7 +39,6 @@ time.workspace = true
 tokio.workspace = true
 ureq = { version = "2", optional = true }
 uuid.workspace = true
-v8 = { version = "150", optional = true }
 wasmtime = { version = "37", optional = true }
 wasmtime-wasi = { version = "37", optional = true }
 
