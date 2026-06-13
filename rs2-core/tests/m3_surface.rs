@@ -273,6 +273,15 @@ async fn discovery_surface_filters_and_advertises() {
     assert!(paths.contains(&"/data") && paths.contains(&"/summary"));
     assert!(!paths.contains(&"/secret"), "unreadable mounts are hidden: {paths:?}");
 
+    // The control surface (config/catalogue/code) is advertised explicitly,
+    // so a generic admin client has one stable entry point and needn't scan
+    // for the `services` mount by name.
+    assert_eq!(doc["control"]["path"], "/services");
+    assert_eq!(doc["control"]["config"], "/services/raw");
+    assert_eq!(doc["control"]["catalogue"], "/services/catalogue");
+    assert_eq!(doc["control"]["mounts"], "/services/services");
+    assert_eq!(doc["control"]["code"], "/services/code/");
+
     // agent-surface: entities, actions (with idempotency guidance), queries
     // (with the same param schema enforced at runtime).
     let mut surface = rt.handle(req(Method::GET, "/.well-known/rs2/agent-surface")).await;

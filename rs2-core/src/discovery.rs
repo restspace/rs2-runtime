@@ -154,8 +154,10 @@ fn with_pattern(mut entry: Value, mount: &Mount) -> Value {
 }
 
 fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
-    let services: Vec<Value> = readable_mounts(tenant, msg)
-        .into_iter()
+    let readable = readable_mounts(tenant, msg);
+    let services: Vec<Value> = readable
+        .iter()
+        .copied()
         .map(|m| {
             let mut entry = json!({
                 "path": if m.base_path.is_empty() { "/" } else { &m.base_path },
@@ -167,7 +169,22 @@ fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
             with_pattern(entry, m)
         })
         .collect();
-    json!({ "tenant": msg.tenant, "services": services })
+    // The control surface (config / catalogue / code) lives on the
+    // `services` mount, which a tenant may mount at any path (or not at
+    // all). Surface its location explicitly so a generic admin client has
+    // one stable entry point instead of scanning for `service ==
+    // "services"`. `null` when the caller can't read such a mount.
+    let control = readable.iter().copied().find(|m| m.service == "services").map(|m| {
+        let base = m.base_path.as_str();
+        json!({
+            "path": if base.is_empty() { "/" } else { base },
+            "config": format!("{base}/raw"),
+            "catalogue": format!("{base}/catalogue"),
+            "mounts": format!("{base}/services"),
+            "code": format!("{base}/code/"),
+        })
+    });
+    json!({ "tenant": msg.tenant, "services": services, "control": control })
 }
 
 async fn agent_surface_doc(
