@@ -53,6 +53,12 @@ pub struct Adapters {
     /// Outbound HTTP (PRD §9.2): granted per mount with allowed-host
     /// patterns; `None` disables external calls entirely.
     pub http: Option<Arc<dyn crate::capabilities::HttpOut>>,
+    /// Log sink (PRD §14). Defaults to a no-op; the server swaps in a
+    /// `FileLogStore`. Both the sink and its level floor are node infra
+    /// (operator config), so they ride on `Adapters`.
+    pub log: Arc<dyn crate::logging::LogStore>,
+    /// Boundary-log severity floor; failures (Err arm / 5xx) bypass it.
+    pub log_level: crate::logging::Severity,
 }
 
 impl Adapters {
@@ -63,11 +69,24 @@ impl Adapters {
             data,
             idempotency: Arc::new(crate::idempotency::MemIdempotencyStore::default()),
             http: None,
+            log: Arc::new(crate::logging::NullLogStore),
+            log_level: crate::logging::Severity::Info,
         }
     }
 
     pub fn with_http(mut self, http: Arc<dyn crate::capabilities::HttpOut>) -> Self {
         self.http = Some(http);
+        self
+    }
+
+    /// Install a log sink and the boundary-log severity floor.
+    pub fn with_logging(
+        mut self,
+        log: Arc<dyn crate::logging::LogStore>,
+        level: crate::logging::Severity,
+    ) -> Self {
+        self.log = log;
+        self.log_level = level;
         self
     }
 }
@@ -147,6 +166,7 @@ impl Tenant {
                     config.auth.as_ref(),
                 )?),
                 "services" => Arc::new(crate::services::ServicesService::new()),
+                "log" => Arc::new(crate::services::LogReaderService::new()),
                 code_ref if code_ref.starts_with("code:") => {
                     Arc::new(crate::services::CodeService::from_ref(code_ref)?)
                 }
@@ -174,6 +194,19 @@ impl Tenant {
                 control: control.clone(),
                 tenant_retry: config.retry.clone(),
                 pipeline_wall_clock: limits.wall_clock_pipeline,
+                logger: crate::logging::ServiceLogger::new(
+                    adapters.log.clone(),
+                    name,
+                    &mount.base_path,
+                    &mount.service,
+                ),
+                // The log reader alone gets read-back; every other mount sees
+                // `None` (default-deny).
+                log_store: if mount.service == "log" {
+                    Some(adapters.log.clone())
+                } else {
+                    None
+                },
             };
             instances.insert(mount.base_path.clone(), (service, Arc::new(ctx)));
         }

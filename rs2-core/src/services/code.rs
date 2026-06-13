@@ -241,12 +241,24 @@ impl Service for CodeService {
                 #[cfg(feature = "wasm")]
                 {
                     use crate::contract::{Engine, ServiceCode};
-                    let host = Arc::new(crate::contract::GrantedHost::new(
-                        self.grants(ctx)?,
-                        ctx.limits.outbound_calls,
-                        self.state.clone(),
-                        &format!("{}@{}", self.name, self.version),
-                    ));
+                    let service_ref = format!("{}@{}", self.name, self.version);
+                    let log_ctx = crate::contract::LogContext {
+                        sink: ctx.logger.sink(),
+                        tenant: msg.tenant.clone(),
+                        mount: msg.url.base_path.clone(),
+                        service: service_ref.clone(),
+                        trace_id: msg.trace.trace_id.clone(),
+                        span_id: msg.trace.span_id.clone(),
+                    };
+                    let host = Arc::new(
+                        crate::contract::GrantedHost::new(
+                            self.grants(ctx)?,
+                            ctx.limits.outbound_calls,
+                            self.state.clone(),
+                            &service_ref,
+                        )
+                        .with_log_context(log_ctx),
+                    );
                     return self
                         .wasm_engine
                         .invoke(
@@ -272,12 +284,24 @@ impl Service for CodeService {
                 #[cfg(feature = "js")]
                 {
                     use crate::contract::{Engine, ServiceCode};
-                    let host = Arc::new(crate::contract::GrantedHost::new(
-                        self.grants(ctx)?,
-                        ctx.limits.outbound_calls,
-                        self.state.clone(),
-                        &format!("{}@{}", self.name, self.version),
-                    ));
+                    let service_ref = format!("{}@{}", self.name, self.version);
+                    let log_ctx = crate::contract::LogContext {
+                        sink: ctx.logger.sink(),
+                        tenant: msg.tenant.clone(),
+                        mount: msg.url.base_path.clone(),
+                        service: service_ref.clone(),
+                        trace_id: msg.trace.trace_id.clone(),
+                        span_id: msg.trace.span_id.clone(),
+                    };
+                    let host = Arc::new(
+                        crate::contract::GrantedHost::new(
+                            self.grants(ctx)?,
+                            ctx.limits.outbound_calls,
+                            self.state.clone(),
+                            &service_ref,
+                        )
+                        .with_log_context(log_ctx),
+                    );
                     return self
                         .js_engine
                         .invoke(

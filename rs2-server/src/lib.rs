@@ -37,6 +37,50 @@ struct ServerConfig {
     /// Directory holding `<tenant>.json` tenant configs.
     #[serde(default = "default_tenants_dir")]
     tenants_dir: String,
+    /// Logging (PRD §14): where logs physically go is operator config.
+    #[serde(default)]
+    logging: LoggingConfig,
+}
+
+/// Node logging configuration. Absent ⇒ file sink at `./logs`, Info floor.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LoggingConfig {
+    /// `"file"` (default) writes per-tenant NDJSON; `"none"` disables.
+    #[serde(default = "default_log_sink")]
+    sink: String,
+    #[serde(default)]
+    file: FileLogConfig,
+    /// Boundary-log severity floor (`debug|info|warn|error`); 5xx always emit.
+    #[serde(default = "default_log_level")]
+    level: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileLogConfig {
+    #[serde(default = "default_log_path")]
+    path: String,
+    #[serde(default = "default_log_max_bytes")]
+    max_bytes: u64,
+    #[serde(default = "default_log_backups")]
+    backups: usize,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        LoggingConfig { sink: default_log_sink(), file: FileLogConfig::default(), level: default_log_level() }
+    }
+}
+
+impl Default for FileLogConfig {
+    fn default() -> Self {
+        FileLogConfig {
+            path: default_log_path(),
+            max_bytes: default_log_max_bytes(),
+            backups: default_log_backups(),
+        }
+    }
 }
 
 fn default_listen() -> String {
@@ -47,6 +91,21 @@ fn default_file_root() -> String {
 }
 fn default_tenants_dir() -> String {
     "./tenants".to_string()
+}
+fn default_log_sink() -> String {
+    "file".to_string()
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_log_path() -> String {
+    "./logs".to_string()
+}
+fn default_log_max_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_log_backups() -> usize {
+    5
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,12 +312,26 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         TenancyConfig::Single { tenant } => Tenancy::Single { tenant },
         TenancyConfig::Multi { domain_map, main_domain } => Tenancy::Multi { domain_map, main_domain },
     };
+    // Log sink (PRD §14): file store (default) or a no-op. The severity floor
+    // governs boundary-log volume; 5xx always emit.
+    let log_level = rs2_core::logging::Severity::parse(&config.logging.level)
+        .unwrap_or(rs2_core::logging::Severity::Info);
+    let log_store: Arc<dyn rs2_core::logging::LogStore> = match config.logging.sink.as_str() {
+        "none" => Arc::new(rs2_core::logging::NullLogStore),
+        _ => Arc::new(rs2_core::adapters::FileLogStore::new(
+            &config.logging.file.path,
+            config.logging.file.max_bytes,
+            config.logging.file.backups,
+        )),
+    };
+
     let adapters = Adapters::new(
         Arc::new(rs2_core::adapters::LocalFsFileStore::new(&config.file_root)),
         Arc::new(rs2_core::adapters::MemDataStore::new()),
     )
     // Outbound HTTP: granted per mount via `httpOut` allowlists (PRD §9.2).
-    .with_http(Arc::new(rs2_core::adapters::UreqHttpOut::new()));
+    .with_http(Arc::new(rs2_core::adapters::UreqHttpOut::new()))
+    .with_logging(log_store, log_level);
     let loader = Arc::new(FileConfigLoader { dir: PathBuf::from(&config.tenants_dir) });
     let runtime = Runtime::new(tenancy, adapters, loader, LimitTable::default());
 

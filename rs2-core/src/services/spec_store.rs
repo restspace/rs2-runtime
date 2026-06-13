@@ -83,6 +83,14 @@ impl SpecStore {
             control: None,
             tenant_retry: None,
             pipeline_wall_clock: std::time::Duration::from_secs(120),
+            // The spec store's private FileService doesn't emit app logs.
+            logger: crate::logging::ServiceLogger::new(
+                Arc::new(crate::logging::NullLogStore),
+                tenant,
+                "",
+                "spec-store",
+            ),
+            log_store: None,
         };
         SpecStore { inner: FileService::new(), inner_ctx, subtree, validate }
     }

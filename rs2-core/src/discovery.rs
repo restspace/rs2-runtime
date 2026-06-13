@@ -137,6 +137,7 @@ fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
         "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
         "pipeline" => ("store-transform", vec!["any-verb"]),
         "query" => ("store-view", vec!["positional-params", "url-params", "any-verb"]),
+        "log" => ("view", vec!["url-params", "time-range", "trace-scoped"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),
@@ -377,6 +378,28 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                 paths.insert(
                     format!("{base}/code/{{name}}/{{version}}"),
                     json!({ "$ref": "#/components/pathItems/StoreChild" }),
+                );
+            }
+            "log" => {
+                let root = if base.is_empty() { "/".to_string() } else { base.clone() };
+                paths.insert(
+                    root,
+                    json!({
+                        "description": "Query this tenant's structured logs, newest first. \
+                                        Params: $take, severity (debug|info|warn|error floor), \
+                                        traceId, service (mount or path prefix), since/until \
+                                        (unix-ms or RFC 3339), q (body substring). JSON array of \
+                                        OTLP LogRecords, or text/plain NDJSON via Accept; \
+                                        X-Total-Count set.",
+                        "get": op("Query structured logs", "pure"),
+                    }),
+                );
+                paths.insert(
+                    format!("{base}/{{traceId}}"),
+                    json!({
+                        "description": "All log records for one trace (request-debugging view).",
+                        "get": op("Read one trace's log records", "pure"),
+                    }),
                 );
             }
             _ => {}

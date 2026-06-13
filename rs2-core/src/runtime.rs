@@ -70,6 +70,10 @@ pub struct Runtime {
     load_guard: tokio::sync::Mutex<()>,
     /// Self-reference handed to services as the internal-dispatch capability.
     self_ref: std::sync::Weak<Runtime>,
+    /// Node log sink (PRD §14): boundary + error logs emit here.
+    log: Arc<dyn crate::logging::LogStore>,
+    /// Boundary-log severity floor; failures bypass it.
+    log_level: crate::logging::Severity,
 }
 
 /// Internal dispatch capability handed to services (pipelines): requests
@@ -128,6 +132,8 @@ impl Runtime {
         limits: LimitTable,
     ) -> Arc<Self> {
         Arc::new_cyclic(|me| Runtime {
+            log: adapters.log.clone(),
+            log_level: adapters.log_level,
             tenancy,
             adapters,
             loader,
@@ -179,15 +185,25 @@ impl Runtime {
     /// response headers are added here — the single choke point — so error
     /// responses carry them too (browsers can't read un-decorated errors).
     pub async fn handle(&self, msg: Message) -> Message {
-        // Capture enough context to build an error response after `msg` moves.
+        let start = std::time::Instant::now();
+        // Capture enough context to build an error response and a boundary log
+        // after `msg` moves into dispatch.
         let template = msg.response(StatusCode::OK, None);
         let origin = msg.header("origin").map(str::to_string);
         let request_host = msg.header("host").map(str::to_string);
         let tenant_name = msg.tenant.clone();
         let external = msg.source == crate::message::Source::External;
-        let mut resp = match self.dispatch(msg).await {
-            Ok(resp) => resp,
-            Err(err) => template.error_response(&err),
+        let method = msg.method.as_str().to_string();
+        let path = msg.url.path.clone();
+        let trace = msg.trace.clone();
+        let principal = msg.principal.clone();
+
+        let (mut resp, err) = match self.dispatch(msg).await {
+            Ok(resp) => (resp, None),
+            Err(err) => {
+                let resp = template.error_response(&err);
+                (resp, Some(err))
+            }
         };
         if external {
             if let Some(origin) = origin {
@@ -204,7 +220,78 @@ impl Runtime {
         {
             resp.set_header("cache-control", "no-store");
         }
+
+        // Boundary log (PRD §14): one record per dispatch — external requests
+        // and internal hops alike (each its own span, shared trace), severity
+        // from the outcome. Errors carry their code/detail.
+        self.emit_boundary_log(
+            &resp,
+            err,
+            external,
+            &method,
+            &path,
+            &trace,
+            &tenant_name,
+            principal.as_ref(),
+            start,
+        );
         resp
+    }
+
+    /// Emit the per-dispatch boundary log. Severity is status-driven (5xx →
+    /// Error, 4xx → Warn, external success → Info, internal success → Debug);
+    /// server failures (5xx) always emit, everything else obeys the level
+    /// floor. Off the hot path only by virtue of `emit` being a channel send.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_boundary_log(
+        &self,
+        resp: &Message,
+        err: Option<RsError>,
+        external: bool,
+        method: &str,
+        path: &str,
+        trace: &crate::message::TraceContext,
+        tenant: &str,
+        principal: Option<&crate::message::Principal>,
+        start: std::time::Instant,
+    ) {
+        use crate::logging::{LogRecord, Severity};
+        // Fast path: no sink configured ⇒ build nothing (keeps the dispatch
+        // hot path allocation-free when logging is off).
+        if !self.log.enabled() {
+            return;
+        }
+        let status = resp.status.map(|s| s.as_u16()).unwrap_or(0);
+        let severity = if status >= 500 {
+            Severity::Error
+        } else if status >= 400 {
+            Severity::Warn
+        } else if external {
+            Severity::Info
+        } else {
+            Severity::Debug
+        };
+        let always = status >= 500;
+        if !always && severity < self.log_level {
+            return;
+        }
+        let source = if external { "external" } else { "internal" };
+        let mut rec = LogRecord::now(severity, tenant, trace, format!("{method} {path} -> {status}"))
+            .attr("http.request.method", method)
+            .attr("url.path", path)
+            .attr("http.response.status_code", status as i64)
+            .attr("rs2.source", source)
+            .attr("duration_ms", start.elapsed().as_millis() as i64);
+        if let Some(p) = principal {
+            rec = rec.attr("enduser.id", p.id.as_str()).attr("rs2.principal.kind", p.kind.as_str());
+        }
+        if let Some(e) = &err {
+            rec = rec
+                .attr("error.type", e.code)
+                .attr("error.message", e.detail.as_str())
+                .attr("rs2.retryable", e.retryable);
+        }
+        self.log.emit(rec);
     }
 
     async fn dispatch(&self, mut msg: Message) -> Result<Message, RsError> {

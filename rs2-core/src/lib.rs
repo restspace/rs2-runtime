@@ -27,6 +27,7 @@ pub mod discovery;
 pub mod engines;
 pub mod error;
 pub mod idempotency;
+pub mod logging;
 pub mod message;
 pub mod pipeline;
 pub mod retry;

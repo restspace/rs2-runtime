@@ -7,6 +7,7 @@ pub mod auth;
 pub mod code;
 mod data;
 mod file;
+mod log_reader;
 mod pipeline_service;
 mod query;
 pub mod query_template;
@@ -17,6 +18,7 @@ pub use auth::AuthService;
 pub use code::CodeService;
 pub use data::DataService;
 pub use file::FileService;
+pub use log_reader::LogReaderService;
 pub use pipeline_service::{PipelineService, PIPELINE_PREFIX, PIPELINE_SUBTREE};
 pub use query::{QueryService, QUERY_PREFIX, QUERY_SUBTREE};
 pub use services_config::ServicesService;
@@ -52,6 +54,14 @@ pub struct ServiceContext {
     pub tenant_retry: Option<RetryPolicy>,
     /// Pipeline wall-clock budget (PRD §9.3: 120 s default).
     pub pipeline_wall_clock: std::time::Duration,
+    /// Application-log emit handle (PRD §14), bound to this mount's
+    /// tenant/mount/service. Always present (a no-op when the node sink is
+    /// Null); not a grant — the host stamps identity, so a service can only
+    /// write its own stamped lines.
+    pub logger: crate::logging::ServiceLogger,
+    /// Log read-back capability — granted only to `log` reader mounts
+    /// (`None` elsewhere). Reading logs back is sensitive; writing is not.
+    pub log_store: Option<Arc<dyn crate::logging::LogStore>>,
 }
 
 /// A unit of behavior handling messages at a mount: Message → Message.

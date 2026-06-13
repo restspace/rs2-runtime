@@ -100,6 +100,19 @@ pub type CapabilityTarget = Arc<
     dyn Fn(Message) -> Pin<Box<dyn Future<Output = Result<Message, RsError>> + Send>> + Send + Sync,
 >;
 
+/// Identity stamped onto a sandbox service's own logs (`HostApi::log`). Built
+/// per invocation — `GrantedHost` is constructed per call, where the trace and
+/// mount are known — so each line carries the right span and the host-fixed
+/// service identity (the author supplies only level + text, can't forge it).
+pub struct LogContext {
+    pub sink: Arc<dyn crate::logging::LogStore>,
+    pub tenant: String,
+    pub mount: String,
+    pub service: String,
+    pub trace_id: String,
+    pub span_id: String,
+}
+
 /// The host side handed to engines: enforces capability grants (default
 /// deny), the outbound-call budget, and trace propagation. State is
 /// invocation-external (keyed per service instance), satisfying invariant 4.
@@ -109,6 +122,9 @@ pub struct GrantedHost {
     outbound_used: AtomicU32,
     state: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     service_name: String,
+    /// Where this invocation's `log()` calls go; `None` drops them (tests and
+    /// the default-deny baseline).
+    log_ctx: Option<LogContext>,
 }
 
 impl GrantedHost {
@@ -124,7 +140,14 @@ impl GrantedHost {
             outbound_used: AtomicU32::new(0),
             state,
             service_name: service_name.to_string(),
+            log_ctx: None,
         }
+    }
+
+    /// Route this invocation's sandbox logs to the node sink (PRD §14).
+    pub fn with_log_context(mut self, ctx: LogContext) -> Self {
+        self.log_ctx = Some(ctx);
+        self
     }
 
     /// A host with no grants at all — the default-deny baseline.
@@ -150,9 +173,24 @@ impl HostApi for GrantedHost {
         target(msg).await
     }
 
-    fn log(&self, _level: LogLevel, _text: &str) {
-        // M1: logs are dropped at the contract layer; the wrapper logs
-        // invocations. OTel export lands with the observability work (§14).
+    fn log(&self, level: LogLevel, text: &str) {
+        // Sandbox `console.log` / Wasm `log()` land here, stamped with this
+        // invocation's identity (PRD §14). `None` context drops them.
+        let Some(c) = &self.log_ctx else { return };
+        let trace = crate::message::TraceContext {
+            trace_id: c.trace_id.clone(),
+            span_id: c.span_id.clone(),
+        };
+        let rec = crate::logging::LogRecord::now(
+            crate::logging::Severity::from_log_level(level),
+            &c.tenant,
+            &trace,
+            text.to_string(),
+        )
+        .attr("rs2.mount", c.mount.as_str())
+        .attr("rs2.service", c.service.as_str())
+        .attr("rs2.source", "custom");
+        c.sink.emit(rec);
     }
 
     async fn state_get(&self, key: &str) -> Option<Vec<u8>> {

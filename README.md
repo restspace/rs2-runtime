@@ -103,6 +103,18 @@ Done:
   headers.
 - Host-enforced tenant scoping on every store capability; local-fs and
   in-memory adapters.
+- **OTel-compatible logging** (PRD §14): a `LogSink`/`LogStore` capability
+  with an OTLP-shaped `LogRecord` model. The host emits one boundary log per
+  dispatch at the single `Runtime::handle` choke point (external requests and
+  internal hops, severity from outcome, errors carry code/detail); prebuilt
+  services emit application logs through a mount-bound `ServiceLogger`; sandbox
+  `console.log`/Wasm `log()` land via the (now un-stubbed) `HostApi::log` —
+  all stamped with tenant/mount/service/trace, the service identity fixed by
+  the host. The default `FileLogStore` writes per-tenant rotated NDJSON off the
+  request path (bounded channel + background writer; a no-op sink is
+  allocation-free on the hot path). The `log` reader service queries it back,
+  tenant-scoped. Write-only OTLP/observability exporters are a documented
+  follow-on (swap the sink; the reader degrades to "exported, not queryable").
 
 Remaining M1 (tracked, not started):
 - **V8 isolate engine** (`engines/js.rs` is a skeleton returning

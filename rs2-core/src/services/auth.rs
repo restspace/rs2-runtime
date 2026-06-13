@@ -323,12 +323,14 @@ impl AuthService {
             Err(_) => {
                 // Indistinguishable from a bad password (no user enumeration).
                 self.record_failure(&email);
+                ctx.logger.at(&msg.trace).warn(format!("login failed for '{email}' (unknown user)"));
                 return Err(RsError::unauthorized("invalid credentials"));
             }
         };
         let hash = user.get("passwordHash").and_then(|v| v.as_str()).unwrap_or("");
         if !verify_password(&password, hash) {
             self.record_failure(&email);
+            ctx.logger.at(&msg.trace).warn(format!("login failed for '{email}' (bad password)"));
             return Err(RsError::unauthorized("invalid credentials"));
         }
         self.clear_failures(&email);
