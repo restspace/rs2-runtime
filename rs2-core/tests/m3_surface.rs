@@ -249,6 +249,37 @@ async fn query_positional_url_params_and_sql_passthrough() {
     assert_eq!(resp.status, Some(StatusCode::NOT_IMPLEMENTED), "reference adapter is JSON-only");
 }
 
+#[tokio::test]
+async fn options_probes_mount_capabilities() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), surface_config());
+
+    // OPTIONS describes the resolved mount: pattern, facets, and an Allow
+    // header — one round trip, no correlation against the services list.
+    let mut data = rt.handle(req(Method::OPTIONS, "/data")).await;
+    assert_eq!(data.status, Some(StatusCode::OK));
+    let allow = data.header("allow").unwrap().to_string();
+    assert!(allow.contains("PATCH") && allow.contains("OPTIONS"), "allow: {allow}");
+    let doc = body_json(&mut data).await;
+    assert_eq!(doc["pattern"], "store");
+    assert_eq!(doc["path"], "/data");
+    assert!(doc["facets"].as_array().unwrap().iter().any(|f| f == "schema"), "{doc}");
+    assert_eq!(doc["schemaUrlPattern"], "/data/{dataset}/.schema.json");
+
+    // A sub-path resolves to its governing mount (longest-prefix match).
+    let sub = rt.handle(req(Method::OPTIONS, "/data/people/alice")).await;
+    assert_eq!(sub.status, Some(StatusCode::OK));
+
+    // The pipeline mount reports its own conversation shape.
+    let mut summary = rt.handle(req(Method::OPTIONS, "/summary")).await;
+    let doc = body_json(&mut summary).await;
+    assert_eq!(doc["pattern"], "store-transform");
+
+    // The probe is read-gated: an unreadable mount stays hidden.
+    let secret = rt.handle(req(Method::OPTIONS, "/secret")).await;
+    assert_eq!(secret.status, Some(StatusCode::UNAUTHORIZED), "{:?}", secret.status);
+}
+
 // ---------------------------------------------------------------------------
 // agent surface + OpenAPI (PRD §12)
 // ---------------------------------------------------------------------------

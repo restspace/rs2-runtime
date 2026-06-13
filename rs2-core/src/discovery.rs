@@ -153,6 +153,42 @@ fn with_pattern(mut entry: Value, mount: &Mount) -> Value {
     entry
 }
 
+/// Capability descriptor for one mount — the body of the `OPTIONS` probe
+/// (G3). Carries the same `pattern`/`facets`/metadata a generic client reads
+/// from `/.well-known/rs2/services`, plus the data schema-URL hint, so it can
+/// render any path from a single round trip instead of correlating the path
+/// back to the services list itself.
+pub fn describe_mount(mount: &Mount) -> Value {
+    let base = if mount.base_path.is_empty() { "/" } else { mount.base_path.as_str() };
+    let mut out = json!({ "path": base, "service": mount.service });
+    for (k, v) in meta(mount) {
+        out[k] = v;
+    }
+    if mount.service == "data" {
+        out["schemaUrlPattern"] = json!(format!("{base}/{{dataset}}/.schema.json"));
+    }
+    with_pattern(out, mount)
+}
+
+/// The `Allow` header set for a mount's `OPTIONS` probe, derived from its
+/// pattern and facets. Store-shaped mounts share the contract's verbs (PATCH
+/// only with the `patch` facet); `api` mounts get a best-effort superset,
+/// since their verbs are service-defined.
+pub fn allowed_methods(mount: &Mount) -> Vec<&'static str> {
+    let (pattern, facets) = pattern_of(mount);
+    match pattern {
+        "store" if facets.contains(&"patch") => {
+            vec!["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"]
+        }
+        "store" => vec!["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS"],
+        "store-transform" | "store-view" => {
+            vec!["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"]
+        }
+        "view" => vec!["GET", "HEAD", "OPTIONS"],
+        _ => vec!["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
+    }
+}
+
 fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
     let readable = readable_mounts(tenant, msg);
     let services: Vec<Value> = readable

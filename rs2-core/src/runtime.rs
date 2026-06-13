@@ -343,6 +343,18 @@ impl Runtime {
         msg.url.apply_mount(&mount.base_path);
 
         check_access(&msg, &mount.config)?;
+
+        // OPTIONS is a read-only capability probe (G3): describe the resolved
+        // mount — pattern, facets, schema hint — with an `Allow` header, so a
+        // generic client can render any path from one round trip. A permitted
+        // CORS preflight was already answered above, before routing.
+        if msg.method == http::Method::OPTIONS {
+            let desc = crate::discovery::describe_mount(mount);
+            let mut resp = msg.ok_json(&desc);
+            resp.set_header("allow", &crate::discovery::allowed_methods(mount).join(", "));
+            return Ok(resp);
+        }
+
         check_declared_body_size(&msg, &self.limits)?;
         let _permit = self.limiter.admit(&msg.tenant, self.limits.tenant_concurrency).await?;
 
