@@ -31,11 +31,11 @@ use rs2_core::{RsError, Runtime};
 
 // ---- the adapter bundle: a store-pattern surface over RESP -----------------
 
-/// A minimal Redis-backed `DataStore` adapter. It implements the store pattern
-/// (`GET/PUT/DELETE /{ds}/{key}`, container + root listings) by speaking RESP
-/// over a single pooled socket cached in a module-level var — the resident
-/// runtime keeps it alive between requests.
-const REDIS_ADAPTER: &str = r#"
+/// A minimal RESP (Redis) client over the pooled socket, shared by the data and
+/// query adapters below — it connects lazily and caches the socket in a
+/// module-level var, so the resident runtime keeps one connection across
+/// requests. A concrete adapter appends its handler (`export default …`).
+const RESP_CLIENT: &str = r#"
 let SOCK = null;
 let RBUF = new Uint8Array(0);
 
@@ -106,7 +106,11 @@ function cmd(...args) {
   SOCK.write(s);
   return readReply();
 }
+"#;
 
+/// The data adapter: a store-pattern surface (`GET/PUT/DELETE /{ds}/{key}`,
+/// container + root listings) over the RESP client. Appended to `RESP_CLIENT`.
+const DATA_HANDLER: &str = r#"
 export default async (msg, ctx) => {
   connect(ctx.config);
   const url = String(msg.url);
@@ -163,6 +167,47 @@ export default async (msg, ctx) => {
     return { status: 204 };
   }
   return { status: 400, body: { detail: "method not supported" } };
+};
+"#;
+
+/// The query adapter: executes a stored query (`POST /query` with
+/// `{query, params, take, skip}`) by scanning the dataset over the RESP client
+/// and filtering by the substituted `where` clause — query push-down to the
+/// backend. Appended to `RESP_CLIENT`.
+const QUERY_HANDLER: &str = r#"
+function keep(record, where) {
+  return Object.entries(where).every(([field, clause]) => {
+    if (clause && typeof clause === "object" && clause.op) {
+      const a = record[field], b = clause.value;
+      switch (clause.op) {
+        case ">=": return a >= b;
+        case ">":  return a > b;
+        case "<=": return a <= b;
+        case "<":  return a < b;
+        case "!=": return a !== b;
+        default:    return a === b;
+      }
+    }
+    return record[field] === clause;
+  });
+}
+export default async (msg, ctx) => {
+  connect(ctx.config);
+  const { query, take, skip } = msg.body;
+  const dataset = query.dataset;
+  const where = query.where || {};
+  const keys = cmd("KEYS", dataset + ":*") || [];
+  let rows = [];
+  for (const k of keys) {
+    const name = k.slice(dataset.length + 1);
+    if (name === ".schema.json") continue;
+    const rec = JSON.parse(cmd("GET", k));
+    rec._key = name;
+    if (keep(rec, where)) rows.push(rec);
+  }
+  if (query.orderBy) rows.sort((a, b) => (a[query.orderBy] > b[query.orderBy] ? 1 : -1));
+  const total = rows.length;
+  return { status: 200, body: { rows: rows.slice(skip, skip + take), total } };
 };
 "#;
 
@@ -304,7 +349,10 @@ async fn guest_backed_data_store_satisfies_the_store_contract() {
         .write(
             "t",
             ".rs2-code/redis/v1.js",
-            Body::from_string(REDIS_ADAPTER.to_string(), MediaType::new("application/javascript")),
+            Body::from_string(
+                format!("{RESP_CLIENT}{DATA_HANDLER}"),
+                MediaType::new("application/javascript"),
+            ),
         )
         .await
         .unwrap();
@@ -424,4 +472,69 @@ async fn missing_adapter_bundle_is_a_clear_error() {
     let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
     let resp = rt.handle(req(Method::GET, "/data/things/alpha")).await;
     assert_eq!(resp.status, Some(StatusCode::NOT_FOUND), "undeployed adapter → 404");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_backed_query_store_executes_a_stored_query() {
+    let (port, conns) = spawn_mock_redis().await;
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
+
+    // Deploy both adapters against the same mock: data (to seed records) and
+    // query (to execute stored queries by scanning the dataset).
+    files.write("t", ".rs2-code/redis/v1.js", js(format!("{RESP_CLIENT}{DATA_HANDLER}"))).await.unwrap();
+    files
+        .write("t", ".rs2-code/redis-query/v1.js", js(format!("{RESP_CLIENT}{QUERY_HANDLER}")))
+        .await
+        .unwrap();
+
+    let socket = json!({ "type": "socket", "hosts": [format!("127.0.0.1:{port}")] });
+    let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/data", "service": "data", "config": { "store": {
+            "adapter": "code:redis@v1", "host": "127.0.0.1", "port": port,
+            "grants": { "redis": socket.clone() }
+        }}},
+        { "path": "/q", "service": "query", "config": { "store": {
+            "adapter": "code:redis-query@v1", "host": "127.0.0.1", "port": port,
+            "grants": { "redis": socket }
+        }}}
+    ]})));
+    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+
+    // Seed records through the guest data mount.
+    for (k, status, total) in [("o1", "open", 50), ("o2", "closed", 200), ("o3", "open", 150)] {
+        let resp = rt
+            .handle(req(Method::PUT, &format!("/data/orders/{k}")).with_json(&json!({ "status": status, "total": total })))
+            .await;
+        assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {k}");
+    }
+
+    // Author a stored query — normal SpecStore authoring, unchanged.
+    let envelope = json!({
+        "language": "json",
+        "query": { "dataset": "orders", "where": { "status": "${status}" }, "orderBy": "_key" },
+        "params": { "type": "object", "properties": { "status": { "type": "string" } } }
+    });
+    let put = req(Method::PUT, "/q/.queries/by-status").with_json(&envelope);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED), "author query");
+
+    // Execute: the param substitutes structurally, the guest query store runs
+    // it against the shared backend, and the matching rows come back.
+    let mut resp = rt.handle(req(Method::GET, "/q/by-status?status=open")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "execute: {:?}", resp.body);
+    assert_eq!(resp.header("x-total-count"), Some("2"), "X-Total-Count");
+    let rows = body_json(&mut resp).await;
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "two open orders: {rows:?}");
+    assert!(rows.iter().all(|r| r["status"] == "open"), "only open orders: {rows:?}");
+
+    // Pagination narrows rows, not the reported total.
+    let mut resp = rt.handle(req(Method::GET, "/q/by-status?status=open&$take=1")).await;
+    assert_eq!(resp.header("x-total-count"), Some("2"), "paged total is the full count");
+    assert_eq!(body_json(&mut resp).await.as_array().unwrap().len(), 1, "$take pages");
+
+    // Each guest mount pooled its own single connection (data + query = 2).
+    assert_eq!(conns.load(Ordering::SeqCst), 2, "one pooled connection per resident mount");
 }

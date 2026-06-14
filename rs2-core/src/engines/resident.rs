@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::capabilities::{DataStore, ScopedFileStore};
+use crate::capabilities::{DataStore, QueryStore, ScopedFileStore};
 use crate::contract::{GrantedHost, HostApi, InvocationLimits};
 use crate::error::RsError;
 
@@ -163,57 +163,54 @@ impl BundleLoader {
     }
 }
 
-/// A [`DataStore`] backed by a resident JS adapter. The adapter implements the
-/// store-pattern HTTP surface over a wire protocol (Redis, Mongo, …); this type
-/// maps each trait method to a store-pattern request and the response back to
-/// the trait's return. The `tenant` argument is ignored — the resident runtime
-/// is already the tenant's, connected to the tenant's backend.
-pub struct GuestDataStore {
+/// Shared machinery for guest-backed capability adapters: a lazily-spawned,
+/// re-spawn-on-death resident runtime plus the request/response call helper. A
+/// concrete adapter ([`GuestDataStore`], [`GuestQueryStore`]) wraps one of
+/// these and maps its capability trait onto messages. The runtime is built from
+/// a `"store"` config block (`{ "adapter": "code:<name>@<version>", "grants":
+/// { … socket … }, … }`) and the whole block is handed to the bundle as
+/// `ctx.config` (it reads connection params from there).
+pub(crate) struct ResidentAdapter {
     /// The resident runtime, spawned lazily on first use and re-spawned if it
-    /// dies. A one-slot pool: lifecycle is tied to this `GuestDataStore`, which
-    /// the tenant owns — a config change rebuilds the tenant, dropping the old
-    /// store (and its runtime) and a new `code_ref` with it.
+    /// dies. A one-slot pool: lifecycle is tied to the owning adapter, which the
+    /// tenant owns — a config change rebuilds the tenant, dropping the old
+    /// adapter (and its runtime), and a new `code_ref` with it.
     handle: Mutex<Option<ResidentHandle>>,
     loader: BundleLoader,
     host: Arc<dyn HostApi>,
     limits: InvocationLimits,
     tenant: String,
     socket_allowlist: Vec<String>,
-    /// The mount's `store` config, handed to the adapter as `ctx.config` (it
-    /// reads connection params from here).
     store_config: Value,
 }
 
-impl GuestDataStore {
-    /// Build a guest-backed data store from a `"store"` config block:
-    /// `{ "adapter": "code:<name>@<version>", "grants": { … socket … }, … }`.
-    /// `files` is the tenant-scoped file store the bundle is read from.
-    pub fn from_config(
+impl ResidentAdapter {
+    /// Build a resident adapter from a `"store"` config block. `kind` names the
+    /// capability for error messages (`"data"`, `"query"`); `files` is the
+    /// tenant-scoped file store the bundle is read from.
+    pub(crate) fn from_config(
+        kind: &str,
         adapter_ref: &str,
         store_config: &Value,
         files: ScopedFileStore,
         tenant: &str,
         limits: InvocationLimits,
     ) -> Result<Self, RsError> {
-        let rest = adapter_ref.strip_prefix("code:").ok_or_else(|| {
+        let invalid = || {
             RsError::bad_request(format!(
-                "data store adapter '{adapter_ref}' must be 'code:<name>@<version>'"
+                "{kind} store adapter '{adapter_ref}' must be 'code:<name>@<version>'"
             ))
-        })?;
-        let (name, version) = rest.split_once('@').ok_or_else(|| {
-            RsError::bad_request(format!(
-                "data store adapter '{adapter_ref}' must be 'code:<name>@<version>'"
-            ))
-        })?;
+        };
+        let (name, version) = adapter_ref.strip_prefix("code:").ok_or_else(invalid)?.split_once('@').ok_or_else(invalid)?;
         if name.is_empty() || version.is_empty() || name.contains(['/', '\\', '.']) {
             return Err(RsError::bad_request(format!(
-                "invalid data store adapter reference '{adapter_ref}'"
+                "invalid {kind} store adapter reference '{adapter_ref}'"
             )));
         }
         // The adapter only needs its socket grant (enforced host-side via the
         // allowlist); request/fetch default-deny unless a later kind is added.
         let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all(adapter_ref));
-        Ok(GuestDataStore {
+        Ok(ResidentAdapter {
             handle: Mutex::new(None),
             loader: BundleLoader {
                 cap: limits.materialized_body_bytes,
@@ -251,8 +248,13 @@ impl GuestDataStore {
         Ok(handle)
     }
 
-    /// Send a store-pattern request to the adapter; return `(status, body)`.
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value), RsError> {
+    /// Send a request envelope to the adapter; return `(status, body)`.
+    pub(crate) async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), RsError> {
         let mut req = json!({ "method": method, "url": path });
         if let Some(b) = body {
             req["body"] = b;
@@ -263,6 +265,34 @@ impl GuestDataStore {
         let status = envelope.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
         let body = envelope.get("body").cloned().unwrap_or(Value::Null);
         Ok((status, body))
+    }
+}
+
+/// A [`DataStore`] backed by a resident JS adapter. The adapter implements the
+/// store-pattern HTTP surface over a wire protocol (Redis, Mongo, …); this type
+/// maps each trait method to a store-pattern request and the response back to
+/// the trait's return. The `tenant` argument is ignored — the resident runtime
+/// is already the tenant's, connected to the tenant's backend.
+pub struct GuestDataStore {
+    inner: ResidentAdapter,
+}
+
+impl GuestDataStore {
+    /// Build a guest-backed data store from a `"store"` config block.
+    pub fn from_config(
+        adapter_ref: &str,
+        store_config: &Value,
+        files: ScopedFileStore,
+        tenant: &str,
+        limits: InvocationLimits,
+    ) -> Result<Self, RsError> {
+        Ok(GuestDataStore {
+            inner: ResidentAdapter::from_config("data", adapter_ref, store_config, files, tenant, limits)?,
+        })
+    }
+
+    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value), RsError> {
+        self.inner.call(method, path, body).await
     }
 }
 
@@ -382,6 +412,78 @@ impl DataStore for GuestDataStore {
         } else {
             Err(store_error(status, &body))
         }
+    }
+}
+
+/// A [`QueryStore`] backed by a resident JS adapter. The query service
+/// substitutes JSON templates / validates params first, then calls `run_query`;
+/// this type ships `{query, params, take, skip}` to the adapter as
+/// `POST /query` and reads `{rows, total}` back. The adapter executes the query
+/// against its backend (e.g. push it down over a pooled socket).
+pub struct GuestQueryStore {
+    inner: ResidentAdapter,
+}
+
+impl GuestQueryStore {
+    /// Build a guest-backed query store from a `"store"` config block.
+    pub fn from_config(
+        adapter_ref: &str,
+        store_config: &Value,
+        files: ScopedFileStore,
+        tenant: &str,
+        limits: InvocationLimits,
+    ) -> Result<Self, RsError> {
+        Ok(GuestQueryStore {
+            inner: ResidentAdapter::from_config("query", adapter_ref, store_config, files, tenant, limits)?,
+        })
+    }
+}
+
+#[async_trait]
+impl QueryStore for GuestQueryStore {
+    async fn run_query(
+        &self,
+        _tenant: &str,
+        query: &Value,
+        params: &serde_json::Map<String, Value>,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<Value>, u64), RsError> {
+        let body = json!({ "query": query, "params": params, "take": take, "skip": skip });
+        let (status, resp) = self.inner.call("POST", "/query", Some(body)).await?;
+        if !(200..300).contains(&status) {
+            return Err(store_error(status, &resp));
+        }
+        let rows = resp.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        let total = resp.get("total").and_then(|t| t.as_u64()).unwrap_or(rows.len() as u64);
+        Ok((rows, total))
+    }
+
+    fn quote(&self, value: &Value) -> Result<String, RsError> {
+        // `quote` is synchronous, so it can't round-trip to the isolate;
+        // adapter-specific quoting (for embedded string positions in JSON
+        // templates) uses the same scalar default as the reference adapter —
+        // SQL adapters bind via params and never reach this path.
+        scalar_quote(value)
+    }
+}
+
+/// Default scalar quoting for embedded string positions of a JSON template
+/// (matches the reference `MemQueryStore`): scalars stringify, composites are
+/// rejected (a 400) rather than silently splicing structure into a string.
+fn scalar_quote(value: &Value) -> Result<String, RsError> {
+    match value {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        other => Err(RsError::bad_request(format!(
+            "cannot splice a {} into a string query position",
+            match other {
+                Value::Null => "null",
+                Value::Array(_) => "array",
+                _ => "object",
+            }
+        ))),
     }
 }
 

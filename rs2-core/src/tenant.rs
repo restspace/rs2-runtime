@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::capabilities::{DataStore, FileStore, ScopedDataStore, ScopedFileStore};
+use crate::capabilities::{DataStore, FileStore, ScopedDataStore, ScopedFileStore, ScopedQueryStore};
 use crate::error::RsError;
 use crate::router::{Mount, MountTable};
 use crate::services::{DataService, FileService, Service, ServiceContext};
@@ -177,12 +177,12 @@ impl Tenant {
                     )))
                 }
             };
-            // The `data` capability is normally the node's built-in store; a
-            // `data` mount may instead name a loadable adapter (`"store":
-            // {"adapter":"code:…"}`, G13 Phase 2) backing its persistence with
-            // a resident JS bundle. The stock `DataService` runs unchanged on
-            // top of either.
+            // The `data`/`query` capabilities are normally the node's built-in
+            // adapters; a `data`/`query` mount may instead name a loadable
+            // adapter (`"store": {"adapter":"code:…"}`, G13 Phase 2/3) backed by
+            // a resident JS bundle. The stock service runs unchanged on either.
             let data = data_capability(mount, adapters, name, limits.invocation_limits())?;
+            let query = query_capability(mount, adapters, name, limits.invocation_limits())?;
 
             // Capability grants: each instance gets handles pre-scoped to
             // this tenant — host-enforced isolation (PRD §9.2).
@@ -190,10 +190,7 @@ impl Tenant {
                 config: mount.config.clone(),
                 files: Some(ScopedFileStore::new(adapters.files.clone(), name)),
                 data,
-                query: Some(crate::capabilities::ScopedQueryStore::new(
-                    adapters.query.clone(),
-                    name,
-                )),
+                query,
                 http: adapters.http.clone(),
                 cors: Arc::new(crate::wrapper::CorsPolicy::from_config(config.cors.as_ref())),
                 limits: limits.invocation_limits(),
@@ -262,6 +259,44 @@ fn data_capability(
         let _ = limits;
         Err(RsError::engine_unavailable(format!(
             "data mount '{}' uses a loadable adapter ('{adapter_ref}') but this build has no JS \
+             engine (rebuild with --features js)",
+            if mount.base_path.is_empty() { "/" } else { &mount.base_path }
+        )))
+    }
+}
+
+/// Resolve a mount's `query` capability. Every mount sees the node's built-in
+/// `QueryStore` by default; a `query` mount with `"store": {"adapter": "code:…"}`
+/// is instead backed by a resident loadable adapter (G13 Phase 3) that executes
+/// stored queries against its own backend. (`store.root` still relocates the
+/// authoring subtree — the two `store` keys are independent.)
+fn query_capability(
+    mount: &Mount,
+    adapters: &Adapters,
+    name: &str,
+    limits: crate::contract::InvocationLimits,
+) -> Result<Option<ScopedQueryStore>, RsError> {
+    let adapter_ref = (mount.service == "query")
+        .then(|| mount.config.get("store").and_then(|s| s.get("adapter")).and_then(|a| a.as_str()))
+        .flatten();
+    let Some(adapter_ref) = adapter_ref else {
+        return Ok(Some(ScopedQueryStore::new(adapters.query.clone(), name)));
+    };
+
+    #[cfg(feature = "js")]
+    {
+        let store = mount.config.get("store").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let files = ScopedFileStore::new(adapters.files.clone(), name);
+        let guest = crate::engines::resident::GuestQueryStore::from_config(
+            adapter_ref, &store, files, name, limits,
+        )?;
+        Ok(Some(ScopedQueryStore::new(Arc::new(guest), name)))
+    }
+    #[cfg(not(feature = "js"))]
+    {
+        let _ = limits;
+        Err(RsError::engine_unavailable(format!(
+            "query mount '{}' uses a loadable adapter ('{adapter_ref}') but this build has no JS \
              engine (rebuild with --features js)",
             if mount.base_path.is_empty() { "/" } else { &mount.base_path }
         )))

@@ -124,11 +124,30 @@ module-state persistence across jobs and build-error-at-spawn.
 
 ## Phase 3 — follow-ons
 
-A **MongoDB** `DataStore` adapter (OP_MSG + BSON + SCRAM-SHA-256 over the socket
-capability — the deferred half of Phase 2's proof); a resident **N-pool** per mount
-+ timer-based idle eviction (today one runtime per mount, serialized, resident while
-the tenant is loaded); `QueryStore` adapter (push-down); `FileStore` adapter
-(streaming or redirect/presigned mode); a host-capability tier (Rust `sql`/`kv`/
-`mongo` as message-shaped capabilities, also serving the wasm tier); instruction-plane
-multi-file ESM resolution (replace `NoopModuleLoader`); a startup snapshot for
-faster per-invocation boot; tighten `Deno.core` exposure.
+**`GuestQueryStore` — DONE.** A second guest-backed capability on the same resident
+substrate: a `query` mount with `"store": {"adapter":"code:…"}` runs stored queries
+through a resident JS adapter. The query service still substitutes JSON templates /
+validates params first (unchanged), then `run_query` ships `{query, params, take,
+skip}` to the adapter as `POST /query` and reads `{rows, total}` back. The shared
+runtime machinery was extracted into `ResidentAdapter` (lazy spawn + re-spawn +
+call), wrapped by both `GuestDataStore` and `GuestQueryStore`; wiring is
+`query_capability` in `tenant.rs` (mirrors `data_capability`; `store.root` for the
+authoring subtree and `store.adapter` for the execution backend coexist). `quote` is
+synchronous so it can't round-trip to the isolate — it uses the reference adapter's
+scalar default (SQL adapters bind via params and never hit it). Proof:
+`guest_backed_query_store_executes_a_stored_query` in `tests/guest_adapter.rs` — a
+Redis-backed query adapter scans + filters a dataset over its pooled socket (one
+connection per resident mount, asserted). This validates the Phase 2 claim that the
+substrate is generic, not data-specific.
+
+**Remaining:** a **MongoDB** `DataStore` adapter (OP_MSG + BSON + SCRAM-SHA-256 over
+the socket capability — the deferred half of Phase 2's proof); a resident **N-pool**
+per mount + timer-based idle eviction (today one runtime per mount, serialized,
+resident while the tenant is loaded); a **`GuestActor`** model for long-lived
+server-push connections (Discord gateway / Slack socket-mode — needs a continuously
+driven runtime, real wall-clock timers, and an inbound-event egress path: a sibling
+to the resident *adapter*, not another `GuestXyz`); a `FileStore` adapter (streaming
+or redirect/presigned mode); a host-capability tier (Rust `sql`/`kv`/`mongo` as
+message-shaped capabilities, also serving the wasm tier); instruction-plane
+multi-file ESM resolution (replace `NoopModuleLoader`); a startup snapshot for faster
+per-invocation boot; tighten `Deno.core` exposure.
