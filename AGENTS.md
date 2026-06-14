@@ -18,6 +18,9 @@ it first.** This file is the agent working guide.
   that have bitten us (Body-not-Sync, wasmtime 37, v8 150, features).
 - **[docs/agents/testing.md](docs/agents/testing.md)** — the test matrix,
   integration harness, conformance, and benchmarks.
+- **[docs/agents/loadable-adapters.md](docs/agents/loadable-adapters.md)** — the
+  deno_core engine + loadable-adapter arc (G13): Phase 0/1 done, Phase 2 design.
+  Read before touching the JS engine, sockets, or adapter wiring.
 
 ## Five-second version
 
