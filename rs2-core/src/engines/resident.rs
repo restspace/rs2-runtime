@@ -19,12 +19,13 @@
 //! (socket I/O) still re-enters the *main* runtime via `block_on_main`, exactly
 //! as for per-invocation isolates.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 
 use crate::capabilities::{DataStore, QueryStore, ScopedFileStore};
 use crate::contract::{GrantedHost, HostApi, InvocationLimits};
@@ -163,19 +164,45 @@ impl BundleLoader {
     }
 }
 
-/// Shared machinery for guest-backed capability adapters: a lazily-spawned,
-/// re-spawn-on-death resident runtime plus the request/response call helper. A
+/// One resident runtime in a mount's pool, tracked for least-busy dispatch
+/// (`inflight`) and idle eviction (`last_used`).
+struct PoolEntry {
+    handle: ResidentHandle,
+    inflight: Arc<AtomicUsize>,
+    last_used: Instant,
+}
+
+/// Decrements a runtime's in-flight count when a call finishes (or unwinds).
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Shared machinery for guest-backed capability adapters: a small per-mount
+/// **pool** of resident runtimes plus the request/response call helper. A
 /// concrete adapter ([`GuestDataStore`], [`GuestQueryStore`]) wraps one of
 /// these and maps its capability trait onto messages. The runtime is built from
 /// a `"store"` config block (`{ "adapter": "code:<name>@<version>", "grants":
 /// { … socket … }, … }`) and the whole block is handed to the bundle as
 /// `ctx.config` (it reads connection params from there).
+///
+/// The pool grows lazily under concurrent load up to `maxRuntimes` (default 4)
+/// — each runtime serializes its own jobs, so calls dispatch to the least-busy
+/// one and a serial workload stays at a single runtime — and a background
+/// sweeper evicts runtimes idle longer than `idleMs`/`idleSeconds` (default
+/// 60 s; `0` disables), dropping the isolate and its pooled sockets. Lifecycle
+/// is bounded by the owning adapter, which the tenant owns: a config change
+/// rebuilds the tenant, dropping the pool (and every runtime) with it.
 pub(crate) struct ResidentAdapter {
-    /// The resident runtime, spawned lazily on first use and re-spawned if it
-    /// dies. A one-slot pool: lifecycle is tied to the owning adapter, which the
-    /// tenant owns — a config change rebuilds the tenant, dropping the old
-    /// adapter (and its runtime), and a new `code_ref` with it.
-    handle: Mutex<Option<ResidentHandle>>,
+    pool: Arc<Mutex<Vec<PoolEntry>>>,
+    max_runtimes: usize,
+    idle: Duration,
+    sweeper_started: AtomicBool,
+    /// The adapter bundle source, read once and reused for every spawn.
+    source: OnceCell<String>,
     loader: BundleLoader,
     host: Arc<dyn HostApi>,
     limits: InvocationLimits,
@@ -210,8 +237,19 @@ impl ResidentAdapter {
         // The adapter only needs its socket grant (enforced host-side via the
         // allowlist); request/fetch default-deny unless a later kind is added.
         let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all(adapter_ref));
+        let max_runtimes =
+            store_config.get("maxRuntimes").and_then(|v| v.as_u64()).unwrap_or(4).clamp(1, 64) as usize;
+        let idle_ms = store_config
+            .get("idleMs")
+            .and_then(|v| v.as_u64())
+            .or_else(|| store_config.get("idleSeconds").and_then(|v| v.as_u64()).map(|s| s.saturating_mul(1000)))
+            .unwrap_or(60_000);
         Ok(ResidentAdapter {
-            handle: Mutex::new(None),
+            pool: Arc::new(Mutex::new(Vec::new())),
+            max_runtimes,
+            idle: Duration::from_millis(idle_ms),
+            sweeper_started: AtomicBool::new(false),
+            source: OnceCell::new(),
             loader: BundleLoader {
                 cap: limits.materialized_body_bytes,
                 files,
@@ -226,16 +264,33 @@ impl ResidentAdapter {
         })
     }
 
-    /// Get a live resident handle, spawning (or re-spawning a dead one) on
-    /// demand. Holds the slot lock across the spawn so first calls spawn once.
-    async fn resident(&self) -> Result<ResidentHandle, RsError> {
-        let mut slot = self.handle.lock().await;
-        if let Some(h) = slot.as_ref() {
-            if h.alive() {
-                return Ok(h.clone());
+    /// The adapter bundle source, loaded once and cached for every spawn.
+    async fn cached_source(&self) -> Result<String, RsError> {
+        self.source.get_or_try_init(|| self.loader.load()).await.map(|s| s.clone())
+    }
+
+    /// Reserve a runtime for one call: reuse an idle one, else grow the pool up
+    /// to `max_runtimes`, else dispatch to the least-busy. The returned guard
+    /// releases the reservation when the call finishes. Dead runtimes are
+    /// pruned first (re-spawn on demand). The spawn awaits under the pool lock
+    /// so concurrent first-calls don't over-spawn.
+    async fn acquire(&self) -> Result<(ResidentHandle, InflightGuard), RsError> {
+        let mut entries = self.pool.lock().await;
+        entries.retain(|e| e.handle.alive());
+        let least = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.inflight.load(Ordering::SeqCst)))
+            .min_by_key(|(_, n)| *n);
+        if let Some((i, n)) = least {
+            if n == 0 || entries.len() >= self.max_runtimes {
+                let e = &mut entries[i];
+                e.last_used = Instant::now();
+                e.inflight.fetch_add(1, Ordering::SeqCst);
+                return Ok((e.handle.clone(), InflightGuard(e.inflight.clone())));
             }
         }
-        let source = self.loader.load().await?;
+        let source = self.cached_source().await?;
         let handle = spawn_resident(
             source,
             self.host.clone(),
@@ -244,8 +299,42 @@ impl ResidentAdapter {
             self.socket_allowlist.clone(),
         )
         .await?;
-        *slot = Some(handle.clone());
-        Ok(handle)
+        let inflight = Arc::new(AtomicUsize::new(1));
+        entries.push(PoolEntry {
+            handle: handle.clone(),
+            inflight: inflight.clone(),
+            last_used: Instant::now(),
+        });
+        Ok((handle, InflightGuard(inflight)))
+    }
+
+    /// Start the idle-eviction sweeper once, on first use. It holds a `Weak` to
+    /// the pool, so it stops itself when the adapter (and pool) drop.
+    fn ensure_sweeper(&self) {
+        if self.idle.is_zero() || self.sweeper_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pool = Arc::downgrade(&self.pool);
+        let idle = self.idle;
+        tokio::spawn(async move {
+            let tick = idle.max(Duration::from_millis(50));
+            loop {
+                tokio::time::sleep(tick).await;
+                let Some(pool) = pool.upgrade() else {
+                    return; // adapter dropped → nothing left to sweep
+                };
+                let now = Instant::now();
+                let mut entries = pool.lock().await;
+                // Keep a runtime only while it is live and either busy or
+                // recently used; an evicted handle's thread exits and its
+                // pooled sockets close.
+                entries.retain(|e| {
+                    e.handle.alive()
+                        && (e.inflight.load(Ordering::SeqCst) > 0
+                            || now.duration_since(e.last_used) < idle)
+                });
+            }
+        });
     }
 
     /// Send a request envelope to the adapter; return `(status, body)`.
@@ -255,12 +344,13 @@ impl ResidentAdapter {
         path: &str,
         body: Option<Value>,
     ) -> Result<(u16, Value), RsError> {
+        self.ensure_sweeper();
+        let (handle, _guard) = self.acquire().await?;
         let mut req = json!({ "method": method, "url": path });
         if let Some(b) = body {
             req["body"] = b;
             req["mediaType"] = json!("application/json");
         }
-        let handle = self.resident().await?;
         let envelope = handle.call(req, self.store_config.clone()).await?;
         let status = envelope.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
         let body = envelope.get("body").cloned().unwrap_or(Value::Null);

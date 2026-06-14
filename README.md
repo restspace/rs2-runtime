@@ -344,16 +344,21 @@ non-HTTP wire protocols — without recompiling `rs2-core`.
   per-invocation and resident paths share `build_runtime` + `dispatch_once`.
   Proof: `tests/guest_adapter.rs` runs the store contract over a Redis (RESP)
   adapter against an in-process mock, asserting a single pooled connection.
-- **Phase 3** (in progress): **`GuestQueryStore`** — a second guest-backed
-  capability on the same `ResidentAdapter` substrate. A `query` mount with
-  `"store": {"adapter": "code:…"}` runs stored queries through a resident JS
-  adapter (`run_query` → `POST /query {query,params,take,skip}` → `{rows,
-  total}`); the query service still substitutes templates + validates params
-  first, unchanged. Proven by a Redis-backed query adapter that scans + filters
-  a dataset over its pooled socket.
-- **Deferred** (Phase 3): a MongoDB adapter (BSON/SCRAM), a per-mount N-pool +
-  idle eviction, a `GuestActor` model for long-lived push connections (Discord
-  gateway), a `FileStore` adapter, multi-file ESM resolution.
+- **Phase 3** (in progress):
+  - **`GuestQueryStore`** — a second guest-backed capability on the same
+    `ResidentAdapter` substrate. A `query` mount with `"store": {"adapter":
+    "code:…"}` runs stored queries through a resident JS adapter (`run_query` →
+    `POST /query {query,params,take,skip}` → `{rows, total}`); the query service
+    still substitutes templates + validates params first, unchanged. Proven by a
+    Redis-backed query adapter that scans + filters a dataset over its socket.
+  - **Resident N-pool + idle eviction** — `ResidentAdapter` is a small per-mount
+    pool: it grows lazily under concurrent load to `store.maxRuntimes` (default
+    4, least-busy dispatch; a serial workload stays at one) and a background
+    sweeper evicts runtimes idle past `store.idleMs`/`idleSeconds` (default 60 s),
+    closing the isolate and its pooled sockets.
+- **Deferred** (Phase 3): a MongoDB adapter (BSON/SCRAM), a `GuestActor` model
+  for long-lived push connections (Discord gateway), a `FileStore` adapter,
+  multi-file ESM resolution.
 
 ## G1 + G3 benchmarks (`tests/g_benchmarks.rs`)
 

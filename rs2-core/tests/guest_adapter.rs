@@ -214,8 +214,16 @@ export default async (msg, ctx) => {
 // ---- the mock Redis (RESP) -------------------------------------------------
 
 /// A tiny RESP server supporting the subset the adapter uses (SET/GET/DEL/
-/// EXISTS/KEYS). Returns the bound port and a counter of accepted connections.
+/// EXISTS/KEYS). Returns the bound port and a counter of accepted connections
+/// (so a test can observe pooling — one connection per resident runtime).
 async fn spawn_mock_redis() -> (u16, Arc<AtomicUsize>) {
+    spawn_mock_redis_with_delay(std::time::Duration::ZERO).await
+}
+
+/// As [`spawn_mock_redis`], but delays each reply by `delay` — so a call
+/// occupies its runtime long enough for concurrent calls to overlap (forcing
+/// the pool to grow).
+async fn spawn_mock_redis_with_delay(delay: std::time::Duration) -> (u16, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let store: Arc<Mutex<BTreeMap<String, String>>> = Arc::new(Mutex::new(BTreeMap::new()));
@@ -225,16 +233,19 @@ async fn spawn_mock_redis() -> (u16, Arc<AtomicUsize>) {
         while let Ok((sock, _)) = listener.accept().await {
             conns2.fetch_add(1, Ordering::SeqCst);
             let store = store.clone();
-            tokio::spawn(serve_conn(sock, store));
+            tokio::spawn(serve_conn(sock, store, delay));
         }
     });
     (port, conns)
 }
 
-async fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<BTreeMap<String, String>>>) {
+async fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<BTreeMap<String, String>>>, delay: std::time::Duration) {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(args) = read_command(&mut sock, &mut buf).await {
         let reply = exec(&args, &store);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         if sock.write_all(&reply).await.is_err() {
             break;
         }
@@ -537,4 +548,71 @@ async fn guest_backed_query_store_executes_a_stored_query() {
 
     // Each guest mount pooled its own single connection (data + query = 2).
     assert_eq!(conns.load(Ordering::SeqCst), 2, "one pooled connection per resident mount");
+}
+
+/// Build a single-`/data` runtime backed by the redis adapter, with extra
+/// `store` keys (e.g. `maxRuntimes`, `idleMs`) merged in.
+fn data_rt(port: u16, files: Arc<LocalFsFileStore>, extra: serde_json::Value) -> Arc<Runtime> {
+    let mut store = json!({
+        "adapter": "code:redis@v1", "host": "127.0.0.1", "port": port,
+        "grants": { "redis": { "type": "socket", "hosts": [format!("127.0.0.1:{port}")] } }
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        store[k] = v.clone();
+    }
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/data", "service": "data", "config": { "store": store } }
+    ]})));
+    let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
+    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pool_grows_under_concurrency_and_caps_at_max_runtimes() {
+    // Each reply is delayed, so four concurrent calls overlap and can't reuse a
+    // single runtime. With maxRuntimes=2 the pool grows to 2 and no further.
+    let (port, conns) = spawn_mock_redis_with_delay(std::time::Duration::from_millis(300)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
+    files.write("t", ".rs2-code/redis/v1.js", js(format!("{RESP_CLIENT}{DATA_HANDLER}"))).await.unwrap();
+    // idleMs:0 disables eviction so it can't interfere with the count.
+    let rt = data_rt(port, files, json!({ "maxRuntimes": 2, "idleMs": 0 }));
+
+    let (a, b, c, d) = tokio::join!(
+        rt.handle(req(Method::GET, "/data/things/k0")),
+        rt.handle(req(Method::GET, "/data/things/k1")),
+        rt.handle(req(Method::GET, "/data/things/k2")),
+        rt.handle(req(Method::GET, "/data/things/k3")),
+    );
+    for r in [&a, &b, &c, &d] {
+        assert_eq!(r.status, Some(StatusCode::NOT_FOUND), "missing key → 404");
+    }
+    assert_eq!(conns.load(Ordering::SeqCst), 2, "pool grew to maxRuntimes=2 and capped there");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_runtimes_are_evicted_and_respawn() {
+    let (port, conns) = spawn_mock_redis().await;
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
+    files.write("t", ".rs2-code/redis/v1.js", js(format!("{RESP_CLIENT}{DATA_HANDLER}"))).await.unwrap();
+    let rt = data_rt(port, files, json!({ "idleMs": 150 }));
+
+    // First call spawns a runtime and opens one connection.
+    let resp = rt.handle(req(Method::PUT, "/data/things/a").with_json(&json!({ "n": 1 }))).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED));
+    assert_eq!(conns.load(Ordering::SeqCst), 1, "one connection after first call");
+
+    // Idle past the eviction window + a few sweeper ticks: the runtime is
+    // dropped, closing its socket.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    // The next call finds an empty pool and re-spawns → a fresh connection. (If
+    // the idle runtime had survived, this would reuse it and stay at 1.)
+    let mut resp = rt.handle(req(Method::GET, "/data/things/a")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "record still in the backend");
+    assert_eq!(body_json(&mut resp).await["n"], 1);
+    assert_eq!(conns.load(Ordering::SeqCst), 2, "idle runtime was evicted; next call re-spawned");
 }

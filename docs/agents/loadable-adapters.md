@@ -140,10 +140,25 @@ Redis-backed query adapter scans + filters a dataset over its pooled socket (one
 connection per resident mount, asserted). This validates the Phase 2 claim that the
 substrate is generic, not data-specific.
 
+**Resident N-pool + idle eviction — DONE.** `ResidentAdapter` is now a small
+per-mount pool instead of a one-slot handle. It **grows lazily under concurrent
+load** up to `maxRuntimes` (default 4, config `store.maxRuntimes`): each runtime
+serializes its own jobs, so `acquire` dispatches each call to the **least-busy**
+runtime, spawns a new one when all are busy and there's room, and a serial workload
+stays at one (the spawn awaits under the pool lock so concurrent first-calls don't
+over-spawn; an `InflightGuard` releases the reservation on completion/unwind). A
+**background sweeper** (started once, holds a `Weak` to the pool so it stops when the
+adapter drops) evicts runtimes idle longer than `store.idleMs`/`store.idleSeconds`
+(default 60 s; `0` disables) — dropping the isolate and its pooled sockets;
+`cached_source` (a `OnceCell`) reads the bundle once and reuses it for every spawn.
+Proof: `pool_grows_under_concurrency_and_caps_at_max_runtimes` (four overlapping
+calls against a delayed mock grow the pool to `maxRuntimes=2` and no further) and
+`idle_runtimes_are_evicted_and_respawn` (an idle runtime is dropped, the next call
+re-spawns a fresh connection) in `tests/guest_adapter.rs`.
+
 **Remaining:** a **MongoDB** `DataStore` adapter (OP_MSG + BSON + SCRAM-SHA-256 over
-the socket capability — the deferred half of Phase 2's proof); a resident **N-pool**
-per mount + timer-based idle eviction (today one runtime per mount, serialized,
-resident while the tenant is loaded); a **`GuestActor`** model for long-lived
+the socket capability — the deferred half of Phase 2's proof); a **`GuestActor`**
+model for long-lived
 server-push connections (Discord gateway / Slack socket-mode — needs a continuously
 driven runtime, real wall-clock timers, and an inbound-event egress path: a sibling
 to the resident *adapter*, not another `GuestXyz`); a `FileStore` adapter (streaming
