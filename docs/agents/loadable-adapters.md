@@ -170,12 +170,26 @@ follow-on). Proof: `guest_backed_file_store_satisfies_the_store_contract` runs t
 full store contract (PUT/GET/keyless-POST/list/pagination/DELETE + `?confirm=`) plus
 `HEAD` and a `Range`→206 against an in-memory guest file adapter.
 
-**Remaining:** a **MongoDB** `DataStore` adapter (OP_MSG + BSON + SCRAM-SHA-256 over
-the socket capability — the deferred half of Phase 2's proof); a **`GuestActor`**
-model for long-lived
-server-push connections (Discord gateway / Slack socket-mode — needs a continuously
-driven runtime, real wall-clock timers, and an inbound-event egress path: a sibling
-to the resident *adapter*, not another `GuestXyz`); a host-capability tier (Rust
-`sql`/`kv`/`mongo` as message-shaped capabilities, also serving the wasm tier);
-instruction-plane multi-file ESM resolution (replace `NoopModuleLoader`); a startup
-snapshot for faster per-invocation boot; tighten `Deno.core` exposure.
+**MongoDB adapter — DONE (no-auth).** A real-wire-protocol `DataStore` adapter,
+purely a JS bundle on the existing `GuestDataStore` (no rs2-core change): it speaks
+**OP_MSG framing + a hand-written BSON codec** over the pooled socket. Datasets are
+collections, a record's key is its string `_id`; CRUD maps to `find`/`update`(upsert)/
+`delete`/`count`, listings to `find`+`count` and `listCollections`, dataset delete to
+`drop`, schema to a `__rs2_schemas__` collection. Proof:
+`guest_backed_mongo_data_store_satisfies_the_store_contract` runs the full store
+contract against an **in-process mock `mongod`** (OP_MSG + a hand-rolled BSON
+subset over `serde_json::Value` — the `bson` crate was tried but bloats the dep graph
+past the MSVC linker's module limit, error 1318). **SCRAM-SHA-256 auth is the one gap**:
+it needs HMAC/SHA-256/PBKDF2, which the JS prelude's `crypto` doesn't expose (no
+WebCrypto `subtle`), so the adapter targets unauthenticated/network-trusted MongoDB;
+adding a `crypto.subtle` to the prelude (the host already has `hmac`/`sha2`) would
+unlock it — the only remaining piece.
+
+**Remaining:** a **`GuestActor`** model for long-lived server-push connections
+(Discord gateway / Slack socket-mode — needs a continuously driven runtime, real
+wall-clock timers, and an inbound-event egress path: a sibling to the resident
+*adapter*, not another `GuestXyz`); **SCRAM-SHA-256** for the Mongo adapter (prelude
+`crypto.subtle`); a host-capability tier (Rust `sql`/`kv`/`mongo` as message-shaped
+capabilities, also serving the wasm tier); instruction-plane multi-file ESM
+resolution (replace `NoopModuleLoader`); a startup snapshot for faster
+per-invocation boot; tighten `Deno.core` exposure.

@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use http::{Method, StatusCode};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -306,6 +306,401 @@ export default async (msg) => {
   return { status: 400, body: { detail: "unsupported method" } };
 };
 "#;
+
+/// A MongoDB `DataStore` adapter speaking the real wire protocol — OP_MSG
+/// framing + a hand-written BSON codec — over the pooled socket. Datasets are
+/// collections; a record's key is its string `_id`. **No auth**: SCRAM-SHA-256
+/// needs HMAC/PBKDF2 which the JS prelude's `crypto` doesn't expose, so this
+/// targets unauthenticated MongoDB (or a network-trusted deployment); adding a
+/// WebCrypto `subtle` to the prelude would unlock SCRAM.
+const MONGO_ADAPTER: &str = r#"
+let SOCK = null, RBUF = new Uint8Array(0), DB = "test", REQID = 0;
+const SCHEMA_COLL = "__rs2_schemas__";
+
+// --- BSON encode (subset: doc/array/string/int32/double/bool/null) ---
+function pushI32(a, v) { a.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff); }
+function pushDouble(a, v) { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, v, true); for (const x of b) a.push(x); }
+function pushCStr(a, s) { for (const x of new TextEncoder().encode(s)) a.push(x); a.push(0); }
+function pushStr(a, s) { const b = new TextEncoder().encode(s); pushI32(a, b.length + 1); for (const x of b) a.push(x); a.push(0); }
+function encodeInto(a, obj) {
+  const body = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined) { body.push(0x0a); pushCStr(body, k); }
+    else if (typeof v === "boolean") { body.push(0x08); pushCStr(body, k); body.push(v ? 1 : 0); }
+    else if (typeof v === "number") {
+      if (Number.isInteger(v) && v >= -2147483648 && v <= 2147483647) { body.push(0x10); pushCStr(body, k); pushI32(body, v); }
+      else { body.push(0x01); pushCStr(body, k); pushDouble(body, v); }
+    } else if (typeof v === "string") { body.push(0x02); pushCStr(body, k); pushStr(body, v); }
+    else if (Array.isArray(v)) { const o = {}; v.forEach((x, i) => (o[i] = x)); body.push(0x04); pushCStr(body, k); encodeInto(body, o); }
+    else if (typeof v === "object") { body.push(0x03); pushCStr(body, k); encodeInto(body, v); }
+    else throw new Error("bson encode: bad type " + typeof v);
+  }
+  pushI32(a, body.length + 5);
+  for (const x of body) a.push(x);
+  a.push(0);
+}
+function encodeDoc(obj) { const a = []; encodeInto(a, obj); return Uint8Array.from(a); }
+
+// --- BSON decode ---
+function decodeDoc(bytes, start) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const end = start + dv.getInt32(start, true);
+  let off = start + 4;
+  const obj = {};
+  while (off < end - 1) {
+    const type = bytes[off++];
+    let ns = off;
+    while (bytes[off] !== 0) off++;
+    const name = new TextDecoder().decode(bytes.subarray(ns, off));
+    off++;
+    let val;
+    if (type === 0x01) { val = dv.getFloat64(off, true); off += 8; }
+    else if (type === 0x02) { const l = dv.getInt32(off, true); off += 4; val = new TextDecoder().decode(bytes.subarray(off, off + l - 1)); off += l; }
+    else if (type === 0x03) { const r = decodeDoc(bytes, off); val = r[0]; off = r[1]; }
+    else if (type === 0x04) { const r = decodeDoc(bytes, off); val = Object.values(r[0]); off = r[1]; }
+    else if (type === 0x08) { val = bytes[off++] !== 0; }
+    else if (type === 0x0a) { val = null; }
+    else if (type === 0x10) { val = dv.getInt32(off, true); off += 4; }
+    else if (type === 0x12) { val = Number(dv.getBigInt64(off, true)); off += 8; }
+    else if (type === 0x07) { off += 12; val = null; }
+    else throw new Error("bson decode: unsupported type 0x" + type.toString(16));
+    obj[name] = val;
+  }
+  return [obj, end];
+}
+
+// --- OP_MSG over the socket ---
+function cat(a, b) { const o = new Uint8Array(a.length + b.length); o.set(a, 0); o.set(b, a.length); return o; }
+function ensure(n) { while (RBUF.length < n) { const c = SOCK.read(65536); if (c === null) throw new Error("mongo: closed"); RBUF = cat(RBUF, c); } }
+function command(doc) {
+  doc["$db"] = DB;
+  const body = encodeDoc(doc);
+  const msg = new Uint8Array(21 + body.length);
+  const dv = new DataView(msg.buffer);
+  dv.setInt32(0, msg.length, true);
+  dv.setInt32(4, ++REQID, true);
+  dv.setInt32(12, 2013, true); // OP_MSG
+  msg[20] = 0; // section kind 0
+  msg.set(body, 21);
+  SOCK.write(msg);
+  ensure(4);
+  const len = new DataView(RBUF.buffer, RBUF.byteOffset, RBUF.byteLength).getInt32(0, true);
+  ensure(len);
+  const reply = decodeDoc(RBUF.slice(0, len), 21)[0];
+  RBUF = RBUF.slice(len);
+  if (!reply.ok) throw new Error("mongo error: " + JSON.stringify(reply));
+  return reply;
+}
+
+export default async (msg, ctx) => {
+  if (!SOCK) { DB = ctx.config.db || "test"; SOCK = RS2Socket.connect(ctx.config.host || "127.0.0.1", ctx.config.port | 0); }
+  const path = String(msg.url).split("?")[0];
+  const qs = new URLSearchParams(String(msg.url).split("?")[1] || "");
+  const segs = path.split("/").filter(Boolean);
+  const skip = parseInt(qs.get("$skip") || "0", 10), take = parseInt(qs.get("$take") || "1000", 10);
+
+  if (segs.length === 0) {
+    if (msg.method !== "GET") return { status: 400, body: { detail: "root supports GET" } };
+    const reply = command({ listCollections: 1, nameOnly: true });
+    const names = (reply.cursor.firstBatch || []).map((c) => c.name).filter((n) => n !== SCHEMA_COLL).sort();
+    const entries = names.slice(skip, skip + take).map((n) => ({ name: n + "/", dir: true }));
+    return { status: 200, body: { path: "/", entries, total: names.length } };
+  }
+
+  const dataset = segs[0];
+  if (segs.length === 1 && path.endsWith("/")) {
+    if (msg.method === "GET") {
+      const total = command({ count: dataset }).n || 0;
+      const found = command({ find: dataset, filter: {}, skip, limit: take });
+      const names = (found.cursor.firstBatch || []).map((d) => String(d._id)).sort();
+      const entries = names.map((n) => ({ name: n, dir: false, contentType: "application/json" }));
+      return { status: 200, body: { path: "/" + dataset + "/", entries, total } };
+    }
+    if (msg.method === "DELETE") { command({ drop: dataset }); return { status: 204 }; }
+    return { status: 400, body: { detail: "container supports GET, DELETE" } };
+  }
+
+  const key = segs.slice(1).join("/");
+  if (key === ".schema.json") {
+    if (msg.method === "GET") {
+      const doc = (command({ find: SCHEMA_COLL, filter: { _id: dataset }, limit: 1 }).cursor.firstBatch || [])[0];
+      return doc ? { status: 200, body: doc.schema } : { status: 404, body: { detail: "no schema" } };
+    }
+    if (msg.method === "PUT") {
+      command({ update: SCHEMA_COLL, updates: [{ q: { _id: dataset }, u: { _id: dataset, schema: msg.body }, upsert: true }] });
+      return { status: 200 };
+    }
+    return { status: 400, body: { detail: "schema supports GET, PUT" } };
+  }
+
+  if (msg.method === "GET") {
+    const doc = (command({ find: dataset, filter: { _id: key }, limit: 1 }).cursor.firstBatch || [])[0];
+    if (!doc) return { status: 404, body: { detail: "no record '" + key + "'" } };
+    delete doc._id;
+    return { status: 200, body: doc };
+  }
+  if (msg.method === "PUT") {
+    const reply = command({ update: dataset, updates: [{ q: { _id: key }, u: Object.assign({}, msg.body, { _id: key }), upsert: true }] });
+    const created = reply.upserted && reply.upserted.length > 0;
+    return { status: created ? 201 : 200 };
+  }
+  if (msg.method === "DELETE") {
+    if (!command({ delete: dataset, deletes: [{ q: { _id: key }, limit: 1 }] }).n) return { status: 404, body: { detail: "no record" } };
+    return { status: 204 };
+  }
+  return { status: 400, body: { detail: "unsupported" } };
+};
+"#;
+
+// ---- a mock mongod (OP_MSG + a hand-rolled BSON codec) ---------------------
+// A self-contained BSON subset (doc/array/string/int32/int64/double/bool/null)
+// over serde_json::Value, mirroring the adapter's JS codec — no `bson` crate
+// (it bloats the dependency graph past the MSVC linker's module limit).
+
+fn cstr(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(s.as_bytes());
+    out.push(0);
+}
+
+fn bson_encode_doc(obj: &serde_json::Map<String, Value>) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (k, v) in obj {
+        match v {
+            Value::Null => {
+                body.push(0x0a);
+                cstr(&mut body, k);
+            }
+            Value::Bool(b) => {
+                body.push(0x08);
+                cstr(&mut body, k);
+                body.push(*b as u8);
+            }
+            Value::Number(n) => match n.as_i64() {
+                Some(i) if (i32::MIN as i64..=i32::MAX as i64).contains(&i) => {
+                    body.push(0x10);
+                    cstr(&mut body, k);
+                    body.extend_from_slice(&(i as i32).to_le_bytes());
+                }
+                Some(i) => {
+                    body.push(0x12);
+                    cstr(&mut body, k);
+                    body.extend_from_slice(&i.to_le_bytes());
+                }
+                None => {
+                    body.push(0x01);
+                    cstr(&mut body, k);
+                    body.extend_from_slice(&n.as_f64().unwrap().to_le_bytes());
+                }
+            },
+            Value::String(s) => {
+                body.push(0x02);
+                cstr(&mut body, k);
+                body.extend_from_slice(&((s.len() + 1) as i32).to_le_bytes());
+                body.extend_from_slice(s.as_bytes());
+                body.push(0);
+            }
+            Value::Array(a) => {
+                let mut m = serde_json::Map::new();
+                for (i, item) in a.iter().enumerate() {
+                    m.insert(i.to_string(), item.clone());
+                }
+                body.push(0x04);
+                cstr(&mut body, k);
+                body.extend_from_slice(&bson_encode_doc(&m));
+            }
+            Value::Object(o) => {
+                body.push(0x03);
+                cstr(&mut body, k);
+                body.extend_from_slice(&bson_encode_doc(o));
+            }
+        }
+    }
+    let mut out = ((body.len() + 5) as i32).to_le_bytes().to_vec();
+    out.extend_from_slice(&body);
+    out.push(0);
+    out
+}
+
+fn bson_decode_doc(b: &[u8], start: usize) -> (Value, usize) {
+    let len = i32::from_le_bytes(b[start..start + 4].try_into().unwrap()) as usize;
+    let end = start + len;
+    let mut off = start + 4;
+    let mut map = serde_json::Map::new();
+    while off < end - 1 {
+        let t = b[off];
+        off += 1;
+        let ns = off;
+        while b[off] != 0 {
+            off += 1;
+        }
+        let name = String::from_utf8_lossy(&b[ns..off]).to_string();
+        off += 1;
+        let val = match t {
+            0x01 => {
+                let v = f64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                off += 8;
+                json!(v)
+            }
+            0x02 => {
+                let l = i32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                let s = String::from_utf8_lossy(&b[off..off + l - 1]).to_string();
+                off += l;
+                Value::String(s)
+            }
+            0x03 => {
+                let (d, no) = bson_decode_doc(b, off);
+                off = no;
+                d
+            }
+            0x04 => {
+                let (d, no) = bson_decode_doc(b, off);
+                off = no;
+                let o = d.as_object().unwrap();
+                let mut items: Vec<(usize, Value)> =
+                    o.iter().map(|(k, v)| (k.parse().unwrap_or(0), v.clone())).collect();
+                items.sort_by_key(|(i, _)| *i);
+                Value::Array(items.into_iter().map(|(_, v)| v).collect())
+            }
+            0x08 => {
+                let v = b[off] != 0;
+                off += 1;
+                Value::Bool(v)
+            }
+            0x0a => Value::Null,
+            0x10 => {
+                let v = i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+                off += 4;
+                json!(v)
+            }
+            0x12 => {
+                let v = i64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                off += 8;
+                json!(v)
+            }
+            _ => return (Value::Object(map), end),
+        };
+        map.insert(name, val);
+    }
+    (Value::Object(map), end)
+}
+
+/// A minimal MongoDB server: OP_MSG framing + the command subset the adapter
+/// uses (find/count/update/delete/drop/listCollections), over an in-memory map.
+/// Returns the bound port.
+async fn spawn_mock_mongo() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // collection -> (_id -> document)
+    let store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            tokio::spawn(serve_mongo(sock, store.clone()));
+        }
+    });
+    port
+}
+
+async fn serve_mongo(mut sock: TcpStream, store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>) {
+    loop {
+        let mut header = [0u8; 16];
+        if sock.read_exact(&mut header).await.is_err() {
+            break;
+        }
+        let len = i32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if len < 21 {
+            break;
+        }
+        let mut rest = vec![0u8; len - 16];
+        if sock.read_exact(&mut rest).await.is_err() {
+            break;
+        }
+        // rest = flagBits(4) + section kind(1) + BSON command doc
+        let (cmd, _) = bson_decode_doc(&rest, 5);
+        let reply = mongo_dispatch(&cmd, &store);
+        let body = bson_encode_doc(reply.as_object().unwrap());
+        let total = (21 + body.len()) as i32;
+        let mut out = total.to_le_bytes().to_vec();
+        out.extend_from_slice(&0i32.to_le_bytes()); // requestID
+        out.extend_from_slice(&0i32.to_le_bytes()); // responseTo
+        out.extend_from_slice(&2013i32.to_le_bytes()); // OP_MSG
+        out.extend_from_slice(&0u32.to_le_bytes()); // flagBits
+        out.push(0u8); // section kind 0
+        out.extend_from_slice(&body);
+        if sock.write_all(&out).await.is_err() {
+            break;
+        }
+    }
+}
+
+fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, Value>>>) -> Value {
+    let str_of = |key: &str| cmd.get(key).and_then(|v| v.as_str());
+    let id_of = |d: &Value| d.get("q").and_then(|q| q.get("_id")).and_then(|v| v.as_str()).map(String::from);
+    let mut s = store.lock().unwrap();
+
+    if let Some(coll) = str_of("find") {
+        let skip = cmd.get("skip").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let limit = cmd.get("limit").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
+        let want_id = cmd.get("filter").and_then(|f| f.get("_id")).and_then(|v| v.as_str());
+        let mut batch: Vec<Value> = Vec::new();
+        if let Some(map) = s.get(coll) {
+            match want_id {
+                Some(id) => batch.extend(map.get(id).cloned()),
+                None => batch.extend(map.values().skip(skip).take(limit).cloned()),
+            }
+        }
+        return json!({ "ok": 1.0, "cursor": { "firstBatch": batch, "id": 0, "ns": format!("test.{coll}") } });
+    }
+    if let Some(coll) = str_of("count") {
+        return json!({ "ok": 1.0, "n": s.get(coll).map(|m| m.len()).unwrap_or(0) as i64 });
+    }
+    if let Some(coll) = str_of("update") {
+        let updates = cmd.get("updates").and_then(|u| u.as_array()).cloned().unwrap_or_default();
+        let (mut n, mut nmod) = (0i64, 0i64);
+        let mut upserted: Vec<Value> = Vec::new();
+        let map = s.entry(coll.to_string()).or_default();
+        for (i, u) in updates.iter().enumerate() {
+            let id = id_of(u).unwrap_or_default();
+            let doc = u.get("u").cloned().unwrap_or(Value::Null);
+            let existed = map.contains_key(&id);
+            map.insert(id.clone(), doc);
+            n += 1;
+            if existed {
+                nmod += 1;
+            } else {
+                upserted.push(json!({ "index": i as i64, "_id": id }));
+            }
+        }
+        let mut reply = json!({ "ok": 1.0, "n": n, "nModified": nmod });
+        if !upserted.is_empty() {
+            reply["upserted"] = json!(upserted);
+        }
+        return reply;
+    }
+    if let Some(coll) = str_of("delete") {
+        let deletes = cmd.get("deletes").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        let mut n = 0i64;
+        if let Some(map) = s.get_mut(coll) {
+            for d in &deletes {
+                if let Some(id) = id_of(d) {
+                    if map.remove(&id).is_some() {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        return json!({ "ok": 1.0, "n": n });
+    }
+    if let Some(coll) = str_of("drop") {
+        s.remove(coll);
+        return json!({ "ok": 1.0 });
+    }
+    if cmd.get("listCollections").is_some() {
+        let batch: Vec<Value> = s.keys().map(|name| json!({ "name": name, "type": "collection" })).collect();
+        return json!({ "ok": 1.0, "cursor": { "firstBatch": batch, "id": 0, "ns": "test.$cmd.listCollections" } });
+    }
+    json!({ "ok": 1.0 }) // hello / ping / unknown
+}
 
 // ---- the mock Redis (RESP) -------------------------------------------------
 
@@ -808,5 +1203,104 @@ async fn guest_backed_file_store_satisfies_the_store_contract() {
     assert!(
         !root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "docs/"),
         "deleted directory left the root listing: {root}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_backed_mongo_data_store_satisfies_the_store_contract() {
+    let port = spawn_mock_mongo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
+    files.write("t", ".rs2-code/mongo/v1.js", js(MONGO_ADAPTER.to_string())).await.unwrap();
+
+    let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [{
+        "path": "/data", "service": "data", "config": { "store": {
+            "adapter": "code:mongo@v1", "host": "127.0.0.1", "port": port, "db": "test",
+            "grants": { "mongo": { "type": "socket", "hosts": [format!("127.0.0.1:{port}")] } }
+        }}
+    }]})));
+    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+
+    // PUT create / overwrite over the real Mongo wire protocol.
+    let resp = rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "status": "open", "total": 50 }))).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT create: {:?}", resp.body);
+    let resp = rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "status": "open", "total": 55 }))).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "PUT overwrite");
+
+    // GET round-trips the record (BSON encode → mock → BSON decode).
+    let mut resp = rt.handle(req(Method::GET, "/data/orders/o1")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "GET child");
+    assert!(resp.header("etag").is_some(), "child GET carries ETag");
+    let rec = body_json(&mut resp).await;
+    assert_eq!(rec["status"], "open");
+    assert_eq!(rec["total"], 55);
+    assert!(rec.get("_id").is_none(), "_id is stripped from the record");
+
+    // Keyless POST → 201 + Location, fetchable.
+    let resp = rt.handle(req(Method::POST, "/data/orders/").with_json(&json!({ "status": "new" }))).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "keyless POST");
+    let location = resp.header("location").expect("Location").to_string();
+    assert_eq!(rt.handle(req(Method::GET, &location)).await.status, Some(StatusCode::OK));
+
+    // Container listing + pagination (find + count commands).
+    let mut resp = rt.handle(req(Method::GET, "/data/orders/")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "container GET");
+    let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
+    assert!(total >= 2, "X-Total-Count");
+    let listing = body_json(&mut resp).await;
+    assert!(
+        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "o1" && e["dir"] == false),
+        "record appears as an entry: {listing}"
+    );
+    let mut resp = rt.handle(req(Method::GET, "/data/orders/?$take=1")).await;
+    let page = body_json(&mut resp).await;
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1, "$take pages");
+    assert_eq!(page["total"].as_u64(), Some(total), "paged total is the full count");
+
+    // Mount root lists the collection as a dataset.
+    let mut resp = rt.handle(req(Method::GET, "/data/")).await;
+    let root = body_json(&mut resp).await;
+    assert!(
+        root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "orders/" && e["dir"] == true),
+        "dataset at the root: {root}"
+    );
+
+    // Schema facet: install (a separate collection), read back, shown in listing.
+    let put = req(Method::PUT, "/data/orders/.schema.json").with_json(&json!({ "type": "object" }));
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::OK), "install schema");
+    let mut resp = rt.handle(req(Method::GET, "/data/orders/.schema.json")).await;
+    assert_eq!(body_json(&mut resp).await["type"], "object", "schema reads back");
+    let mut listing = rt.handle(req(Method::GET, "/data/orders/")).await;
+    assert!(
+        body_json(&mut listing).await["entries"].as_array().unwrap().iter().any(|e| e["name"] == ".schema.json"),
+        "schema is a fixed child"
+    );
+
+    // DELETE child → 204, gone.
+    assert_eq!(rt.handle(req(Method::DELETE, "/data/orders/o1")).await.status, Some(StatusCode::NO_CONTENT));
+    assert_eq!(
+        rt.handle(req(Method::GET, "/data/orders/o1")).await.status,
+        Some(StatusCode::NOT_FOUND),
+        "deleted record is gone"
+    );
+
+    // Container guard + drop.
+    assert_eq!(
+        rt.handle(req(Method::DELETE, "/data/orders/")).await.status,
+        Some(StatusCode::CONFLICT),
+        "non-empty container delete is 409 without confirm"
+    );
+    assert_eq!(
+        rt.handle(req(Method::DELETE, "/data/orders/?confirm=orders")).await.status,
+        Some(StatusCode::NO_CONTENT),
+        "confirmed delete drops the collection"
+    );
+    let mut resp = rt.handle(req(Method::GET, "/data/")).await;
+    let root = body_json(&mut resp).await;
+    assert!(
+        !root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "orders/"),
+        "dropped collection left the root listing: {root}"
     );
 }

@@ -362,8 +362,14 @@ non-HTTP wire protocols — without recompiling `rs2-core`.
     crosses base64-encoded and `read` rebuilds a `Replayable` `Body` so ETags/304
     and `Range`→206 keep working. Proven by the full store contract over an
     in-memory guest file adapter.
-- **Deferred** (Phase 3): a MongoDB adapter (BSON/SCRAM), a `GuestActor` model
-  for long-lived push connections (Discord gateway), multi-file ESM resolution.
+  - **MongoDB adapter** — a real-wire-protocol `DataStore` adapter (OP_MSG + a
+    hand-written BSON codec over the socket), purely a JS bundle on the existing
+    `GuestDataStore`. Datasets = collections, key = string `_id`; CRUD →
+    `find`/`update`/`delete`/`count`/`drop`/`listCollections`. Proven against an
+    in-process mock `mongod`. **No-auth** (SCRAM-SHA-256 needs HMAC/PBKDF2 the JS
+    prelude doesn't expose — a `crypto.subtle` addition would unlock it).
+- **Deferred** (Phase 3): a `GuestActor` model for long-lived push connections
+  (Discord gateway), SCRAM auth for Mongo, multi-file ESM resolution.
 
 ## G1 + G3 benchmarks (`tests/g_benchmarks.rs`)
 
