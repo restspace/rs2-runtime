@@ -132,9 +132,11 @@ Done:
 - **Pipeline executor** (`pipeline/`): typed spec (PRD §8.1) with serial /
   parallel / conditional / tee / teeWait modes, `jsonSplit` + `jsonObject`,
   conditions (config-time-checked grammar), JSONata transforms (jsonata-rs —
-  the PRD's "evaluate Rust JSONata early in M2" risk, resolved), `try`,
-  `as:$var` capture, `${...}` interpolation, `?$to-step`, fan-out/depth/step
-  limits.
+  the PRD's "evaluate Rust JSONata early in M2" risk, resolved; evaluated on the
+  blocking pool, internally timeboxed, so a heavy expression can't stall a
+  reactor worker), `try`, `as:$var` capture, `${...}` interpolation, `?$to-step`,
+  fan-out/depth/step limits + an aggregate fan-out footprint cap (branch count ×
+  body bytes → `pipeline_fanout_bytes`).
 - **String DSL converter** (`pipeline/dsl.rs`): the Restspace terse form
   (`"if (ok) GET /x :$y"`) is accepted as sugar; stored format is typed.
 - **Segments** (PRD §7.3): planned at materialization points; the segment is

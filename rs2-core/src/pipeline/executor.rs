@@ -36,6 +36,11 @@ pub struct PipelineLimits {
     pub wall_clock: Duration,
     pub max_steps: usize,
     pub max_fanout: usize,
+    /// Aggregate cap on a fan-out's materialized footprint: branch count ×
+    /// body bytes. A parallel block copies the whole input body into every
+    /// branch eagerly, so without this a wide fan-out over a large body could
+    /// multiply host memory unboundedly (default 256 MB).
+    pub max_fanout_bytes: u64,
     pub max_depth: usize,
     pub default_concurrency: usize,
     pub materialize_cap: u64,
@@ -50,6 +55,7 @@ impl Default for PipelineLimits {
             wall_clock: Duration::from_secs(120),
             max_steps: 1000,
             max_fanout: 1000,
+            max_fanout_bytes: 256 * 1024 * 1024,
             max_depth: 16,
             default_concurrency: 12,
             materialize_cap: 100 * 1024 * 1024,
@@ -320,6 +326,10 @@ impl Executor {
         key_path: &str,
     ) -> Result<Flow, RsError> {
         self.materialize_if_needed(&mut msg).await?;
+        // Each branch gets a full copy of the (now materialized) body, built
+        // eagerly below — so bound the aggregate footprint before fanning out.
+        let body_size = msg.body.as_ref().and_then(|b| b.size).unwrap_or(0);
+        self.check_fanout_budget(spec.steps.len(), body_size)?;
         let concurrency = spec.concurrency.unwrap_or(self.limits.default_concurrency).max(1);
 
         // Clone branch inputs eagerly: the branch futures must not borrow
@@ -485,7 +495,13 @@ impl Executor {
                 })
                 .collect();
             eval_vars.insert("_headers".into(), Value::Object(headers));
-            let out = transform::apply(template, &input, &eval_vars)?;
+            // JSONata is synchronous and internally timeboxed (~1 s); run it on
+            // the blocking pool so a heavy expression can occupy a blocking
+            // thread instead of stalling a reactor worker.
+            let template = template.clone();
+            let out = tokio::task::spawn_blocking(move || transform::apply(&template, &input, &eval_vars))
+                .await
+                .map_err(|e| RsError::internal(format!("transform task panicked: {e}")))??;
             if let Some(capture) = &step.capture {
                 vars.insert(capture.trim_start_matches('$').to_string(), out);
             } else {
@@ -800,6 +816,20 @@ impl Executor {
         }
     }
 
+    /// Reject a fan-out whose materialized footprint (branch count × body
+    /// bytes) would exceed the aggregate budget, before any branch is cloned.
+    fn check_fanout_budget(&self, count: usize, body_size: u64) -> Result<(), RsError> {
+        let total = (count as u64).saturating_mul(body_size);
+        if total > self.limits.max_fanout_bytes {
+            return Err(RsError::limit_exceeded(
+                "pipeline_fanout_bytes",
+                total,
+                self.limits.max_fanout_bytes,
+            ));
+        }
+        Ok(())
+    }
+
     async fn materialize_if_needed(&self, msg: &mut Message) -> Result<(), RsError> {
         if let Some(body) = &mut msg.body {
             if body.is_stream() {
@@ -919,5 +949,49 @@ mod tests {
         assert_eq!(derive_key("inv", "/0"), derive_key("inv", "/0"));
         assert_ne!(derive_key("inv", "/0"), derive_key("inv", "/1"));
         assert_ne!(derive_key("inv", "/0"), derive_key("inv2", "/0"));
+    }
+
+    struct NoRequester;
+    #[async_trait]
+    impl Requester for NoRequester {
+        async fn request(&self, msg: Message) -> Message {
+            msg
+        }
+    }
+
+    fn parallel_transforms(n: usize) -> PipelineSpec {
+        PipelineSpec {
+            mode: Mode::Parallel,
+            steps: (0..n)
+                .map(|_| Step { transform: Some(serde_json::json!("$_status")), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn body_msg(value: serde_json::Value) -> Message {
+        let mut msg = Message::request(http::Method::POST, "/x", "t");
+        msg.body = Some(Body::from_json(&value));
+        msg
+    }
+
+    #[tokio::test]
+    async fn parallel_fanout_rejects_oversized_aggregate() {
+        // 5 branches × a ~75-byte body = 375 bytes > the 100-byte budget.
+        let limits = PipelineLimits { max_fanout_bytes: 100, ..Default::default() };
+        let exec = Executor::new(Arc::new(NoRequester), limits, RetryPolicy::no_retry());
+        let msg = body_msg(serde_json::json!({ "data": "x".repeat(60) }));
+        let err = exec.run(&parallel_transforms(5), msg, None).await.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::LIMIT_EXCEEDED);
+        assert_eq!(err.extra.as_ref().unwrap()["limit"], "pipeline_fanout_bytes");
+    }
+
+    #[tokio::test]
+    async fn parallel_fanout_within_budget_runs() {
+        let exec =
+            Executor::new(Arc::new(NoRequester), PipelineLimits::default(), RetryPolicy::no_retry());
+        let msg = body_msg(serde_json::json!({ "data": "small" }));
+        let out = exec.run(&parallel_transforms(3), msg, None).await.unwrap();
+        assert!(out.is_ok());
     }
 }
