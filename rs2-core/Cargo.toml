@@ -10,7 +10,7 @@ default = []
 # Wasmtime component engine for Rust/Wasm custom services
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # V8 isolate engine for TS/JS custom services (deno_core: modules, ops, extensions)
-js = ["dep:deno_core", "dep:deno_error"]
+js = ["dep:deno_core", "dep:deno_error", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 # Outbound HTTP adapter (ureq) for httpOut capability grants
 http = ["dep:ureq"]
 
@@ -24,6 +24,9 @@ bytes.workspace = true
 deno_core = { version = "0.404", optional = true }
 deno_error = { version = "0.7", optional = true }
 futures.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
 hmac = "0.12"
 http.workspace = true
 jsonata-rs = "0.3"
@@ -43,5 +46,6 @@ wasmtime = { version = "37", optional = true }
 wasmtime-wasi = { version = "37", optional = true }
 
 [dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

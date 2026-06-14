@@ -19,9 +19,10 @@
 //! memory via the near-heap-limit callback; the outbound budget and
 //! materialization caps are host-enforced as for every engine.
 
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,9 +32,10 @@ use deno_core::{
 };
 use deno_error::JsErrorBox;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::contract::{Engine, HostApi, InvocationLimits, LogLevel, ServiceCode};
-use crate::error::RsError;
+use crate::error::{codes, RsError};
 use crate::message::{Body, MediaType, Message, Source};
 
 /// Bootstrap: capture the host ops into closures, install the native hooks
@@ -56,6 +58,27 @@ const BOOTSTRAP: &str = r#"
   globalThis.__rs2_native_log = (l, t) => ops.op_rs2_log(String(l), String(t));
   globalThis.__rs2_native_random = (n) => ops.op_rs2_random(n);
   globalThis.__rs2_native_fetch = (r) => rethrow(ops.op_rs2_fetch(r ?? {}));
+  // Gated raw socket for non-HTTP wire protocols (the `socket` grant).
+  // Synchronous from the guest's view (host calls block); pooling across
+  // requests is Phase 2's resident-runtime model.
+  class RS2Socket {
+    constructor(id) { this._id = id; }
+    static connect(host, port, opts) {
+      const r = rethrow(ops.op_rs2_sock_connect(String(host), port | 0, !!(opts && opts.tls)));
+      return new RS2Socket(r.id);
+    }
+    write(data) {
+      const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+      rethrow(ops.op_rs2_sock_write(this._id, bytes));
+    }
+    read(max) {
+      const r = rethrow(ops.op_rs2_sock_read(this._id, (max | 0) || 65536));
+      if (!r.data || r.data.length === 0) return null; // EOF
+      return Uint8Array.from(r.data);
+    }
+    close() { ops.op_rs2_sock_close(this._id); }
+  }
+  globalThis.RS2Socket = RS2Socket;
   globalThis.__rs2_dispatch = async (userDefault, msg, config) => {
     const ctx = {
       config,
@@ -92,6 +115,154 @@ struct InvocationState {
     depth: u16,
     materialize_cap: u64,
     host_error: Mutex<Option<RsError>>,
+    /// Open sockets for the `socket` capability. Phase 1 is one runtime per
+    /// invocation, so connections live for the request (pooling across
+    /// invocations is Phase 2's resident-runtime model).
+    sockets: Mutex<HashMap<u32, Arc<tokio::sync::Mutex<SockStream>>>>,
+    socket_seq: AtomicU32,
+    /// Allowed `host:port` patterns, from the mount's `socket` grants.
+    socket_allowlist: Vec<String>,
+}
+
+impl InvocationState {
+    fn socket_allowed(&self, host: &str, port: u16) -> bool {
+        let target = format!("{host}:{port}");
+        self.socket_allowlist.iter().any(|pat| socket_pattern_matches(pat, host, port, &target))
+    }
+}
+
+/// A raw socket the guest speaks a wire protocol over: plain TCP or TLS.
+enum SockStream {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl SockStream {
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            SockStream::Plain(s) => s.write_all(buf).await,
+            SockStream::Tls(s) => s.write_all(buf).await,
+        }
+    }
+    async fn read_up_to(&mut self, max: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; max];
+        let n = match self {
+            SockStream::Plain(s) => s.read(&mut buf).await?,
+            SockStream::Tls(s) => s.read(&mut buf).await?,
+        };
+        buf.truncate(n);
+        Ok(buf)
+    }
+}
+
+/// The TLS client connector (webpki roots, ring provider). Tests may override
+/// it via [`set_tls_connector_for_test`] to trust a self-signed cert.
+fn tls_connector() -> tokio_rustls::TlsConnector {
+    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("ring supports the default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            tokio_rustls::TlsConnector::from(Arc::new(config))
+        })
+        .clone()
+}
+
+#[cfg(test)]
+static TEST_CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
+
+/// Install a TLS connector for tests (e.g. trusting a self-signed cert).
+#[cfg(test)]
+pub fn set_tls_connector_for_test(connector: tokio_rustls::TlsConnector) {
+    let _ = TEST_CONNECTOR.set(connector);
+}
+
+fn active_connector() -> tokio_rustls::TlsConnector {
+    #[cfg(test)]
+    if let Some(c) = TEST_CONNECTOR.get() {
+        return c.clone();
+    }
+    tls_connector()
+}
+
+/// Open a socket to `host:port`, optionally upgrading to TLS.
+async fn connect_stream(host: &str, port: u16, tls: bool) -> Result<SockStream, RsError> {
+    let tcp = tokio::net::TcpStream::connect((host, port))
+        .await
+        .map_err(|e| RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("connect {host}:{port} failed: {e}")))?;
+    if !tls {
+        return Ok(SockStream::Plain(tcp));
+    }
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| RsError::bad_request(format!("invalid TLS server name '{host}'")))?;
+    let stream = active_connector()
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("TLS handshake to {host}:{port} failed: {e}")))?;
+    Ok(SockStream::Tls(Box::new(stream)))
+}
+
+/// Match a `host:port` grant pattern: exact, host-only (any port), or a
+/// `*.suffix[:port]` host wildcard (matching the apex too).
+fn socket_pattern_matches(pat: &str, host: &str, port: u16, target: &str) -> bool {
+    if pat == target {
+        return true;
+    }
+    let (pat_host, pat_port) = match pat.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(pp) => (h, Some(pp)),
+            Err(_) => (pat, None),
+        },
+        None => (pat, None),
+    };
+    if let Some(pp) = pat_port {
+        if pp != port {
+            return false;
+        }
+    }
+    if pat_host == "*" || pat_host == host {
+        return true;
+    }
+    if let Some(suffix) = pat_host.strip_prefix("*.") {
+        return host == suffix || host.ends_with(&format!(".{suffix}"));
+    }
+    false
+}
+
+/// Collect the `socket` grant allowlist (`host:port` patterns) from a mount
+/// config's `grants`.
+fn socket_allowlist_from_config(config: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(grants) = config.get("grants").and_then(|g| g.as_object()) {
+        for grant in grants.values() {
+            if grant.get("type").and_then(|t| t.as_str()) == Some("socket") {
+                if let Some(hosts) = grant.get("hosts").and_then(|h| h.as_array()) {
+                    out.extend(hosts.iter().filter_map(|h| h.as_str().map(String::from)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A structured host error rendered as the marker the bootstrap rethrows.
+fn error_marker(e: &RsError) -> Value {
+    json!({ "__rs2_error": true, "code": e.code, "status": e.status, "message": e.detail })
+}
+
+/// Record a structured socket error (so an uncaught one keeps its identity out
+/// of the engine, invariant 2) and return the marker the bootstrap rethrows.
+fn fail_socket(inv: &InvocationState, e: RsError) -> Value {
+    let marker = error_marker(&e);
+    *inv.host_error.lock().unwrap() = Some(e);
+    marker
 }
 
 /// Build an internal `Message` from a guest request envelope
@@ -305,6 +476,68 @@ fn op_rs2_random(#[smi] n: u32) -> Vec<u8> {
     bytes
 }
 
+/// Open a gated socket to `host:port` (TLS optional). Returns `{id}` or an
+/// error marker; the connect is allowlisted by the mount's `socket` grants.
+#[op2]
+#[serde]
+fn op_rs2_sock_connect(
+    state: &mut OpState,
+    #[string] host: String,
+    #[smi] port: u32,
+    tls: bool,
+) -> serde_json::Value {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let port = port as u16;
+    if !inv.socket_allowed(&host, port) {
+        return fail_socket(&inv, RsError::capability_denied(&format!("socket {host}:{port}")));
+    }
+    let host2 = host.clone();
+    let stream = match block_on_main(&inv.main, async move { connect_stream(&host2, port, tls).await }) {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return fail_socket(&inv, e),
+        Err(_) => return fail_socket(&inv, RsError::internal("socket task dropped")),
+    };
+    let id = inv.socket_seq.fetch_add(1, Ordering::SeqCst);
+    inv.sockets.lock().unwrap().insert(id, Arc::new(tokio::sync::Mutex::new(stream)));
+    json!({ "id": id })
+}
+
+#[op2]
+#[serde]
+fn op_rs2_sock_write(state: &mut OpState, #[smi] id: u32, #[buffer] data: &[u8]) -> serde_json::Value {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let Some(sock) = inv.sockets.lock().unwrap().get(&id).cloned() else {
+        return fail_socket(&inv, RsError::bad_request("write to unknown socket"));
+    };
+    let data = data.to_vec();
+    match block_on_main(&inv.main, async move { sock.lock().await.write_all(&data).await }) {
+        Ok(Ok(())) => Value::Null,
+        Ok(Err(e)) => fail_socket(&inv, RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("socket write failed: {e}"))),
+        Err(_) => fail_socket(&inv, RsError::internal("socket task dropped")),
+    }
+}
+
+#[op2]
+#[serde]
+fn op_rs2_sock_read(state: &mut OpState, #[smi] id: u32, #[smi] max: u32) -> serde_json::Value {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let Some(sock) = inv.sockets.lock().unwrap().get(&id).cloned() else {
+        return fail_socket(&inv, RsError::bad_request("read from unknown socket"));
+    };
+    let max = (max as usize).clamp(1, 1 << 20);
+    match block_on_main(&inv.main, async move { sock.lock().await.read_up_to(max).await }) {
+        Ok(Ok(bytes)) => json!({ "data": bytes }),
+        Ok(Err(e)) => fail_socket(&inv, RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("socket read failed: {e}"))),
+        Err(_) => fail_socket(&inv, RsError::internal("socket task dropped")),
+    }
+}
+
+#[op2(fast)]
+fn op_rs2_sock_close(state: &mut OpState, #[smi] id: u32) {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    inv.sockets.lock().unwrap().remove(&id);
+}
+
 extension!(
     rs2_host,
     ops = [
@@ -313,7 +546,11 @@ extension!(
         op_rs2_state_get,
         op_rs2_state_put,
         op_rs2_fetch,
-        op_rs2_random
+        op_rs2_random,
+        op_rs2_sock_connect,
+        op_rs2_sock_write,
+        op_rs2_sock_read,
+        op_rs2_sock_close
     ]
 );
 
@@ -429,6 +666,9 @@ impl Engine for JsEngine {
                 depth,
                 materialize_cap: limits.materialized_body_bytes,
                 host_error: Mutex::new(None),
+                sockets: Mutex::new(HashMap::new()),
+                socket_seq: AtomicU32::new(1),
+                socket_allowlist: socket_allowlist_from_config(&config),
             });
             let local = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -695,5 +935,157 @@ fn normalize_envelope(value: Value) -> Value {
         value
     } else {
         json!({ "status": 200, "body": value })
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::JsEngine;
+    use crate::contract::{Engine, GrantedHost, HostApi, InvocationLimits, ServiceCode};
+    use crate::message::Message;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn run(code: &str, config: serde_json::Value) -> Result<Message, crate::error::RsError> {
+        let engine = JsEngine::new();
+        let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all("sock-test"));
+        engine
+            .invoke(
+                &ServiceCode::JsBundle(Arc::new(code.to_string())),
+                Message::request(http::Method::GET, "/x", "t1"),
+                &config,
+                host,
+                &InvocationLimits::default(),
+            )
+            .await
+    }
+
+    /// A TCP echo server on a random port; returns the port.
+    async fn spawn_echo() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn socket_plain_tcp_roundtrip() {
+        let port = spawn_echo().await;
+        let config = json!({
+            "grants": { "db": { "type": "socket", "hosts": [format!("127.0.0.1:{port}")] } }
+        });
+        let code = format!(
+            r#"
+            export default async (msg, ctx) => {{
+                const s = RS2Socket.connect("127.0.0.1", {port});
+                s.write("ping-42");
+                const reply = s.read();
+                s.close();
+                return {{ status: 200, body: new TextDecoder().decode(reply) }};
+            }};
+            "#
+        );
+        let mut resp = run(&code, config).await.unwrap();
+        let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"ping-42");
+    }
+
+    #[tokio::test]
+    async fn socket_tls_roundtrip() {
+        // Self-signed cert for "localhost".
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+
+        let provider = || Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = rustls::ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if tls.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Client connector trusting the self-signed cert.
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        super::set_tls_connector_for_test(tokio_rustls::TlsConnector::from(Arc::new(client_config)));
+
+        let config = json!({
+            "grants": { "db": { "type": "socket", "hosts": [format!("localhost:{port}")] } }
+        });
+        let code = format!(
+            r#"
+            export default async (msg, ctx) => {{
+                const s = RS2Socket.connect("localhost", {port}, {{ tls: true }});
+                s.write("secure-hi");
+                const reply = s.read();
+                s.close();
+                return {{ status: 200, body: new TextDecoder().decode(reply) }};
+            }};
+            "#
+        );
+        let mut resp = run(&code, config).await.unwrap();
+        let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"secure-hi");
+    }
+
+    #[tokio::test]
+    async fn socket_denied_without_grant() {
+        let port = spawn_echo().await;
+        let code = format!(
+            r#"
+            export default async (msg, ctx) => {{
+                RS2Socket.connect("127.0.0.1", {port});
+                return {{ status: 200 }};
+            }};
+            "#
+        );
+        // No socket grant → the connect is capability-denied.
+        let err = run(&code, json!({})).await.unwrap_err();
+        assert_eq!(err.code, crate::error::codes::CAPABILITY_DENIED);
     }
 }
