@@ -27,9 +27,14 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 
-use crate::capabilities::{DataStore, QueryStore, ScopedFileStore};
+use base64::Engine as _;
+
+use crate::capabilities::{
+    ByteRange, DataStore, DirEntry, FileMeta, FileStore, QueryStore, ScopedFileStore,
+};
 use crate::contract::{GrantedHost, HostApi, InvocationLimits};
-use crate::error::RsError;
+use crate::error::{codes, RsError};
+use crate::message::{Body, MediaType, Provenance};
 
 use super::js::{build_runtime, dispatch_once, socket_allowlist_from_config, InvocationState};
 
@@ -574,6 +579,176 @@ fn scalar_quote(value: &Value) -> Result<String, RsError> {
                 _ => "object",
             }
         ))),
+    }
+}
+
+/// A [`FileStore`] backed by a resident JS adapter. The adapter implements the
+/// store pattern over its backend (`GET/PUT/DELETE /{path}`, `HEAD`, `MOVE`,
+/// container listings `GET /{path}/`); file contents cross the message boundary
+/// **base64-encoded** (the envelope is JSON), so the reference path materializes
+/// — a streaming or presigned-redirect mode is a later optimization. The
+/// `tenant` argument is ignored — the resident runtime is already the tenant's.
+pub struct GuestFileStore {
+    inner: ResidentAdapter,
+}
+
+impl GuestFileStore {
+    /// Build a guest-backed file store from a `"store"` config block.
+    pub fn from_config(
+        adapter_ref: &str,
+        store_config: &Value,
+        files: ScopedFileStore,
+        tenant: &str,
+        limits: InvocationLimits,
+    ) -> Result<Self, RsError> {
+        Ok(GuestFileStore {
+            inner: ResidentAdapter::from_config("file", adapter_ref, store_config, files, tenant, limits)?,
+        })
+    }
+}
+
+const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+/// A stable content version (for the file service's ETags), hashed from bytes.
+fn content_version(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+#[async_trait]
+impl FileStore for GuestFileStore {
+    async fn head(&self, _tenant: &str, path: &str) -> Result<FileMeta, RsError> {
+        let (status, body) = self.inner.call("HEAD", path, None).await?;
+        if !(200..300).contains(&status) {
+            return Err(store_error(status, &body));
+        }
+        Ok(FileMeta {
+            size: body.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+            last_modified: None,
+            is_dir: body.get("isDir").and_then(|d| d.as_bool()).unwrap_or(false),
+        })
+    }
+
+    async fn read(&self, _tenant: &str, path: &str, range: Option<ByteRange>) -> Result<Body, RsError> {
+        let (status, body) = self.inner.call("GET", path, None).await?;
+        if !(200..300).contains(&status) {
+            return Err(store_error(status, &body));
+        }
+        let b64 = body.get("contentBase64").and_then(|c| c.as_str()).unwrap_or("");
+        let bytes = B64
+            .decode(b64)
+            .map_err(|e| RsError::contract_violation(format!("adapter returned invalid base64: {e}")))?;
+        let media_type = body
+            .get("mediaType")
+            .and_then(|m| m.as_str())
+            .map(MediaType::parse)
+            .unwrap_or_else(|| MediaType::for_path(path));
+        let version = content_version(&bytes);
+        // The whole-file version is the ETag; a Range serves the slice. (The
+        // reference adapter returns the full body and we slice host-side; a
+        // backend with native range support would push the range down.)
+        let total = bytes.len() as u64;
+        let slice = match range {
+            None => bytes,
+            Some(r) => {
+                let start = r.start.min(total);
+                let end = r.end.map(|e| (e + 1).min(total)).unwrap_or(total);
+                if start >= end {
+                    return Err(RsError::new(
+                        416,
+                        codes::BAD_REQUEST,
+                        "Range Not Satisfiable",
+                        format!("range start {start} beyond resource size {total}"),
+                    ));
+                }
+                bytes[start as usize..end as usize].to_vec()
+            }
+        };
+        let mut out = Body::from_bytes(slice, media_type);
+        out.provenance = Provenance::Replayable { url: path.to_string(), version };
+        Ok(out)
+    }
+
+    async fn write(&self, _tenant: &str, path: &str, mut body: Body) -> Result<bool, RsError> {
+        let media_type = body.media_type.to_string();
+        let bytes = body.materialize(self.inner.limits.materialized_body_bytes).await?;
+        let payload = json!({ "contentBase64": B64.encode(bytes), "mediaType": media_type });
+        let (status, resp) = self.inner.call("PUT", path, Some(payload)).await?;
+        match status {
+            201 => Ok(true),
+            200 => Ok(false),
+            _ => Err(store_error(status, &resp)),
+        }
+    }
+
+    async fn delete(&self, _tenant: &str, path: &str) -> Result<(), RsError> {
+        let (status, body) = self.inner.call("DELETE", path, None).await?;
+        if matches!(status, 200 | 204) {
+            Ok(())
+        } else {
+            Err(store_error(status, &body))
+        }
+    }
+
+    async fn rename(&self, _tenant: &str, from: &str, to: &str) -> Result<bool, RsError> {
+        let (status, body) = self.inner.call("MOVE", from, Some(json!({ "to": to }))).await?;
+        match status {
+            201 => Ok(true),
+            200 => Ok(false),
+            _ => Err(store_error(status, &body)),
+        }
+    }
+
+    async fn delete_dir(&self, _tenant: &str, path: &str) -> Result<(), RsError> {
+        let (status, body) = self.inner.call("DELETE", path, None).await?;
+        if matches!(status, 200 | 204) {
+            Ok(())
+        } else {
+            Err(store_error(status, &body))
+        }
+    }
+
+    async fn delete_dir_all(&self, _tenant: &str, path: &str) -> Result<(), RsError> {
+        let (status, body) = self.inner.call("DELETE", path, Some(json!({ "recursive": true }))).await?;
+        if matches!(status, 200 | 204) {
+            Ok(())
+        } else {
+            Err(store_error(status, &body))
+        }
+    }
+
+    async fn list(&self, _tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let (status, body) =
+            self.inner.call("GET", &format!("{path}{sep}$take={take}&$skip={skip}"), None).await?;
+        if !(200..300).contains(&status) {
+            return Err(store_error(status, &body));
+        }
+        let total = body.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+        let entries = body
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| DirEntry {
+                        name: e.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+                        size: e.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+                        last_modified: e
+                            .get("lastModified")
+                            .and_then(|l| l.as_str())
+                            .map(String::from),
+                        dir: e.get("dir").and_then(|d| d.as_bool()).unwrap_or(false),
+                        content_type: e
+                            .get("contentType")
+                            .and_then(|c| c.as_str())
+                            .map(String::from),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((entries, total))
     }
 }
 

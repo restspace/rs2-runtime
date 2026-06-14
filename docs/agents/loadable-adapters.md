@@ -156,13 +156,26 @@ calls against a delayed mock grow the pool to `maxRuntimes=2` and no further) an
 `idle_runtimes_are_evicted_and_respawn` (an idle runtime is dropped, the next call
 re-spawns a fresh connection) in `tests/guest_adapter.rs`.
 
+**`GuestFileStore` — DONE.** The third guest-backed capability: a `file` mount with
+`"store": {"adapter":"code:…"}` serves its files from a resident JS adapter.
+`GuestFileStore` (in `resident.rs`) maps the eight `FileStore` methods to store-
+pattern messages — `HEAD`/`GET`/`PUT`/`DELETE`/`MOVE` on `/{path}`, container
+listings on `/{path}/` — wired by `file_capability` in `tenant.rs` (the bundle is
+still loaded from the built-in store, so no circularity). File **contents cross the
+JSON boundary base64-encoded** (the message envelope is JSON): `write` materializes +
+encodes, `read` decodes and rebuilds a `Body` with a content-hash `Replayable`
+version so the file service's ETags/304s keep working; a `Range` is sliced host-side
+(a backend with native ranges, or a presigned-redirect mode, is the streaming
+follow-on). Proof: `guest_backed_file_store_satisfies_the_store_contract` runs the
+full store contract (PUT/GET/keyless-POST/list/pagination/DELETE + `?confirm=`) plus
+`HEAD` and a `Range`→206 against an in-memory guest file adapter.
+
 **Remaining:** a **MongoDB** `DataStore` adapter (OP_MSG + BSON + SCRAM-SHA-256 over
 the socket capability — the deferred half of Phase 2's proof); a **`GuestActor`**
 model for long-lived
 server-push connections (Discord gateway / Slack socket-mode — needs a continuously
 driven runtime, real wall-clock timers, and an inbound-event egress path: a sibling
-to the resident *adapter*, not another `GuestXyz`); a `FileStore` adapter (streaming
-or redirect/presigned mode); a host-capability tier (Rust `sql`/`kv`/`mongo` as
-message-shaped capabilities, also serving the wasm tier); instruction-plane
-multi-file ESM resolution (replace `NoopModuleLoader`); a startup snapshot for faster
-per-invocation boot; tighten `Deno.core` exposure.
+to the resident *adapter*, not another `GuestXyz`); a host-capability tier (Rust
+`sql`/`kv`/`mongo` as message-shaped capabilities, also serving the wasm tier);
+instruction-plane multi-file ESM resolution (replace `NoopModuleLoader`); a startup
+snapshot for faster per-invocation boot; tighten `Deno.core` exposure.

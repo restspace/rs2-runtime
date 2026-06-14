@@ -356,9 +356,14 @@ non-HTTP wire protocols — without recompiling `rs2-core`.
     4, least-busy dispatch; a serial workload stays at one) and a background
     sweeper evicts runtimes idle past `store.idleMs`/`idleSeconds` (default 60 s),
     closing the isolate and its pooled sockets.
+  - **`GuestFileStore`** — a `file` mount with `"store": {"adapter": "code:…"}`
+    serves files from a resident JS adapter. All eight `FileStore` methods map to
+    store-pattern messages (`HEAD`/`GET`/`PUT`/`DELETE`/`MOVE`, listings); content
+    crosses base64-encoded and `read` rebuilds a `Replayable` `Body` so ETags/304
+    and `Range`→206 keep working. Proven by the full store contract over an
+    in-memory guest file adapter.
 - **Deferred** (Phase 3): a MongoDB adapter (BSON/SCRAM), a `GuestActor` model
-  for long-lived push connections (Discord gateway), a `FileStore` adapter,
-  multi-file ESM resolution.
+  for long-lived push connections (Discord gateway), multi-file ESM resolution.
 
 ## G1 + G3 benchmarks (`tests/g_benchmarks.rs`)
 

@@ -181,6 +181,7 @@ impl Tenant {
             // adapters; a `data`/`query` mount may instead name a loadable
             // adapter (`"store": {"adapter":"code:…"}`, G13 Phase 2/3) backed by
             // a resident JS bundle. The stock service runs unchanged on either.
+            let files = file_capability(mount, adapters, name, limits.invocation_limits())?;
             let data = data_capability(mount, adapters, name, limits.invocation_limits())?;
             let query = query_capability(mount, adapters, name, limits.invocation_limits())?;
 
@@ -188,7 +189,7 @@ impl Tenant {
             // this tenant — host-enforced isolation (PRD §9.2).
             let ctx = ServiceContext {
                 config: mount.config.clone(),
-                files: Some(ScopedFileStore::new(adapters.files.clone(), name)),
+                files,
                 data,
                 query,
                 http: adapters.http.clone(),
@@ -259,6 +260,43 @@ fn data_capability(
         let _ = limits;
         Err(RsError::engine_unavailable(format!(
             "data mount '{}' uses a loadable adapter ('{adapter_ref}') but this build has no JS \
+             engine (rebuild with --features js)",
+            if mount.base_path.is_empty() { "/" } else { &mount.base_path }
+        )))
+    }
+}
+
+/// Resolve a mount's `files` capability. Every mount sees the node's built-in
+/// file store by default; a `file` mount with `"store": {"adapter": "code:…"}`
+/// is instead backed by a resident loadable adapter (G13 Phase 3). The bundle
+/// itself is still loaded from the built-in store, so there is no circularity.
+fn file_capability(
+    mount: &Mount,
+    adapters: &Adapters,
+    name: &str,
+    limits: crate::contract::InvocationLimits,
+) -> Result<Option<ScopedFileStore>, RsError> {
+    let adapter_ref = (mount.service == "file")
+        .then(|| mount.config.get("store").and_then(|s| s.get("adapter")).and_then(|a| a.as_str()))
+        .flatten();
+    let Some(adapter_ref) = adapter_ref else {
+        return Ok(Some(ScopedFileStore::new(adapters.files.clone(), name)));
+    };
+
+    #[cfg(feature = "js")]
+    {
+        let store = mount.config.get("store").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let loader = ScopedFileStore::new(adapters.files.clone(), name);
+        let guest = crate::engines::resident::GuestFileStore::from_config(
+            adapter_ref, &store, loader, name, limits,
+        )?;
+        Ok(Some(ScopedFileStore::new(Arc::new(guest), name)))
+    }
+    #[cfg(not(feature = "js"))]
+    {
+        let _ = limits;
+        Err(RsError::engine_unavailable(format!(
+            "file mount '{}' uses a loadable adapter ('{adapter_ref}') but this build has no JS \
              engine (rebuild with --features js)",
             if mount.base_path.is_empty() { "/" } else { &mount.base_path }
         )))

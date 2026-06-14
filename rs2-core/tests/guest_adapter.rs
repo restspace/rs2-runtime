@@ -211,6 +211,102 @@ export default async (msg, ctx) => {
 };
 "#;
 
+/// A self-contained `FileStore` adapter that keeps files in a module-level map
+/// (no backend needed — the socket/pooling path is proven by the data/query
+/// adapters). It implements the store pattern the host's `GuestFileStore`
+/// speaks: `HEAD`/`GET`/`PUT`/`DELETE`/`MOVE` on `/{path}`, container listings
+/// on `/{path}/`, content base64 across the JSON boundary.
+const FILE_ADAPTER: &str = r#"
+let FILES = {}; // path -> { data: base64, mediaType }
+
+function b64len(b64) {
+  if (!b64) return 0;
+  let n = Math.floor((b64.length * 3) / 4);
+  if (b64.endsWith("==")) n -= 2;
+  else if (b64.endsWith("=")) n -= 1;
+  return n;
+}
+
+export default async (msg) => {
+  const url = String(msg.url);
+  const path = url.split("?")[0];
+  const qs = new URLSearchParams(url.split("?")[1] || "");
+  const isDir = path.endsWith("/");
+  const m = msg.method;
+
+  if (m === "HEAD") {
+    if (isDir) {
+      const exists = path === "/" || Object.keys(FILES).some((k) => k.startsWith(path));
+      return exists ? { status: 200, body: { size: 0, isDir: true } } : { status: 404, body: { detail: "no directory" } };
+    }
+    const f = FILES[path];
+    return f
+      ? { status: 200, body: { size: b64len(f.data), isDir: false, mediaType: f.mediaType } }
+      : { status: 404, body: { detail: "not found" } };
+  }
+
+  if (m === "GET" && isDir) {
+    const fileSet = new Set(), dirSet = new Set();
+    for (const k of Object.keys(FILES)) {
+      if (path !== "/" && !k.startsWith(path)) continue;
+      const rest = path === "/" ? k.slice(1) : k.slice(path.length);
+      if (!rest) continue;
+      const slash = rest.indexOf("/");
+      if (slash === -1) fileSet.add(rest);
+      else dirSet.add(rest.slice(0, slash));
+    }
+    const base = path === "/" ? "/" : path;
+    const entries = [];
+    for (const d of [...dirSet].sort()) entries.push({ name: d + "/", dir: true, size: 0 });
+    for (const f of [...fileSet].sort()) {
+      entries.push({ name: f, dir: false, size: b64len(FILES[base + f].data), contentType: FILES[base + f].mediaType });
+    }
+    const total = entries.length;
+    const skip = parseInt(qs.get("$skip") || "0", 10), take = parseInt(qs.get("$take") || "1000", 10);
+    return { status: 200, body: { entries: entries.slice(skip, skip + take), total } };
+  }
+
+  if (m === "GET") {
+    const f = FILES[path];
+    return f
+      ? { status: 200, body: { contentBase64: f.data, mediaType: f.mediaType } }
+      : { status: 404, body: { detail: "not found" } };
+  }
+
+  if (m === "PUT") {
+    const existed = !!FILES[path];
+    FILES[path] = { data: msg.body.contentBase64 || "", mediaType: msg.body.mediaType || "application/octet-stream" };
+    return { status: existed ? 200 : 201 };
+  }
+
+  if (m === "MOVE") {
+    const f = FILES[path];
+    if (!f) return { status: 404, body: { detail: "source missing" } };
+    const existed = !!FILES[msg.body.to];
+    FILES[msg.body.to] = f;
+    delete FILES[path];
+    return { status: existed ? 200 : 201 };
+  }
+
+  if (m === "DELETE") {
+    if (isDir) {
+      const under = Object.keys(FILES).filter((k) => k.startsWith(path));
+      if (msg.body && msg.body.recursive) {
+        for (const k of under) delete FILES[k];
+        return { status: 204 };
+      }
+      if (under.length > 0) return { status: 409, body: { detail: "directory not empty" } };
+      return { status: 204 };
+    }
+    if (!FILES[path]) return { status: 404, body: { detail: "not found" } };
+    delete FILES[path];
+    return { status: 204 };
+  }
+
+  return { status: 400, body: { detail: "unsupported method" } };
+};
+"#;
+
 // ---- the mock Redis (RESP) -------------------------------------------------
 
 /// A tiny RESP server supporting the subset the adapter uses (SET/GET/DEL/
@@ -615,4 +711,102 @@ async fn idle_runtimes_are_evicted_and_respawn() {
     assert_eq!(resp.status, Some(StatusCode::OK), "record still in the backend");
     assert_eq!(body_json(&mut resp).await["n"], 1);
     assert_eq!(conns.load(Ordering::SeqCst), 2, "idle runtime was evicted; next call re-spawned");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_backed_file_store_satisfies_the_store_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
+    files.write("t", ".rs2-code/files/v1.js", js(FILE_ADAPTER.to_string())).await.unwrap();
+
+    let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/files", "service": "file", "config": { "store": { "adapter": "code:files@v1" } } }
+    ]})));
+    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let body = |i: u32| Body::from_string(format!("content-{i}"), MediaType::new("text/plain"));
+
+    // PUT create / overwrite, empty body.
+    let resp = rt.handle(req(Method::PUT, "/files/docs/alpha").with_body(body(1))).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT create");
+    assert!(resp.body.is_none(), "PUT returns no body");
+    let resp = rt.handle(req(Method::PUT, "/files/docs/alpha").with_body(body(2))).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "PUT overwrite");
+
+    // GET child: content + ETag (from the store-reported version).
+    let mut resp = rt.handle(req(Method::GET, "/files/docs/alpha")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "GET child");
+    assert!(resp.header("etag").is_some(), "child GET carries ETag");
+    let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+    assert_eq!(&bytes[..], b"content-2");
+
+    // Keyless POST → 201 + Location, fetchable.
+    let resp = rt.handle(req(Method::POST, "/files/docs/").with_body(body(3))).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "keyless POST");
+    let location = resp.header("location").expect("Location").to_string();
+    assert!(location.starts_with("/files/docs/"), "Location under container");
+    assert_eq!(rt.handle(req(Method::GET, &location)).await.status, Some(StatusCode::OK));
+
+    // Container listing: dir+json shape, paginated.
+    let mut resp = rt.handle(req(Method::GET, "/files/docs/")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "container GET");
+    let ct = resp.body.as_ref().unwrap().media_type.essence().to_string();
+    assert_eq!(ct, "application/vnd.rs2.dir+json", "listing media type");
+    let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
+    assert!(total >= 2, "X-Total-Count counts both children");
+    let listing = body_json(&mut resp).await;
+    assert!(
+        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "alpha" && e["dir"] == false),
+        "child appears as an entry: {listing}"
+    );
+    let mut resp = rt.handle(req(Method::GET, "/files/docs/?$take=1")).await;
+    let page = body_json(&mut resp).await;
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1, "$take pages");
+    assert_eq!(page["total"].as_u64(), Some(total), "paged total is the full count");
+
+    // Mount root lists the directory.
+    let mut resp = rt.handle(req(Method::GET, "/files/")).await;
+    let root = body_json(&mut resp).await;
+    assert!(
+        root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "docs/" && e["dir"] == true),
+        "directory at the root: {root}"
+    );
+
+    // HEAD reports the size; a Range serves a 206 slice (the `range` facet).
+    let resp = rt.handle(req(Method::HEAD, "/files/docs/alpha")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK));
+    assert_eq!(resp.header("content-length"), Some("9"), "HEAD content-length (content-2)");
+    let mut ranged = req(Method::GET, "/files/docs/alpha");
+    ranged.set_header("range", "bytes=0-6");
+    let mut resp = rt.handle(ranged).await;
+    assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT), "range → 206");
+    let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+    assert_eq!(&bytes[..], b"content", "first 7 bytes");
+
+    // DELETE child → 204, gone.
+    assert_eq!(rt.handle(req(Method::DELETE, "/files/docs/alpha")).await.status, Some(StatusCode::NO_CONTENT));
+    assert_eq!(
+        rt.handle(req(Method::GET, "/files/docs/alpha")).await.status,
+        Some(StatusCode::NOT_FOUND),
+        "deleted child is gone"
+    );
+
+    // Container guard: non-empty delete is 409; confirm succeeds.
+    assert_eq!(
+        rt.handle(req(Method::DELETE, "/files/docs/")).await.status,
+        Some(StatusCode::CONFLICT),
+        "non-empty container delete is 409 without confirm"
+    );
+    assert_eq!(
+        rt.handle(req(Method::DELETE, "/files/docs/?confirm=docs")).await.status,
+        Some(StatusCode::NO_CONTENT),
+        "confirmed delete"
+    );
+    let mut resp = rt.handle(req(Method::GET, "/files/")).await;
+    let root = body_json(&mut resp).await;
+    assert!(
+        !root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "docs/"),
+        "deleted directory left the root listing: {root}"
+    );
 }
