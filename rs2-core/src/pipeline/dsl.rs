@@ -6,7 +6,7 @@
 //!
 //! - a mode token: `"parallel"`, `"serial"`, `"conditional"`, `"tee"`,
 //!   `"teeWait"`, optionally with fail/succeed actions (`"serial stop end"`)
-//! - a step string: `try? if (cond)? METHOD url ( :$var | :name)?`
+//! - a step string: `elevate? try? if (cond)? METHOD url ( :$var | :name)?`
 //! - a transform: a JSON object (JSONata template)
 //! - a splitter/joiner token: `"jsonSplit"`, `"jsonObject"`
 //! - a nested array: a subpipeline
@@ -99,10 +99,18 @@ fn parse_action(s: &str) -> Option<Action> {
     }
 }
 
-/// `try? if (cond)? METHOD url ( :$var | :name)?`
+/// `elevate? try? if (cond)? METHOD url ( :$var | :name)?`
 fn parse_step(s: &str) -> Result<Step, RsError> {
     let mut step = Step::default();
     let mut rest = s.trim();
+
+    // `elevate` (run the call as trusted internal composition) precedes `try`.
+    if let Some(after) = rest.strip_prefix("elevate ") {
+        step.elevate = true;
+        rest = after.trim_start();
+    } else if rest == "elevate" {
+        return Err(RsError::bad_request("'elevate' must be followed by a step"));
+    }
 
     if let Some(after) = rest.strip_prefix("try ") {
         step.try_mode = true;
@@ -243,5 +251,15 @@ mod tests {
         assert!(convert(&json!(["NOSUCHMETHOD"])).is_err());
         assert!(convert(&json!(["if (unclosed GET /x"])).is_err());
         assert!(convert(&json!([42])).is_err());
+    }
+
+    #[test]
+    fn elevate_token_sets_the_flag() {
+        let spec = convert(&json!(["elevate GET /secret/x", "elevate try POST /y"])).unwrap();
+        assert!(spec.steps[0].elevate);
+        assert!(spec.steps[1].elevate);
+        assert!(spec.steps[1].try_mode);
+        assert!(!convert(&json!(["GET /z"])).unwrap().steps[0].elevate);
+        assert!(convert(&json!(["elevate"])).is_err());
     }
 }

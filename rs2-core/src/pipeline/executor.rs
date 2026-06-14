@@ -569,7 +569,11 @@ impl Executor {
         let tenant = msg.tenant.clone();
         let depth_for_call = msg.depth + 1;
         let trace = msg.trace.clone();
-        let principal = msg.principal.clone();
+        // `elevate`: drop the caller principal so this call runs as trusted
+        // internal composition (it can reach a mount the caller's roles can't).
+        // No request auth header is forwarded, so the principal stays unset and
+        // the target's role-spec admits it as a no-principal internal hop.
+        let principal = if step.elevate { None } else { msg.principal.clone() };
 
         // Bodies move into the closure: borrowing them across the retry
         // awaits would require `Body: Sync`, which stream payloads are not.

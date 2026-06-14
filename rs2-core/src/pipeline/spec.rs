@@ -90,6 +90,16 @@ pub struct Step {
     /// Convert a failure into `{ _errorStatus, _errorMessage }` and continue.
     #[serde(rename = "try", skip_serializing_if = "std::ops::Not::not")]
     pub try_mode: bool,
+    /// Run the step's call as **trusted internal composition**: the caller
+    /// principal is dropped, so the call is authorized as an unattributed
+    /// internal hop and can reach a mount the caller's roles could not (the
+    /// gateway pattern — lock a service to e.g. `writeRoles: "A"` and front it
+    /// with a caller-accessible pipeline that elevates). The target must admit
+    /// internal access (a role-spec mount admits no-principal internal calls).
+    /// Applies to `call` steps; default off. The authoring surface is
+    /// `manageRoles`-gated, so only privileged authors can create elevations.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub elevate: bool,
     /// `as: "$name"` captures the step result into a variable; the in-flight
     /// message keeps its prior body.
     #[serde(rename = "as", skip_serializing_if = "Option::is_none")]
@@ -201,6 +211,9 @@ impl PipelineSpec {
                 if http::Method::from_bytes(call.method.as_bytes()).is_err() {
                     errors.push(format!("{here}: invalid method '{}'", call.method));
                 }
+            }
+            if step.elevate && step.call.is_none() {
+                errors.push(format!("{here}: 'elevate' applies only to call steps"));
             }
             if let Some(sub) = &step.pipeline {
                 sub.validate_into(&here, errors);
