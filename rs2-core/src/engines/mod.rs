@@ -14,3 +14,8 @@ pub mod wasm;
 
 #[cfg(feature = "js")]
 pub mod js;
+
+/// Resident adapter runtimes (G13 Phase 2): loadable `DataStore` adapters on a
+/// resident `deno_core` isolate that pools its connections across requests.
+#[cfg(feature = "js")]
+pub mod resident;

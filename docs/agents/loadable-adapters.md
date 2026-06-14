@@ -62,61 +62,73 @@ Custom JS can speak non-HTTP protocols over a host-gated TCP/TLS socket.
 Limitation carried into Phase 2: one runtime per invocation, so a connection lives
 only for the request (reconnects each time). Pooling needs resident runtimes.
 
-## Phase 2 — resident adapter runtimes + loadable `DataStore` — NOT STARTED
+## Phase 2 — resident adapter runtimes + loadable `DataStore` — DONE
 
-Goal: a deployed JS module backs a data mount's **persistence**, kept resident so
-connections pool across requests. Largest phase; ~3 commits.
+A deployed JS module backs a data mount's **persistence**, kept resident so
+connections pool across requests. Shipped:
 
-**A. Resident runtime subsystem** (new `rs2-core/src/engines/resident.rs`).
-- `ResidentRuntime`: a dedicated OS thread (V8 is `!Send`) running a current-thread
-  tokio runtime + one `deno_core::JsRuntime` built once from the adapter bundle
-  (prelude+bootstrap+module evaluated once; `__rs2_dispatch` ready). The thread loops
-  on `mpsc::Receiver<Job>`, where
-  `Job { input: Value, config: Value, reply: oneshot::Sender<Result<Value, RsError>> }`.
-- Per job: call `__rs2_dispatch(default, msg, config)` via the drive loop; reply.
-- `InvocationState` (host, **socket registry**, allowlist) becomes long-lived in the
-  runtime's `OpState`, so sockets opened in job N persist to N+1 → the adapter pools
-  connections in a module-level JS var holding socket ids.
-- `ResidentHandle { tx, last_used: AtomicInstant }`; `async fn call(input, config)`.
-- `ResidentPool` on the `Runtime` (node-global, like `Adapters`), keyed by
-  `(tenant, mount, code_ref)`; **idle eviction** (drop handle → thread exits → runtime
-  dropped → sockets closed); re-spawn on next call; a new `code_ref` evicts the old.
+**A. Resident runtime subsystem** (`rs2-core/src/engines/resident.rs`).
+- `spawn_resident` puts a `deno_core::JsRuntime` on a dedicated OS thread (V8 is
+  `!Send`) with a current-thread tokio runtime; the bundle is built once
+  (`build_runtime`) and the thread loops on `mpsc::UnboundedReceiver<Job>`, where
+  `Job { input, config, reply: oneshot::Sender<Result<Value, RsError>> }`. Build
+  errors surface at spawn (a `ready` oneshot), not at the first job.
+- The long-lived `InvocationState` (host, **socket registry**, allowlist) lives in
+  the runtime's `OpState`, so sockets opened in job N persist to N+1 — the adapter
+  pools connections in a module-level JS var (proven: the Redis mock accepts exactly
+  one connection across a full store-contract run). `dispatch_once` clears the
+  per-call host-error slot + OOM flag and cancels any pending termination, so the
+  isolate survives a killed call and is reused.
+- `ResidentHandle { tx }` (clonable); `async fn call(input, config)`. Host socket I/O
+  still re-enters the **main** runtime via `block_on_main`, as for per-invocation.
 
-**B. Refactor `engines/js.rs` to share with resident mode.** Extract
-`build_runtime(source, host, limits) -> JsRuntime` (extensions+bootstrap+prelude+module
-load/evaluate) and `dispatch_once(&mut runtime, input, config) -> Result<Value, String>`
-(call + drive loop + extraction). Per-invocation `JsEngine::invoke` stays for
-**services**; resident mode is for **adapters**.
+**B. Refactored `engines/js.rs` to share with resident mode.** Extracted
+`build_runtime(source, inv, limits, oom) -> (JsRuntime, default_export)`
+(extensions + heap cap + bootstrap + prelude + module load/evaluate, watchdog-guarded)
+and `dispatch_once(&mut runtime, default_export, input, config, inv, limits, oom)
+-> Result<Value, RsError>` (clear-state + watchdog + call + drive loop + envelope +
+timeout/OOM/host-error mapping). Per-invocation `JsEngine::invoke` is `build_runtime`
++ one `dispatch_once`; the resident loop is `build_runtime` + many. Conformance +
+npm-compat + socket suites unchanged (no service regression).
 
-**C. `GuestDataStore`** — impl the `DataStore` trait by store-pattern messages →
-`resident.call`: `get`→`GET /{ds}/{key}`, `put`→`PUT …`, `delete`→`DELETE …`,
-`list_keys`→`GET /{ds}/`, `list_datasets`→`GET /`, `get/put_schema`→`…/.schema.json`,
-`delete_dataset`→`DELETE /{ds}/?confirm=`. Map response envelope/markers back to the
-trait's returns / `RsError`. Built with a `GrantedHost` from the mount's `store.grants`
-+ socket allowlist.
+**C. `GuestDataStore`** (in `resident.rs`) impls `DataStore` by store-pattern messages
+→ `ResidentHandle::call`: `get`→`GET /{ds}/{key}`, `put`→`PUT …` (201/200 = created/
+updated), `delete`→`DELETE …`, `list_keys`→`GET /{ds}/?$take&$skip`,
+`list_datasets`→`GET /`, `get/put_schema`→`…/.schema.json`,
+`delete_dataset`→`DELETE /{ds}/?confirm=`. Non-2xx → `RsError` by status class
+(`store_error`). Built with a `GrantedHost` + socket allowlist from `store.grants`.
 
-**D. Config seam + `Tenant::build` wiring** (the `"data"` arm, ~`tenant.rs:184-185`).
-`"store": {"adapter":"code:my-mongo@v1","grants":{…}}` → load the bundle (like
-`CodeService::load_code`), get/spawn the `ResidentRuntime` from the pool, wrap in
-`GuestDataStore`, and pass it as the mount's `data` capability instead of the built-in
-`ScopedDataStore`. The stock `DataService` then runs unchanged on top — inheriting
-schema validation, the store contract, ETags, `.schemas`, etc.
+**D. Config seam + `Tenant::build` wiring** (`data_capability`, `tenant.rs`). A `data`
+mount with `"store": {"adapter":"code:…","grants":{…}}` gets a `GuestDataStore` as its
+`data` capability instead of the built-in `ScopedDataStore`; the bundle loads lazily
+on first request from `.rs2-code/<name>/<version>.js`. The stock `DataService` runs
+unchanged on top (schema validation, ETags, `.schemas`, the store contract). A non-JS
+build rejects such a mount with 501 at config time.
 
-**E. Proof case.** Validate the path with **Redis first** (RESP is trivial) against
-`store_conformance` run over a guest-backed `DataStore`, then **MongoDB** (OP_MSG +
-BSON + SCRAM-SHA-256 over the socket capability; vendor a minimal client or adapt
-`deno_mongo`). The test spins a real backend (or mock), deploys the adapter bundle,
-mounts data with `store.adapter`.
+**E. Proof case** (`tests/guest_adapter.rs`, `--features js`). A Redis (RESP) adapter
+bundle over the socket capability against an in-process mock Redis, held to the store
+contract — the `store_conformance` shape over a guest-backed `DataStore` — plus the
+single-connection pooling assertion. Resident-level unit tests in `resident.rs` cover
+module-state persistence across jobs and build-error-at-spawn.
 
-**Risks:** sharing engine code across per-invocation + resident without regressing
-services; one resident runtime per mount serializes that mount's calls (a small
-N-pool is a later throughput step); add a `store_conformance` variant over a
-guest-backed store.
+**Deviations from the original sketch (tracked):**
+- **No `ResidentPool` on the `Runtime`.** Lifecycle is tied to the `GuestDataStore`,
+  which the tenant owns: each holds a one-slot `Mutex<Option<ResidentHandle>>` (lazy
+  spawn, re-spawn if the thread died). A config change rebuilds the tenant, dropping
+  the old store + runtime + sockets — so "new `code_ref` evicts the old" holds without
+  node-global state (keeps rs2-core state-free per `architecture.md`). Timer-based
+  **idle eviction** of an unused-but-loaded mount is not implemented (tenants aren't
+  idle-evicted either, so it's consistent) — a follow-on.
+- **MongoDB adapter deferred.** Redis (RESP) is the shipped proof; the Mongo client
+  (OP_MSG + BSON + SCRAM-SHA-256) is a larger vendoring job — Phase 3.
 
 ## Phase 3 — follow-ons
 
-`QueryStore` adapter (push-down); `FileStore` adapter (streaming or
-redirect/presigned mode); a host-capability tier (Rust `sql`/`kv`/`mongo` as
-message-shaped capabilities, also serving the wasm tier); instruction-plane
+A **MongoDB** `DataStore` adapter (OP_MSG + BSON + SCRAM-SHA-256 over the socket
+capability — the deferred half of Phase 2's proof); a resident **N-pool** per mount
++ timer-based idle eviction (today one runtime per mount, serialized, resident while
+the tenant is loaded); `QueryStore` adapter (push-down); `FileStore` adapter
+(streaming or redirect/presigned mode); a host-capability tier (Rust `sql`/`kv`/
+`mongo` as message-shaped capabilities, also serving the wasm tier); instruction-plane
 multi-file ESM resolution (replace `NoopModuleLoader`); a startup snapshot for
 faster per-invocation boot; tighten `Deno.core` exposure.

@@ -177,12 +177,19 @@ impl Tenant {
                     )))
                 }
             };
+            // The `data` capability is normally the node's built-in store; a
+            // `data` mount may instead name a loadable adapter (`"store":
+            // {"adapter":"code:…"}`, G13 Phase 2) backing its persistence with
+            // a resident JS bundle. The stock `DataService` runs unchanged on
+            // top of either.
+            let data = data_capability(mount, adapters, name, limits.invocation_limits())?;
+
             // Capability grants: each instance gets handles pre-scoped to
             // this tenant — host-enforced isolation (PRD §9.2).
             let ctx = ServiceContext {
                 config: mount.config.clone(),
                 files: Some(ScopedFileStore::new(adapters.files.clone(), name)),
-                data: Some(ScopedDataStore::new(adapters.data.clone(), name)),
+                data,
                 query: Some(crate::capabilities::ScopedQueryStore::new(
                     adapters.query.clone(),
                     name,
@@ -221,5 +228,42 @@ impl Tenant {
 
     pub fn instance(&self, base_path: &str) -> Option<&(Arc<dyn Service>, Arc<ServiceContext>)> {
         self.instances.get(base_path)
+    }
+}
+
+/// Resolve a mount's `data` capability. Every mount sees the node's built-in
+/// store by default; a `data` mount with `"store": {"adapter": "code:…"}` is
+/// instead backed by a resident loadable adapter (G13 Phase 2), scoped to this
+/// tenant. The bundle is loaded lazily on first use from the tenant file store.
+fn data_capability(
+    mount: &Mount,
+    adapters: &Adapters,
+    name: &str,
+    limits: crate::contract::InvocationLimits,
+) -> Result<Option<ScopedDataStore>, RsError> {
+    let adapter_ref = (mount.service == "data")
+        .then(|| mount.config.get("store").and_then(|s| s.get("adapter")).and_then(|a| a.as_str()))
+        .flatten();
+    let Some(adapter_ref) = adapter_ref else {
+        return Ok(Some(ScopedDataStore::new(adapters.data.clone(), name)));
+    };
+
+    #[cfg(feature = "js")]
+    {
+        let store = mount.config.get("store").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let files = ScopedFileStore::new(adapters.files.clone(), name);
+        let guest = crate::engines::resident::GuestDataStore::from_config(
+            adapter_ref, &store, files, name, limits,
+        )?;
+        Ok(Some(ScopedDataStore::new(Arc::new(guest), name)))
+    }
+    #[cfg(not(feature = "js"))]
+    {
+        let _ = limits;
+        Err(RsError::engine_unavailable(format!(
+            "data mount '{}' uses a loadable adapter ('{adapter_ref}') but this build has no JS \
+             engine (rebuild with --features js)",
+            if mount.base_path.is_empty() { "/" } else { &mount.base_path }
+        )))
     }
 }

@@ -108,16 +108,21 @@ const COMPAT_PRELUDE: &str = include_str!("js_prelude.js");
 /// Per-invocation state, stored in the runtime's `OpState` and read by the
 /// host-bridge ops. `host_error` preserves a structured host error's identity
 /// across the JS boundary (an op records it before throwing).
-struct InvocationState {
+///
+/// A resident adapter runtime ([`crate::engines::resident`]) holds one of these
+/// long-lived: `sockets` then pool across jobs, and `host_error` is cleared by
+/// [`dispatch_once`] before each call.
+pub(crate) struct InvocationState {
     host: Arc<dyn HostApi>,
     main: tokio::runtime::Handle,
     tenant: String,
     depth: u16,
     materialize_cap: u64,
     host_error: Mutex<Option<RsError>>,
-    /// Open sockets for the `socket` capability. Phase 1 is one runtime per
-    /// invocation, so connections live for the request (pooling across
-    /// invocations is Phase 2's resident-runtime model).
+    /// Open sockets for the `socket` capability. Per-invocation runtimes open
+    /// and drop these within one request; a resident runtime keeps them across
+    /// jobs, which is how an adapter pools connections (it caches the socket id
+    /// in a module-level JS var).
     sockets: Mutex<HashMap<u32, Arc<tokio::sync::Mutex<SockStream>>>>,
     socket_seq: AtomicU32,
     /// Allowed `host:port` patterns, from the mount's `socket` grants.
@@ -125,6 +130,29 @@ struct InvocationState {
 }
 
 impl InvocationState {
+    /// Construct shared invocation state. `socket_allowlist` is the mount's
+    /// `socket` grant patterns; `depth` seeds re-entrant dispatch.
+    pub(crate) fn new(
+        host: Arc<dyn HostApi>,
+        main: tokio::runtime::Handle,
+        tenant: String,
+        depth: u16,
+        materialize_cap: u64,
+        socket_allowlist: Vec<String>,
+    ) -> Arc<Self> {
+        Arc::new(InvocationState {
+            host,
+            main,
+            tenant,
+            depth,
+            materialize_cap,
+            host_error: Mutex::new(None),
+            sockets: Mutex::new(HashMap::new()),
+            socket_seq: AtomicU32::new(1),
+            socket_allowlist,
+        })
+    }
+
     fn socket_allowed(&self, host: &str, port: u16) -> bool {
         let target = format!("{host}:{port}");
         self.socket_allowlist.iter().any(|pat| socket_pattern_matches(pat, host, port, &target))
@@ -237,8 +265,8 @@ fn socket_pattern_matches(pat: &str, host: &str, port: u16, target: &str) -> boo
 }
 
 /// Collect the `socket` grant allowlist (`host:port` patterns) from a mount
-/// config's `grants`.
-fn socket_allowlist_from_config(config: &Value) -> Vec<String> {
+/// config's `grants` (or a `store` block's `grants`, for adapters).
+pub(crate) fn socket_allowlist_from_config(config: &Value) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(grants) = config.get("grants").and_then(|g| g.as_object()) {
         for grant in grants.values() {
@@ -659,17 +687,14 @@ impl Engine for JsEngine {
         let depth = msg.depth;
         let limits = limits.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            let inv = Arc::new(InvocationState {
+            let inv = InvocationState::new(
                 host,
                 main,
                 tenant,
                 depth,
-                materialize_cap: limits.materialized_body_bytes,
-                host_error: Mutex::new(None),
-                sockets: Mutex::new(HashMap::new()),
-                socket_seq: AtomicU32::new(1),
-                socket_allowlist: socket_allowlist_from_config(&config),
-            });
+                limits.materialized_body_bytes,
+                socket_allowlist_from_config(&config),
+            );
             let local = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -717,8 +742,8 @@ impl Engine for JsEngine {
     }
 }
 
-/// Build the runtime, run the bundle, and return the response envelope.
-/// Runs on a current-thread runtime on its own thread.
+/// Build the runtime, run the bundle once, and return the response envelope.
+/// Runs on a current-thread runtime on its own thread (per invocation).
 async fn run_invocation(
     source: &str,
     input: Value,
@@ -726,6 +751,49 @@ async fn run_invocation(
     inv: Arc<InvocationState>,
     limits: &InvocationLimits,
 ) -> Result<Value, RsError> {
+    let oom = Arc::new(AtomicBool::new(false));
+    let (mut runtime, default_export) = build_runtime(source, inv.clone(), limits, oom.clone()).await?;
+    dispatch_once(&mut runtime, &default_export, &input, &config, &inv, limits, &oom).await
+}
+
+/// Wall-clock watchdog: terminate the isolate at `deadline`. Returns
+/// `(timed_out, done)` — store `done` when the guarded work finishes so the
+/// watcher exits without firing. Shared by the build and dispatch phases.
+fn spawn_watchdog(
+    handle: v8::IsolateHandle,
+    wall: Duration,
+) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let (t2, d2) = (timed_out.clone(), done.clone());
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + wall;
+        while std::time::Instant::now() < deadline {
+            if d2.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !d2.load(Ordering::SeqCst) {
+            t2.store(true, Ordering::SeqCst);
+            handle.terminate_execution();
+        }
+    });
+    (timed_out, done)
+}
+
+/// Build a runtime from a bundle: install the host extension + heap cap, run
+/// the bootstrap and compat prelude, load and evaluate the module, and capture
+/// its default export. After this returns `__rs2_dispatch` is ready and the
+/// module's top-level state is live. Shared by per-invocation [`run_invocation`]
+/// and the resident adapter runtime ([`crate::engines::resident`]) — the latter
+/// builds once and then [`dispatch_once`]es many jobs against the same isolate.
+pub(crate) async fn build_runtime(
+    source: &str,
+    inv: Arc<InvocationState>,
+    limits: &InvocationLimits,
+    oom: Arc<AtomicBool>,
+) -> Result<(JsRuntime, v8::Global<v8::Value>), RsError> {
     let create = v8::CreateParams::default().heap_limits(0, limits.memory_bytes as usize);
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![rs2_host::init()],
@@ -734,30 +802,8 @@ async fn run_invocation(
         ..Default::default()
     });
 
-    // Wall-clock watchdog: terminate execution at the deadline.
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
-    {
-        let handle = runtime.v8_isolate().thread_safe_handle();
-        let (timed_out, done) = (timed_out.clone(), done.clone());
-        let wall = limits.wall_clock;
-        std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + wall;
-            while std::time::Instant::now() < deadline {
-                if done.load(Ordering::SeqCst) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            if !done.load(Ordering::SeqCst) {
-                timed_out.store(true, Ordering::SeqCst);
-                handle.terminate_execution();
-            }
-        });
-    }
-
     // Near-heap-limit: flag and terminate (don't let V8 abort the process).
-    let oom = Arc::new(AtomicBool::new(false));
+    // Installed once; `dispatch_once` clears the flag before each call.
     {
         let oom = oom.clone();
         let handle = runtime.v8_isolate().thread_safe_handle();
@@ -767,20 +813,100 @@ async fn run_invocation(
             current * 2
         });
     }
-
     runtime.op_state().borrow_mut().put(inv.clone());
 
-    let result = run_module(&mut runtime, source, &input, &config).await;
+    // The bootstrap + compat prelude install the guest contract globals.
+    runtime
+        .execute_script("rs2:bootstrap", BOOTSTRAP)
+        .map_err(|e| RsError::contract_violation(format!("bootstrap: {e}")))?;
+    runtime
+        .execute_script("rs2:prelude", COMPAT_PRELUDE)
+        .map_err(|e| RsError::contract_violation(format!("prelude: {e}")))?;
+
+    // Load + evaluate the module under the wall clock (a bundle that loops at
+    // top level can't hang the build), then map a kill to the right limit.
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    let (timed_out, done) = spawn_watchdog(handle, limits.wall_clock);
+    let evaluated = load_and_evaluate(&mut runtime, source).await;
+    done.store(true, Ordering::SeqCst);
+    match evaluated {
+        Ok(default_export) => Ok((runtime, default_export)),
+        Err(fail) => {
+            if timed_out.load(Ordering::SeqCst) {
+                runtime.v8_isolate().cancel_terminate_execution();
+                let ms = limits.wall_clock.as_millis() as u64;
+                return Err(RsError::limit_exceeded("wall_clock_ms", ms, ms));
+            }
+            if oom.load(Ordering::SeqCst) {
+                runtime.v8_isolate().cancel_terminate_execution();
+                return Err(RsError::limit_exceeded(
+                    "memory_bytes",
+                    limits.memory_bytes,
+                    limits.memory_bytes,
+                ));
+            }
+            if let Some(err) = inv.host_error.lock().unwrap().take() {
+                return Err(err);
+            }
+            Err(RsError::contract_violation(format!("JS bundle failed: {fail}")))
+        }
+    }
+}
+
+/// Load + evaluate the ESM bundle and return its default export.
+async fn load_and_evaluate(
+    runtime: &mut JsRuntime,
+    source: &str,
+) -> Result<v8::Global<v8::Value>, String> {
+    let spec = resolve_url("rs2:service").map_err(|e| format!("specifier: {e}"))?;
+    let mod_id = runtime
+        .load_main_es_module_from_code(&spec, source.to_string())
+        .await
+        .map_err(|e| format!("module load: {e}"))?;
+    let eval = runtime.mod_evaluate(mod_id);
+    runtime.run_event_loop(Default::default()).await.map_err(|e| format!("evaluate: {e}"))?;
+    eval.await.map_err(|e| format!("evaluate: {e}"))?;
+
+    let namespace = runtime.get_module_namespace(mod_id).map_err(|e| format!("namespace: {e}"))?;
+    deno_core::scope!(scope, runtime);
+    let ns = v8::Local::new(scope, namespace);
+    let default_key = v8::String::new(scope, "default").ok_or("oom")?;
+    let default_export = ns.get(scope, default_key.into()).ok_or("no default export")?;
+    Ok(v8::Global::new(scope, default_export))
+}
+
+/// Call `__rs2_dispatch(default, msg, config)` once and return the response
+/// envelope, guarded by the wall clock. Maps a timeout / OOM / host error to
+/// the right `RsError`. Reusable across calls on a resident runtime: it clears
+/// the per-call host-error slot and OOM flag, and cancels any pending
+/// termination so the isolate survives a killed call.
+pub(crate) async fn dispatch_once(
+    runtime: &mut JsRuntime,
+    default_export: &v8::Global<v8::Value>,
+    input: &Value,
+    config: &Value,
+    inv: &InvocationState,
+    limits: &InvocationLimits,
+    oom: &Arc<AtomicBool>,
+) -> Result<Value, RsError> {
+    *inv.host_error.lock().unwrap() = None;
+    oom.store(false, Ordering::SeqCst);
+
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    let (timed_out, done) = spawn_watchdog(handle, limits.wall_clock);
+    let result = drive_dispatch(runtime, default_export, input, config).await;
     done.store(true, Ordering::SeqCst);
 
     match result {
         Ok(value) => Ok(normalize_envelope(value)),
         Err(fail) => {
             if timed_out.load(Ordering::SeqCst) {
+                runtime.v8_isolate().cancel_terminate_execution();
                 let ms = limits.wall_clock.as_millis() as u64;
                 return Err(RsError::limit_exceeded("wall_clock_ms", ms, ms));
             }
             if oom.load(Ordering::SeqCst) {
+                runtime.v8_isolate().cancel_terminate_execution();
                 return Err(RsError::limit_exceeded(
                     "memory_bytes",
                     limits.memory_bytes,
@@ -795,36 +921,20 @@ async fn run_invocation(
     }
 }
 
-/// Load + evaluate the bundle, then call `__rs2_dispatch(default, msg, config)`
-/// and return the settled result as JSON.
-async fn run_module(
+/// Call `__rs2_dispatch(default, msg, config)` and drive: drain microtasks via
+/// the event loop and, when the result promise is still pending with no real
+/// work left, advance the virtual-time timers (host ops are synchronous, so
+/// timers are the only async surface — backoffs fast-forward instead of
+/// waiting). Returns the settled result as JSON.
+async fn drive_dispatch(
     runtime: &mut JsRuntime,
-    source: &str,
+    default_export: &v8::Global<v8::Value>,
     input: &Value,
     config: &Value,
 ) -> Result<Value, String> {
-    runtime.execute_script("rs2:bootstrap", BOOTSTRAP).map_err(|e| format!("bootstrap: {e}"))?;
-    runtime.execute_script("rs2:prelude", COMPAT_PRELUDE).map_err(|e| format!("prelude: {e}"))?;
-
-    let spec = resolve_url("rs2:service").map_err(|e| format!("specifier: {e}"))?;
-    let mod_id = runtime
-        .load_main_es_module_from_code(&spec, source.to_string())
-        .await
-        .map_err(|e| format!("module load: {e}"))?;
-    let eval = runtime.mod_evaluate(mod_id);
-    runtime.run_event_loop(Default::default()).await.map_err(|e| format!("evaluate: {e}"))?;
-    eval.await.map_err(|e| format!("evaluate: {e}"))?;
-
-    // Gather the default export, the dispatch fn, and the args (no awaits
-    // while a scope is live).
-    let namespace = runtime.get_module_namespace(mod_id).map_err(|e| format!("namespace: {e}"))?;
+    // Gather the dispatch fn + args (no awaits while a scope is live).
     let (dispatch_fn, args): (v8::Global<v8::Function>, Vec<v8::Global<v8::Value>>) = {
         deno_core::scope!(scope, runtime);
-        let ns = v8::Local::new(scope, namespace);
-        let default_key = v8::String::new(scope, "default").ok_or("oom")?;
-        let default_export =
-            ns.get(scope, default_key.into()).ok_or("no default export")?;
-
         let global = scope.get_current_context().global(scope);
         let dispatch_key = v8::String::new(scope, "__rs2_dispatch").ok_or("oom")?;
         let dispatch_val =
@@ -838,17 +948,13 @@ async fn run_module(
             serde_v8::to_v8(scope, config).map_err(|e| format!("config marshaling: {e}"))?;
 
         let args = vec![
-            v8::Global::new(scope, default_export),
+            default_export.clone(),
             v8::Global::new(scope, msg_local),
             v8::Global::new(scope, cfg_local),
         ];
         (v8::Global::new(scope, dispatch_local), args)
     };
 
-    // Call dispatch, then drive: drain microtasks via the event loop and, when
-    // the result promise is still pending with no real work left, advance the
-    // virtual-time timers (host ops are synchronous, so timers are the only
-    // async surface — backoffs fast-forward instead of waiting).
     let promise = {
         deno_core::scope!(scope, runtime);
         let f = v8::Local::new(scope, &dispatch_fn);

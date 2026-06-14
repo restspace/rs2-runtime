@@ -323,6 +323,30 @@ Out of scope for v1 (documented): WebSocket connections, response-body
 streaming (`ReadableStream` is presence-only), binary multipart uploads,
 real wall-clock timers.
 
+## Loadable adapters (G13, `--features js`)
+
+Bring-your-own-backend: a tenant connects a custom data backend — including
+non-HTTP wire protocols — without recompiling `rs2-core`.
+
+- **Phase 0/1** (done): the JS engine runs on `deno_core` (guest contract
+  byte-for-byte unchanged), with a host-gated TCP/TLS **socket** capability
+  (`{"type":"socket","hosts":[…]}`, default-deny, allowlisted before connect)
+  so custom JS can speak Postgres/Mongo/Redis. `RS2Socket.connect(host, port,
+  {tls})`, synchronous from the guest.
+- **Phase 2** (done): **resident adapter runtimes** + a loadable `DataStore`.
+  A `data` mount with `"store": {"adapter": "code:my-redis@v1", "grants":
+  {…socket…}}` backs its persistence with a deployed JS bundle, kept resident
+  on its own thread (`engines/resident.rs`) so the adapter pools one connection
+  across requests. The bundle implements the **store pattern** (`GET/PUT/DELETE
+  /{ds}/{key}`, listings, schema); `GuestDataStore` maps the `DataStore` trait
+  onto those messages, and the stock `DataService` runs unchanged on top
+  (schema validation, ETags, `.schemas`, the store contract). `engines/js.rs`'s
+  per-invocation and resident paths share `build_runtime` + `dispatch_once`.
+  Proof: `tests/guest_adapter.rs` runs the store contract over a Redis (RESP)
+  adapter against an in-process mock, asserting a single pooled connection.
+- **Deferred** (Phase 3): a MongoDB adapter (BSON/SCRAM), a per-mount N-pool +
+  idle eviction, `QueryStore`/`FileStore` adapters, multi-file ESM resolution.
+
 ## G1 + G3 benchmarks (`tests/g_benchmarks.rs`)
 
 ```powershell
