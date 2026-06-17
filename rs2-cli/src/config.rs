@@ -92,21 +92,19 @@ pub fn resolve_host(flag: Option<&str>, config: &RsConfig) -> Result<String, Str
 
 /// Resolve a usable bearer token for `host`: requires a stored `auth` issued
 /// for the same host and not past its `exp`.
-pub fn resolve_token(config: &RsConfig, host: &str) -> Result<String, String> {
-    let auth = config
-        .auth
-        .as_ref()
-        .ok_or_else(|| "not logged in — run `rs2 login`".to_string())?;
+/// A usable bearer token for `host`, if one is stored, matches the host, and
+/// hasn't expired — otherwise `None`. Commands send it when present and let the
+/// server decide; this avoids forcing `rs2 login` against an open mount (e.g.
+/// bootstrapping the first `/auth` mount before any admin exists).
+pub fn token_if_valid(config: &RsConfig, host: &str) -> Option<String> {
+    let auth = config.auth.as_ref()?;
     if auth.host.trim_end_matches('/') != host {
-        return Err(format!(
-            "stored token is for {} but the request targets {host} — run `rs2 login`",
-            auth.host
-        ));
+        return None;
     }
     if auth.exp <= now_secs() {
-        return Err("session has expired — run `rs2 login`".to_string());
+        return None;
     }
-    Ok(auth.token.clone())
+    Some(auth.token.clone())
 }
 
 pub fn now_secs() -> i64 {

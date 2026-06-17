@@ -1,0 +1,26 @@
+# Seed user auth on a fresh rs2 node — see README.md.
+#
+# First start the node (from this directory):  rs2 dev serverConfig.json
+# Then run this script (from this directory):   rs2 run seed-auth.rs2
+#
+# Each line below is an `rs2` command with the leading `rs2` omitted; they run
+# in order and the script aborts on the first failure.
+
+# 1. Mount the auth service so /auth/login works.
+service add auth.mount.json
+
+# 2. Authenticate as the bootstrap admin (host + creds come from rsconfig.json).
+login
+
+# 3. Mount the user store: schema-enforced, with field-level authorization.
+service add userstore.mount.json
+
+# 4. Install the users schema. passwordHash is operator-only to read AND write;
+#    roles is operator-only to write (so a user can never self-promote).
+send /data/users/.schema.json --file users.schema.json
+
+# 5. Mount the /users management pipeline.
+service add users.pipeline.mount.json
+
+# 6. Install its .root spec: GET reads, PUT hashes `password` then writes.
+send /users/.pipelines/.root --file users.root.pipeline.json

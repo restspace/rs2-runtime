@@ -1,0 +1,9 @@
+{
+  "listen": "127.0.0.1:3100",
+  "tenancy": { "mode": "single", "tenant": "main" },
+  "fileRoot": "./data",
+  "dataRoot": "./data-store",
+  "tenantsDir": "./tenants",
+  "logging": { "sink": "none" },
+  "bootstrapAdmin": { "email": "admin@demo.local", "password": "demo-admin-pw" }
+}

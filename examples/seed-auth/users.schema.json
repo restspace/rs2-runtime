@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "passwordHash": { "type": "string", "x-rs-read": "A", "x-rs-write": "A" },
+    "roles": { "type": "string", "x-rs-write": "A" },
+    "kind": { "type": "string" }
+  },
+  "required": ["passwordHash"]
+}

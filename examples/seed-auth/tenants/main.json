@@ -1,0 +1,15 @@
+{
+  "operatorRoles": "A",
+  "auth": {
+    "jwtSecret": "demo-only-jwt-secret-change-me",
+    "userDataset": "users",
+    "sessionMinutes": 60
+  },
+  "mounts": [
+    {
+      "path": "/services",
+      "service": "services",
+      "config": { "access": { "read": "all", "write": "all" } }
+    }
+  ]
+}

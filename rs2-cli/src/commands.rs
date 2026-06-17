@@ -58,19 +58,20 @@ pub fn login(
 pub fn send(server_path: &str, file: &str, content_type: Option<&str>) -> Result<(), String> {
     let loaded = config::load()?;
     let host = config::resolve_host(None, &loaded.config)?;
-    let token = config::resolve_token(&loaded.config, &host)?;
+    let token = config::token_if_valid(&loaded.config, &host);
 
     let bytes = std::fs::read(file).map_err(|e| format!("cannot read {file}: {e}"))?;
     let content_type = content_type.map(str::to_string).unwrap_or_else(|| {
         mime_guess::from_path(file).first_raw().unwrap_or("application/octet-stream").to_string()
     });
 
-    let client = Client::new(host, Some(token));
+    let had_token = token.is_some();
+    let client = Client::new(host, token);
     let resp = client.put(server_path, &content_type, &bytes, None)?;
     match resp.status {
         201 => println!("created {server_path} ({} bytes, {content_type})", bytes.len()),
         200 => println!("overwritten {server_path} ({} bytes, {content_type})", bytes.len()),
-        _ => return Err(format!("send failed: {}", resp.error_detail())),
+        _ => return Err(format!("send failed: {}{}", resp.error_detail(), login_hint(resp.status, had_token))),
     }
     Ok(())
 }
@@ -81,8 +82,9 @@ pub fn send(server_path: &str, file: &str, content_type: Option<&str>) -> Result
 pub fn service_add(file: &str, path_override: Option<&str>) -> Result<(), String> {
     let loaded = config::load()?;
     let host = config::resolve_host(None, &loaded.config)?;
-    let token = config::resolve_token(&loaded.config, &host)?;
-    let client = Client::new(host, Some(token));
+    let token = config::token_if_valid(&loaded.config, &host);
+    let had_token = token.is_some();
+    let client = Client::new(host, token);
 
     // The mount spec from the local file.
     let mount_text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
@@ -111,7 +113,11 @@ pub fn service_add(file: &str, path_override: Option<&str>) -> Result<(), String
     // Read the current config (with its ETag for optimistic concurrency).
     let current = client.get("/services/raw")?;
     if current.status != 200 {
-        return Err(format!("could not read current config: {}", current.error_detail()));
+        return Err(format!(
+            "could not read current config: {}{}",
+            current.error_detail(),
+            login_hint(current.status, had_token)
+        ));
     }
     let etag = current
         .etag
@@ -137,7 +143,17 @@ pub fn service_add(file: &str, path_override: Option<&str>) -> Result<(), String
     match resp.status {
         204 => println!("added mount at {target_path}"),
         409 => return Err("config changed under us (ETag mismatch) — re-run".to_string()),
-        _ => return Err(format!("service add failed: {}", resp.error_detail())),
+        _ => return Err(format!("service add failed: {}{}", resp.error_detail(), login_hint(resp.status, had_token))),
     }
     Ok(())
+}
+
+/// Appended to an auth-ish failure when no token was sent, nudging the user to
+/// authenticate (the server enforces access; the CLI just hints).
+fn login_hint(status: u16, had_token: bool) -> String {
+    if !had_token && (status == 401 || status == 403) {
+        " — you may need to `rs2 login` first".to_string()
+    } else {
+        String::new()
+    }
 }

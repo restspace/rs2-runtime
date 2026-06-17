@@ -1,0 +1,4 @@
+{
+  "host": "http://127.0.0.1:3100",
+  "login": { "email": "admin@demo.local", "password": "demo-admin-pw" }
+}
