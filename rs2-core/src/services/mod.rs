@@ -57,6 +57,11 @@ pub struct ServiceContext {
     pub cors: Arc<crate::wrapper::CorsPolicy>,
     /// Tenant-level retry default (PRD §7.3 resolution chain).
     pub tenant_retry: Option<RetryPolicy>,
+    /// Tenant operator roles (`operatorRoles`) — the principals permitted to
+    /// change authorization config. Consulted where a service guards
+    /// authority-defining writes (e.g. the `data` service gates `.schema.json`
+    /// writes under `fieldLevelAuthz`). Empty/None ⇒ no API operator.
+    pub operator_roles: Option<String>,
     /// Pipeline wall-clock budget (PRD §9.3: 120 s default).
     pub pipeline_wall_clock: std::time::Duration,
     /// Application-log emit handle (PRD §14), bound to this mount's

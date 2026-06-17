@@ -93,15 +93,92 @@ fn merge_patch(target: &mut Value, patch: &Value) {
     }
 }
 
+/// Top-level per-field access rules from a dataset schema (PRD §5.2): each
+/// `properties.<field>` carrying `x-rs-read` and/or `x-rs-write` (role-spec
+/// strings). Fields without either are unrestricted (the mount `access` is the
+/// coarse gate; field rules only narrow). Top-level properties only.
+fn field_rules(schema: &Value) -> Vec<(String, Option<String>, Option<String>)> {
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return Vec::new();
+    };
+    props
+        .iter()
+        .filter_map(|(name, def)| {
+            let read = def.get("x-rs-read").and_then(|v| v.as_str()).map(str::to_string);
+            let write = def.get("x-rs-write").and_then(|v| v.as_str()).map(str::to_string);
+            (read.is_some() || write.is_some()).then(|| (name.clone(), read, write))
+        })
+        .collect()
+}
+
+/// Fetch a record, mapping "not found" to JSON null — the write-target of a
+/// create that doesn't exist yet.
+async fn get_or_null(
+    data: &crate::capabilities::ScopedDataStore,
+    dataset: &str,
+    key: &str,
+) -> Result<Value, RsError> {
+    match data.get(dataset, key).await {
+        Ok(v) => Ok(v),
+        Err(e) if e.code == crate::error::codes::NOT_FOUND => Ok(Value::Null),
+        Err(e) => Err(e),
+    }
+}
+
+/// Drop the top-level fields whose `x-rs-read` the caller doesn't satisfy.
+fn redact_fields(value: &mut Value, schema: &Value, msg: &Message) {
+    let Value::Object(obj) = value else { return };
+    for (name, read, _) in field_rules(schema) {
+        if let Some(rule) = read {
+            if !crate::wrapper::satisfies_role_spec(&rule, msg) {
+                obj.remove(&name);
+            }
+        }
+    }
+}
+
+/// Enforce per-field write rules on the record a write would produce, mutating
+/// `final_value` in place. A field the caller can't *read* is restored from
+/// `stored` (a write can neither change nor drop what the caller can't see — so
+/// a read→edit→write-back never loses redacted data, and a blind write to a
+/// hidden field is silently ignored rather than leaking its existence). A change
+/// to a field the caller *can* read but can't *write* is rejected with 403.
+fn enforce_write_rules(
+    final_value: &mut Value,
+    stored: &Value,
+    schema: &Value,
+    msg: &Message,
+) -> Result<(), RsError> {
+    let Value::Object(obj) = final_value else { return Ok(()) };
+    for (name, read, write) in field_rules(schema) {
+        let readable = read.as_deref().map_or(true, |r| crate::wrapper::satisfies_role_spec(r, msg));
+        let writable = write.as_deref().map_or(true, |w| crate::wrapper::satisfies_role_spec(w, msg));
+        if !readable {
+            match stored.get(&name) {
+                Some(v) => {
+                    obj.insert(name.clone(), v.clone());
+                }
+                None => {
+                    obj.remove(&name);
+                }
+            }
+        } else if !writable && obj.get(&name) != stored.get(&name) {
+            return Err(RsError::forbidden(format!(
+                "field '{name}' is not writable by this principal"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Service for DataService {
     async fn handle(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
         let data = ctx.data.as_ref().ok_or_else(|| RsError::capability_denied("data"))?;
-        let enforce_schema = serde_json::from_value::<crate::config_schema::DataConfig>(
-            ctx.config.clone(),
-        )
-        .unwrap_or_default()
-        .enforce_schema;
+        let cfg = serde_json::from_value::<crate::config_schema::DataConfig>(ctx.config.clone())
+            .unwrap_or_default();
+        let enforce_schema = cfg.enforce_schema;
+        let field_authz = cfg.field_level_authz;
         let segments: Vec<String> = msg.url.service_segments().iter().map(|s| s.to_string()).collect();
         let schema_base = format!("{}", msg.url.base_path);
 
@@ -183,15 +260,33 @@ impl Service for DataService {
                             .body
                             .as_mut()
                             .ok_or_else(|| RsError::bad_request("write requires a JSON body"))?;
-                        let value = body.as_json(ctx.limits.materialized_body_bytes).await?;
+                        let mut value = body.as_json(ctx.limits.materialized_body_bytes).await?;
+                        let schema = if field_authz || enforce_schema {
+                            data.get_schema(&dataset).await?
+                        } else {
+                            None
+                        };
+                        if field_authz {
+                            if let Some(schema) = &schema {
+                                // New key ⇒ no stored record: a no-write field
+                                // present here is a create attempt → 403.
+                                enforce_write_rules(&mut value, &Value::Null, schema, &msg)?;
+                            }
+                        }
                         if enforce_schema {
-                            if let Some(schema) = data.get_schema(&dataset).await? {
-                                self.validate(&dataset, &schema, &value).await?;
+                            if let Some(schema) = &schema {
+                                self.validate(&dataset, schema, &value).await?;
                             }
                         }
                         let key = uuid::Uuid::new_v4().simple().to_string();
+                        let etag = record_etag(&value);
                         data.put(&dataset, &key, value.clone()).await?;
                         let schema_url = format!("{schema_base}/{dataset}/{SCHEMA_RESOURCE}");
+                        if field_authz {
+                            if let Some(schema) = &schema {
+                                redact_fields(&mut value, schema, &msg);
+                            }
+                        }
                         let mut resp = msg.response(
                             StatusCode::CREATED,
                             Some(
@@ -200,7 +295,7 @@ impl Service for DataService {
                             ),
                         );
                         resp.set_header("location", &format!("{schema_base}/{dataset}/{key}"));
-                        resp.set_header("etag", &record_etag(&value));
+                        resp.set_header("etag", &etag);
                         Ok(resp)
                     }
                     Method::DELETE => {
@@ -235,6 +330,20 @@ impl Service for DataService {
                         ))))
                     }
                     Method::PUT => {
+                        // The schema carries the field-authz policy, so on a
+                        // fieldLevelAuthz mount editing it is authority-defining
+                        // and requires an operator (else the policy is
+                        // self-bypassable).
+                        if field_authz
+                            && !crate::wrapper::is_operator(
+                                msg.principal.as_ref(),
+                                ctx.operator_roles.as_deref().unwrap_or(""),
+                            )
+                        {
+                            return Err(RsError::forbidden(
+                                "editing the schema on a fieldLevelAuthz mount requires an operator",
+                            ));
+                        }
                         let body = msg
                             .body
                             .as_mut()
@@ -256,13 +365,21 @@ impl Service for DataService {
                 let schema_url = format!("{schema_base}/{dataset}/{SCHEMA_RESOURCE}");
                 match msg.method {
                     Method::GET => {
-                        let value = data.get(&dataset, &key).await?;
+                        let mut value = data.get(&dataset, &key).await?;
+                        // ETag is over the stored (unredacted) record so
+                        // optimistic concurrency is stable across callers with
+                        // different field visibility.
                         let etag = record_etag(&value);
                         // Conditional GET: revalidate without resending.
                         if super::if_none_match_hits(msg.header("if-none-match"), &etag) {
                             let mut not_modified = msg.response(StatusCode::NOT_MODIFIED, None);
                             not_modified.set_header("etag", &etag);
                             return Ok(not_modified);
+                        }
+                        if field_authz {
+                            if let Some(schema) = data.get_schema(&dataset).await? {
+                                redact_fields(&mut value, &schema, &msg);
+                            }
                         }
                         let mut resp = msg.ok(Some(
                             Body::from_bytes(value.to_string(), MediaType::json()).with_schema(schema_url.clone()),
@@ -279,15 +396,38 @@ impl Service for DataService {
                             .body
                             .as_mut()
                             .ok_or_else(|| RsError::bad_request("write requires a JSON body"))?;
-                        let value = body.as_json(ctx.limits.materialized_body_bytes).await?;
-                        if enforce_schema {
-                            if let Some(schema) = data.get_schema(&dataset).await? {
-                                self.validate(&dataset, &schema, &value).await?;
+                        let mut value = body.as_json(ctx.limits.materialized_body_bytes).await?;
+                        let schema = if field_authz || enforce_schema {
+                            data.get_schema(&dataset).await?
+                        } else {
+                            None
+                        };
+                        if field_authz {
+                            if let Some(schema) = &schema {
+                                // PUT is full-replace; under field authz it
+                                // becomes a field-scoped merge against the
+                                // existing record, so a caller can't drop a
+                                // field they can't see and a change to a
+                                // no-write field is rejected.
+                                let stored = get_or_null(data, &dataset, &key).await?;
+                                enforce_write_rules(&mut value, &stored, schema, &msg)?;
                             }
                         }
+                        if enforce_schema {
+                            if let Some(schema) = &schema {
+                                self.validate(&dataset, schema, &value).await?;
+                            }
+                        }
+                        // ETag over the stored (unredacted) record.
+                        let etag = record_etag(&value);
                         let created = data.put(&dataset, &key, value.clone()).await?;
                         let status = if created { StatusCode::CREATED } else { StatusCode::OK };
                         let stored = if echo {
+                            if field_authz {
+                                if let Some(schema) = &schema {
+                                    redact_fields(&mut value, schema, &msg);
+                                }
+                            }
                             Some(
                                 Body::from_bytes(value.to_string(), MediaType::json())
                                     .with_schema(schema_url),
@@ -296,7 +436,7 @@ impl Service for DataService {
                             None
                         };
                         let mut resp = msg.response(status, stored);
-                        resp.set_header("etag", &record_etag(&value));
+                        resp.set_header("etag", &etag);
                         Ok(resp)
                     }
                     Method::PATCH => {
@@ -305,15 +445,35 @@ impl Service for DataService {
                             .as_mut()
                             .ok_or_else(|| RsError::bad_request("patch requires a JSON body"))?;
                         let patch = body.as_json(ctx.limits.materialized_body_bytes).await?;
-                        let mut current = data.get(&dataset, &key).await?;
+                        let stored = data.get(&dataset, &key).await?;
+                        let mut current = stored.clone();
                         merge_patch(&mut current, &patch);
+                        let schema = if field_authz || enforce_schema {
+                            data.get_schema(&dataset).await?
+                        } else {
+                            None
+                        };
+                        // The merge ran against the full stored record, so a
+                        // redacted (unseen) field is simply absent from the
+                        // patch and preserved; the gate only rejects changes to
+                        // fields the caller can read but not write.
+                        if field_authz {
+                            if let Some(schema) = &schema {
+                                enforce_write_rules(&mut current, &stored, schema, &msg)?;
+                            }
+                        }
                         // PATCH results are validated too (PRD §10.2).
                         if enforce_schema {
-                            if let Some(schema) = data.get_schema(&dataset).await? {
-                                self.validate(&dataset, &schema, &current).await?;
+                            if let Some(schema) = &schema {
+                                self.validate(&dataset, schema, &current).await?;
                             }
                         }
                         data.put(&dataset, &key, current.clone()).await?;
+                        if field_authz {
+                            if let Some(schema) = &schema {
+                                redact_fields(&mut current, schema, &msg);
+                            }
+                        }
                         Ok(msg.ok(Some(
                             Body::from_bytes(current.to_string(), MediaType::json()).with_schema(schema_url),
                         )))

@@ -73,7 +73,7 @@ Trusted = credentialed CORS + cookie lane; allowed = bearer-only. See 5.5.
 | Service | Notable config |
 | --- | --- |
 | `file` | `defaultResource`, `spaFallback`, `listings` (static-site, 4.3); `store: {adapter}` for a loadable backend (8.9) |
-| `data` | `enforceSchema` (4.4); `store: {adapter}` for a loadable backend (8.9) |
+| `data` | `enforceSchema` (4.4); `fieldLevelAuthz` — per-field `x-rs-read`/`x-rs-write` schema rules (4.5); `store: {adapter}` for a loadable backend (8.9) |
 | `pipeline` | `retry`, `store: {root}` (relocate spec storage) (7.1) |
 | `query` | `store: {root}` (6.1); `store: {adapter}` for a loadable backend (8.9) |
 | `auth` | usually just `access`; tenant-level `auth` holds the real settings (5.1) |

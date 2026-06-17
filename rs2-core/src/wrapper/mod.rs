@@ -488,7 +488,9 @@ pub(crate) fn is_operator(principal: Option<&Principal>, operator_roles: &str) -
 }
 
 /// Evaluate a role-spec string against the message's principal and path.
-fn satisfies_role_spec(spec: &str, msg: &Message) -> bool {
+/// Also reused for per-field access rules (`x-rs-read` / `x-rs-write`) in the
+/// data service, where the path-scoped form resolves against the record path.
+pub(crate) fn satisfies_role_spec(spec: &str, msg: &Message) -> bool {
     let principal = msg.principal.as_ref();
     let tokens: Vec<&str> = spec.split_whitespace().collect();
     let mut i = 0;

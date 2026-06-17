@@ -159,6 +159,12 @@ impl Default for FileConfig {
 pub struct DataConfig {
     /// Reject writes that fail the dataset's `.schema.json` (default `false`).
     pub enforce_schema: bool,
+    /// Honor per-field access rules in the dataset schema (`x-rs-read` /
+    /// `x-rs-write` on a property): reads redact fields the caller can't read,
+    /// writes that change a field the caller can't write return a 4xx, and
+    /// editing the schema itself requires an operator (PRD §5.2). Default
+    /// `false`.
+    pub field_level_authz: bool,
     /// Backend selection (`store.adapter`); see [`StoreConfig`].
     pub store: Option<StoreConfig>,
 }

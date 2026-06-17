@@ -354,6 +354,7 @@ impl Tenant {
                 requester: requester.clone(),
                 control: control.clone(),
                 tenant_retry: config.retry.clone(),
+                operator_roles: config.operator_roles.clone(),
                 pipeline_wall_clock: limits.wall_clock_pipeline,
                 logger: crate::logging::ServiceLogger::new(
                     adapters.log.clone(),
