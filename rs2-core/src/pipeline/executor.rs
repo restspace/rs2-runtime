@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::RsError;
-use crate::message::{Body, Message, Source};
+use crate::message::{Body, Message, Principal, Source};
 use crate::retry::{retry_request, EffectClass, RetryPolicy};
 
 use super::condition::Condition;
@@ -77,6 +77,14 @@ pub struct Executor {
     /// Per-step execution report: failures surface the failing step and
     /// per-step statuses in the structured error (PRD §12).
     report: Arc<std::sync::Mutex<Vec<Value>>>,
+    /// Host-seeded variables available to every transform/interpolation from
+    /// the first step (e.g. granted secrets bound as `$<name>`).
+    initial_vars: Map<String, Value>,
+    /// The role an `elevate` step adds to the call's principal (PRD §5.2). It
+    /// comes from the pipeline mount's operator-controlled config, never from
+    /// spec content — so an author can opt a call into elevation but can never
+    /// choose how much authority it gains. `None` ⇒ `elevate` is inert.
+    elevate_role: Option<String>,
 }
 
 /// What a step did with the in-flight message.
@@ -98,7 +106,23 @@ impl Executor {
             retry,
             invocation_id: uuid::Uuid::new_v4().simple().to_string(),
             report: Arc::new(std::sync::Mutex::new(Vec::new())),
+            initial_vars: Map::new(),
+            elevate_role: None,
         }
+    }
+
+    /// Seed host-provided variables (e.g. granted secrets) into every run's
+    /// scope, referenceable as `$<name>` from the first step.
+    pub fn with_vars(mut self, vars: Map<String, Value>) -> Self {
+        self.initial_vars = vars;
+        self
+    }
+
+    /// The role an `elevate` step adds to the call's principal (from the
+    /// pipeline mount's operator-controlled config).
+    pub fn with_elevate_role(mut self, role: Option<String>) -> Self {
+        self.elevate_role = role;
+        self
     }
 
     /// Per-step statuses recorded during the last run (step key paths are
@@ -131,7 +155,7 @@ impl Executor {
                 self.limits.max_steps as u64,
             ));
         }
-        let mut vars = Map::new();
+        let mut vars = self.initial_vars.clone();
         match self.run_pipeline(spec, msg, &mut vars, 0, "", to_step).await? {
             Flow::Continue(m) | Flow::Exit(m) | Flow::Abort(m) => Ok(m),
         }
@@ -483,10 +507,25 @@ impl Executor {
                 Some(body) => body.as_json(self.limits.materialize_cap).await?,
                 None => Value::Null,
             };
+            // The exact request bytes (now materialized by `as_json`), so a
+            // transform can verify a signature over the raw payload — e.g.
+            // `$hmacVerify('sha256', $secret, $_rawBody, $sig)` — before any
+            // later step rewrites the body.
+            let raw_body = match &mut msg.body {
+                Some(body) => body
+                    .materialize(self.limits.materialize_cap)
+                    .await
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                None => None,
+            };
             let mut eval_vars = vars.clone();
             let status = msg.status.map(|s| s.as_u16()).unwrap_or(200);
             eval_vars.insert("_status".into(), Value::from(status));
             eval_vars.insert("_ok".into(), Value::Bool(msg.is_ok()));
+            if let Some(raw) = raw_body {
+                eval_vars.insert("_rawBody".into(), Value::String(raw));
+            }
             let headers: Map<String, Value> = msg
                 .headers
                 .iter()
@@ -569,11 +608,26 @@ impl Executor {
         let tenant = msg.tenant.clone();
         let depth_for_call = msg.depth + 1;
         let trace = msg.trace.clone();
-        // `elevate`: drop the caller principal so this call runs as trusted
-        // internal composition (it can reach a mount the caller's roles can't).
-        // No request auth header is forwarded, so the principal stays unset and
-        // the target's role-spec admits it as a no-principal internal hop.
-        let principal = if step.elevate { None } else { msg.principal.clone() };
+        // `elevate`: *add* the mount's operator-configured role to the call's
+        // principal so it can reach a mount that grants that role — keeping the
+        // caller's identity (audit, `{email}` scoping) intact. An anonymous
+        // caller is given a synthetic principal carrying just the elevate role
+        // (the login-gateway case). The authority is the mount's config, never
+        // spec content; without a configured role, `elevate` is inert.
+        let principal = match (step.elevate, &self.elevate_role) {
+            (true, Some(role)) => {
+                let mut p = msg.principal.clone().unwrap_or_else(|| Principal {
+                    id: String::new(),
+                    roles: Vec::new(),
+                    kind: "agent".into(),
+                });
+                if !p.roles.iter().any(|r| r == role) {
+                    p.roles.push(role.clone());
+                }
+                Some(p)
+            }
+            _ => msg.principal.clone(),
+        };
 
         // Bodies move into the closure: borrowing them across the retry
         // awaits would require `Body: Sync`, which stream payloads are not.

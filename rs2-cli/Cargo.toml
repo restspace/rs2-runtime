@@ -19,3 +19,6 @@ ureq = "2"
 [features]
 # Enables the deployment-time component compile check in `rs2 test`.
 wasm = ["rs2-core/wasm"]
+# Enables the V8 compile check in `rs2 template build` (verifies the bundle
+# loads/evaluates as ESM before writing it).
+js = ["rs2-core/js"]

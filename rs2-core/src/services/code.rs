@@ -210,7 +210,7 @@ impl CodeService {
 
 /// Host of an absolute URL ("https://api.x.com:8443/v1" → "api.x.com").
 #[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
-fn url_host(url: &str) -> Option<String> {
+pub(crate) fn url_host(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#']).next()?;
     let host = authority.rsplit('@').next()?.split(':').next()?;
@@ -223,7 +223,7 @@ fn url_host(url: &str) -> Option<String> {
 
 /// Allowlist matching: exact host or a `*.suffix` wildcard.
 #[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
-fn host_matches(pattern: &str, host: &str) -> bool {
+pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     if let Some(suffix) = pattern.strip_prefix("*.") {
         host == suffix || host.ends_with(&format!(".{suffix}"))

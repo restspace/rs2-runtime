@@ -137,8 +137,8 @@ fn scaffold_js(root: &Path, name: &str) -> Result<(), String> {
         &root.join("service.js"),
         &format!(
             r#"// {name}: an RS2 custom service (JS).
-// NOTE: the RS2 JS engine is not yet shipped; this scaffold targets the
-// published contract so the service is ready when it lands.
+// Runs sandboxed on the RS2 JS engine (servers built with --features js).
+// Single-file ESM; `rs2 deploy --bundle` bundles npm deps with esbuild first.
 
 export default {{
     async handle(msg, ctx) {{
@@ -155,7 +155,7 @@ export default {{
     write(&root.join("manifest.json"), &manifest(name, "js"))?;
     write(
         &root.join("README.md"),
-        &format!("# {name}\n\nAn RS2 custom JS service. The JS engine ships in a later RS2 build; `rs2 deploy` will bundle with esbuild + compat shims.\n"),
+        &format!("# {name}\n\nAn RS2 custom JS service. Runs on the RS2 JS engine (servers built with `--features js`; a non-JS node serves it 501 `engine_unavailable`). `rs2 deploy --bundle` bundles with esbuild + compat shims.\n"),
     )?;
     Ok(())
 }

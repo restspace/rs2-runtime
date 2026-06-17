@@ -1,5 +1,7 @@
 /target
 /data
+/logs
+/data-store
 conformance/echo-guest/target
 conformance/echo-guest/Cargo.lock
 bash.exe.stackdump

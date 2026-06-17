@@ -90,14 +90,15 @@ pub struct Step {
     /// Convert a failure into `{ _errorStatus, _errorMessage }` and continue.
     #[serde(rename = "try", skip_serializing_if = "std::ops::Not::not")]
     pub try_mode: bool,
-    /// Run the step's call as **trusted internal composition**: the caller
-    /// principal is dropped, so the call is authorized as an unattributed
-    /// internal hop and can reach a mount the caller's roles could not (the
-    /// gateway pattern — lock a service to e.g. `writeRoles: "A"` and front it
-    /// with a caller-accessible pipeline that elevates). The target must admit
-    /// internal access (a role-spec mount admits no-principal internal calls).
-    /// Applies to `call` steps; default off. The authoring surface is
-    /// `manageRoles`-gated, so only privileged authors can create elevations.
+    /// **Add the pipeline mount's `elevate` role** to this call's principal so
+    /// it can reach a mount the caller's own roles could not (the gateway
+    /// pattern — lock a service to e.g. `read: "svc"` and front it with a
+    /// caller-accessible pipeline whose mount sets `"elevate": "svc"`). The
+    /// caller's identity is preserved (an anonymous caller is given a synthetic
+    /// principal carrying just the role — the login gateway). The authority is
+    /// the mount's operator-controlled config, never this flag: without a
+    /// configured `elevate` role the flag is inert. Applies to `call` steps;
+    /// default off.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub elevate: bool,
     /// `as: "$name"` captures the step result into a variable; the in-flight

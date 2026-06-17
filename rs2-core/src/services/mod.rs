@@ -4,6 +4,7 @@
 //! custom services identically.
 
 pub mod auth;
+pub mod catalogue;
 pub mod code;
 mod data;
 mod file;
@@ -13,6 +14,8 @@ mod query;
 pub mod query_template;
 mod services_config;
 pub mod spec_store;
+#[cfg(feature = "js")]
+mod template;
 
 pub use auth::AuthService;
 pub use code::CodeService;
@@ -22,6 +25,8 @@ pub use log_reader::LogReaderService;
 pub use pipeline_service::{PipelineService, PIPELINE_PREFIX, PIPELINE_SUBTREE};
 pub use query::{QueryService, QUERY_PREFIX, QUERY_SUBTREE};
 pub use services_config::ServicesService;
+#[cfg(feature = "js")]
+pub use template::{TemplateService, TEMPLATE_PREFIX, TEMPLATE_SUBTREE};
 
 use std::sync::Arc;
 
@@ -62,6 +67,18 @@ pub struct ServiceContext {
     /// Log read-back capability — granted only to `log` reader mounts
     /// (`None` elsewhere). Reading logs back is sensitive; writing is not.
     pub log_store: Option<Arc<dyn crate::logging::LogStore>>,
+    /// External-catalogue fetch capability — granted only to the `services`
+    /// self-config mount (`None` elsewhere). Bounded by the operator
+    /// host-allowlist; `None` also when no allowlist is configured.
+    pub catalogue: Option<Arc<dyn catalogue::CatalogueClient>>,
+    /// Snapshot of the node's built-in adapter registry — granted only to the
+    /// `services` mount, so it can list selectable built-in adapters.
+    pub builtin_adapters: Option<crate::adapters::BuiltinRegistry>,
+    /// Tenant secrets this mount is granted (resolved from the mount's `secrets`
+    /// grant against the tenant `secrets` block; default-deny). Host-side only —
+    /// never exposed to sandboxed guests. The `pipeline` service binds these as
+    /// `$<name>` variables for inline `$hmacVerify`.
+    pub secrets: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A unit of behavior handling messages at a mount: Message → Message.

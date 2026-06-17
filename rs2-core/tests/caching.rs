@@ -46,7 +46,7 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
                 "caching": { "mode": "revalidate" } } },
             // public requested on an authenticated mount: must clamp.
             { "path": "/private", "service": "file", "config": {
-                "access": { "readRoles": "U", "writeRoles": "A" },
+                "access": { "read": "U", "write": "A" },
                 "caching": { "mode": "cache", "maxAgeSeconds": 600, "public": true } } },
             // Caching config on the auth mount must not leak onto cookies.
             { "path": "/auth", "service": "auth", "config": {

@@ -46,6 +46,8 @@ wasmtime = { version = "37", optional = true }
 wasmtime-wasi = { version = "37", optional = true }
 
 [dev-dependencies]
+hmac = "0.12"
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

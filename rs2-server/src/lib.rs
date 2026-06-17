@@ -34,12 +34,39 @@ struct ServerConfig {
     /// Root directory for the local-fs file store adapter.
     #[serde(default = "default_file_root")]
     file_root: String,
+    /// Root directory for the file-backed `data` adapter (`builtin:file`),
+    /// kept separate from `fileRoot` so records (which may hold secrets like
+    /// password hashes) are never browsable through a `file` mount.
+    #[serde(default = "default_data_root")]
+    data_root: String,
     /// Directory holding `<tenant>.json` tenant configs.
     #[serde(default = "default_tenants_dir")]
     tenants_dir: String,
     /// Logging (PRD §14): where logs physically go is operator config.
     #[serde(default)]
     logging: LoggingConfig,
+    /// Operator allowlist of catalogue/bundle hosts the host may fetch from
+    /// (wildcard `*.suffix` patterns). Empty ⇒ external catalogues are off,
+    /// regardless of what tenants register. Bounds SSRF.
+    #[serde(default)]
+    catalogue_hosts: Vec<String>,
+    /// Optional admin seeded at startup so a locked-down `services` mount has
+    /// an `A`-role principal to manage it (single-tenant). The env vars
+    /// `RS2_ADMIN_EMAIL`/`RS2_ADMIN_PASSWORD` override these on-disk values.
+    #[serde(default)]
+    bootstrap_admin: Option<BootstrapAdmin>,
+}
+
+/// Bootstrap admin credentials (PRD §10.5). Env vars
+/// `RS2_ADMIN_EMAIL`/`RS2_ADMIN_PASSWORD` take precedence over these; prefer
+/// env for the password so it never lands in the config file at rest.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapAdmin {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// Node logging configuration. Absent ⇒ file sink at `./logs`, Info floor.
@@ -88,6 +115,9 @@ fn default_listen() -> String {
 }
 fn default_file_root() -> String {
     "./data".to_string()
+}
+fn default_data_root() -> String {
+    "./data-store".to_string()
 }
 fn default_tenants_dir() -> String {
     "./tenants".to_string()
@@ -152,6 +182,29 @@ impl ConfigLoader for FileConfigLoader {
             .map_err(|_| RsError::not_found(format!("unknown tenant '{tenant}'")))?;
         serde_json::from_str(&text)
             .map_err(|e| RsError::internal(format!("tenant config for '{tenant}' is invalid: {e}")))
+    }
+
+    /// Enumerate `<dir>/<tenant>.json` files (skip write-then-rename temps) so
+    /// the scheduler can discover all tenants of this node.
+    async fn list_tenants(&self) -> Result<Vec<String>, RsError> {
+        let mut out = Vec::new();
+        let mut rd = match tokio::fs::read_dir(&self.dir).await {
+            Ok(rd) => rd,
+            Err(_) => return Ok(out),
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".json.tmp") {
+                continue;
+            }
+            if let Some(stem) = name.strip_suffix(".json") {
+                if !stem.is_empty() {
+                    out.push(stem.to_string());
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn load_raw(&self, tenant: &str) -> Result<(serde_json::Value, String), RsError> {
@@ -301,6 +354,97 @@ async fn serve_request(runtime: Arc<Runtime>, req: hyper::Request<Incoming>) -> 
     resp
 }
 
+/// Seed a single bootstrap admin into the tenant's user dataset at startup
+/// (PRD §10.5/§10.6), breaking the config-plane chicken-and-egg: a locked
+/// `services` mount needs an `A`-role principal, which needs a user record,
+/// which a locked `data` mount won't accept over the wire. We write it
+/// straight through the data adapter instead.
+///
+/// Credentials resolve env-first (`RS2_ADMIN_EMAIL`/`RS2_ADMIN_PASSWORD`),
+/// then the `bootstrapAdmin` config block; both absent ⇒ no-op (opt-in).
+/// Written through the node's default data store — the same store `auth` reads
+/// `userDataset` from — so with the file-backed default the admin (and any
+/// runtime change to it) persists across restarts. Seeds only when the record
+/// is absent, so a rotated password is never clobbered. Single-tenant only —
+/// `run` doesn't enumerate tenants in multi-tenant mode, where each tenant's
+/// admin is seeded out of band.
+async fn seed_bootstrap_admin(
+    tenancy: &Tenancy,
+    bootstrap: Option<&BootstrapAdmin>,
+    loader: &FileConfigLoader,
+    data: &Arc<dyn rs2_core::capabilities::DataStore>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Env wins over config; an empty value counts as unset.
+    fn resolve(env: &str, configured: Option<&String>) -> Option<String> {
+        std::env::var(env)
+            .ok()
+            .or_else(|| configured.cloned())
+            .filter(|s| !s.is_empty())
+    }
+    let email = resolve("RS2_ADMIN_EMAIL", bootstrap.and_then(|b| b.email.as_ref()));
+    let password = resolve("RS2_ADMIN_PASSWORD", bootstrap.and_then(|b| b.password.as_ref()));
+
+    let (email, password) = match (email, password) {
+        (None, None) => return Ok(()), // opted out
+        (Some(email), Some(password)) => (email, password),
+        _ => {
+            return Err("bootstrap admin: set both an email and a password \
+                        (RS2_ADMIN_EMAIL/RS2_ADMIN_PASSWORD or the bootstrapAdmin config block), \
+                        or neither"
+                .into())
+        }
+    };
+
+    let tenant = match tenancy {
+        Tenancy::Single { tenant } => tenant.clone(),
+        Tenancy::Multi { .. } => {
+            eprintln!(
+                "bootstrapAdmin is ignored in multi-tenant mode; seed each tenant's admin out of band"
+            );
+            return Ok(());
+        }
+    };
+
+    // The auth service mints tokens from the user record's roles; with no
+    // jwtSecret it can't, so seeding would be pointless. Fail loudly.
+    let (raw, _) = loader
+        .load_raw(&tenant)
+        .await
+        .map_err(|e| format!("bootstrap admin: cannot load tenant '{tenant}' config: {e}"))?;
+    let auth = raw.get("auth");
+    let jwt_present = auth
+        .and_then(|a| a.get("jwtSecret"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if !jwt_present {
+        return Err(format!(
+            "bootstrap admin set but tenant '{tenant}' has no auth.jwtSecret — \
+             login can't mint tokens; add one before seeding"
+        )
+        .into());
+    }
+    let dataset = auth
+        .and_then(|a| a.get("userDataset"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("users")
+        .to_string();
+
+    // Seed-if-absent: never overwrite an existing record.
+    if data.get(&tenant, &dataset, &email).await.is_ok() {
+        println!("bootstrap admin '{email}' already present in '{dataset}'; leaving as-is");
+        return Ok(());
+    }
+    let record = serde_json::json!({
+        "passwordHash": rs2_core::services::auth::hash_password(&password)?,
+        "roles": "A",
+        "kind": "user",
+    });
+    data.put(&tenant, &dataset, &email, record).await?;
+    println!("seeded bootstrap admin '{email}' (role A) into dataset '{dataset}' of tenant '{tenant}'");
+    Ok(())
+}
+
 /// Run the server from a config file path. Also the `rs2 dev` entry point.
 pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_text = std::fs::read_to_string(config_path)
@@ -325,15 +469,44 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         )),
     };
 
-    let adapters = Adapters::new(
+    // The node's default data store is file-backed (durable) over `dataRoot`,
+    // kept separate from the file store's `fileRoot` so records — which can
+    // hold secrets like password hashes — are never browsable through a `file`
+    // mount. Seeded users and runtime writes therefore survive restarts.
+    // `builtin:file` selects the same backend explicitly; `builtin:mem` remains
+    // available for ephemeral data.
+    let data_fs: Arc<dyn rs2_core::capabilities::FileStore> =
+        Arc::new(rs2_core::adapters::LocalFsFileStore::new(&config.data_root));
+    let mut adapters = Adapters::new(
         Arc::new(rs2_core::adapters::LocalFsFileStore::new(&config.file_root)),
-        Arc::new(rs2_core::adapters::MemDataStore::new()),
+        Arc::new(rs2_core::adapters::FileDataStore::new(data_fs.clone())),
     )
     // Outbound HTTP: granted per mount via `httpOut` allowlists (PRD §9.2).
     .with_http(Arc::new(rs2_core::adapters::UreqHttpOut::new()))
-    .with_logging(log_store, log_level);
+    .with_logging(log_store, log_level)
+    // External-catalogue fetching, bounded by the operator host allowlist.
+    .with_catalogue(config.catalogue_hosts.clone());
+    {
+        let data_fs = data_fs.clone();
+        adapters.builtins.register_data(
+            "file",
+            Arc::new(move |_cfg| {
+                Ok(Arc::new(rs2_core::adapters::FileDataStore::new(data_fs.clone()))
+                    as Arc<dyn rs2_core::capabilities::DataStore>)
+            }),
+        );
+    }
     let loader = Arc::new(FileConfigLoader { dir: PathBuf::from(&config.tenants_dir) });
+
+    // Seed the bootstrap admin (single-tenant) before serving, so a locked
+    // `services` mount always has an `A`-role principal to manage it.
+    seed_bootstrap_admin(&tenancy, config.bootstrap_admin.as_ref(), &loader, &adapters.data).await?;
+
     let runtime = Runtime::new(tenancy, adapters, loader, LimitTable::default());
+
+    // Host scheduler (G1): fires mounts that declare a `schedule`. No-op when
+    // none do; single-node by default (swap a shared `ScheduleStore` for HA).
+    runtime.spawn_scheduler();
 
     let addr: SocketAddr = config.listen.parse()?;
     let listener = TcpListener::bind(addr).await?;

@@ -62,15 +62,19 @@ pub enum AccessShorthand {
     Authenticated,
 }
 
-/// Space-separated role-spec strings per verb class. A token may be followed
-/// by a path pattern (`"U /user/{email}"`) scoping that role.
+/// Space-separated role-spec strings per action. A token may be followed
+/// by a path pattern (`"U /user/{email}"`) scoping that role. Actions map to
+/// HTTP methods (PRD §5.2): `read` = GET/HEAD/OPTIONS, `write` = PUT/PATCH,
+/// `delete` = DELETE, `invoke` = POST (and other non-idempotent verbs).
+/// `delete` and `invoke` default to `write`; `read` defaults to `"all"`,
+/// `write` to `"A"`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct RoleAccess {
-    pub read_roles: Option<String>,
-    pub write_roles: Option<String>,
-    pub create_roles: Option<String>,
-    pub manage_roles: Option<String>,
+    pub read: Option<String>,
+    pub write: Option<String>,
+    pub delete: Option<String>,
+    pub invoke: Option<String>,
 }
 
 /// The common mount-config envelope every service shares (the `baseSchema`).
@@ -84,6 +88,35 @@ pub struct MountBaseConfig {
     pub caching: Option<CachePolicy>,
     /// Mount-level retry override in the resolution chain (PRD §7.3).
     pub retry: Option<RetryPolicy>,
+    /// Periodic host-driven invocation: the runtime fires a synthetic internal
+    /// `POST` (header `x-rs2-trigger: schedule`) at this mount on cadence.
+    pub schedule: Option<ScheduleConfig>,
+    /// Names of tenant `secrets` this mount may use (default-deny). A `pipeline`
+    /// mount binds each as a `$<name>` variable for inline HMAC verification
+    /// (`$hmacVerify`); the secret value is never exposed on `GET /raw`.
+    pub secrets: Option<Vec<String>>,
+}
+
+/// A mount schedule: exactly one of `every` (interval) or `cron` (5-field, UTC).
+/// The "exactly one" rule is enforced when parsed (`scheduler::Schedule`), so a
+/// bad value is a 400 at `PUT /raw`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ScheduleConfig {
+    /// Fixed interval, e.g. `"500ms"`, `"30s"`, `"5m"`, `"2h"`.
+    pub every: Option<String>,
+    /// 5-field cron (minute hour day-of-month month day-of-week), UTC,
+    /// e.g. `"0 9 * * *"`.
+    pub cron: Option<String>,
+}
+
+/// A registered external catalogue: a name and the URL serving its document.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogueRef {
+    pub name: String,
+    /// Absolute http(s) URL serving the catalogue document.
+    pub url: String,
 }
 
 /// Top-level tenant settings outside the mount list (the `tenantSchema`).
@@ -93,6 +126,8 @@ pub struct TenantSettings {
     pub auth: Option<AuthSettings>,
     pub cors: Option<CorsPolicy>,
     pub retry: Option<RetryPolicy>,
+    /// External catalogues to browse/install services and adapters from.
+    pub catalogues: Option<Vec<CatalogueRef>>,
 }
 
 // ---- per-service config -------------------------------------------------
@@ -108,11 +143,13 @@ pub struct FileConfig {
     pub spa_fallback: bool,
     /// Whether directory GETs return `dir+json` listings (default `true`).
     pub listings: bool,
+    /// Backend selection (`store.adapter`); see [`StoreConfig`].
+    pub store: Option<StoreConfig>,
 }
 
 impl Default for FileConfig {
     fn default() -> Self {
-        FileConfig { default_resource: None, spa_fallback: false, listings: true }
+        FileConfig { default_resource: None, spa_fallback: false, listings: true, store: None }
     }
 }
 
@@ -122,14 +159,21 @@ impl Default for FileConfig {
 pub struct DataConfig {
     /// Reject writes that fail the dataset's `.schema.json` (default `false`).
     pub enforce_schema: bool,
+    /// Backend selection (`store.adapter`); see [`StoreConfig`].
+    pub store: Option<StoreConfig>,
 }
 
-/// Storage-root override shared by spec stores.
+/// Storage-root override shared by spec stores, plus per-mount backend
+/// selection.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StoreConfig {
     /// Storage root; defaults to `.rs2-<kind><mount>`.
     pub root: Option<String>,
+    /// Backend selection: `builtin:<name>` for a built-in Rust adapter (e.g.
+    /// `builtin:mem`) or `code:<name>@<version>` for a deployed JS loadable
+    /// adapter. Absent ⇒ the node default for this service kind.
+    pub adapter: Option<String>,
 }
 
 /// `pipeline` service config (beyond the base envelope).
@@ -144,6 +188,13 @@ pub struct PipelineConfig {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct QueryConfig {
+    pub store: Option<StoreConfig>,
+}
+
+/// `template` service config (beyond the base envelope).
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TemplateConfig {
     pub store: Option<StoreConfig>,
 }
 
@@ -172,6 +223,9 @@ pub fn catalogue() -> Value {
             { "name": "query",
               "description": "Stored parameterized queries (PRD §10.4): PUT envelopes {language?, query, params?, output?} to /<mount>/.queries/<name>; any verb elsewhere executes the longest-prefix match",
               "configSchema": schema_of::<QueryConfig>() },
+            { "name": "template",
+              "description": "JSX templates rendered to HTML: PUT compiled bundles (from `rs2 template build`) to /<mount>/.templates/<name> (.root governs the mount root); any verb elsewhere renders the longest-prefix match with the request body as props",
+              "configSchema": schema_of::<TemplateConfig>() },
             { "name": "auth",
               "description": "Authentication & RBAC (PRD §10.5)",
               "configSchema": schema_of::<AuthSettings>() },
@@ -219,10 +273,14 @@ mod tests {
         let base = jsonschema::validator_for(&base_schema).unwrap();
         assert!(base.is_valid(&serde_json::json!({ "access": "open" })));
         assert!(base.is_valid(&serde_json::json!({
-            "access": { "readRoles": "all", "writeRoles": "A" }
+            "access": { "read": "all", "write": "A", "delete": "A" }
         })));
+        // Stale v1 keys (and any typo) fail loudly rather than silently
+        // deserializing to an all-`None` (open) role object.
+        assert!(!base.is_valid(&serde_json::json!({ "access": { "readRoles": "all" } })));
+        assert!(!base.is_valid(&serde_json::json!({ "access": { "manageRoles": "A" } })));
         serde_json::from_value::<MountBaseConfig>(
-            serde_json::json!({ "access": { "writeRoles": "A E" }, "caching": { "mode": "cache", "maxAgeSeconds": 60 } }),
+            serde_json::json!({ "access": { "write": "A E", "invoke": "A" }, "caching": { "mode": "cache", "maxAgeSeconds": 60 } }),
         )
         .expect("envelope deserializes");
     }

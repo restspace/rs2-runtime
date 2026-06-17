@@ -16,7 +16,6 @@ use crate::error::RsError;
 use crate::message::Message;
 use crate::router::Mount;
 use crate::tenant::Tenant;
-use crate::wrapper::check_access;
 
 pub const WELL_KNOWN_PREFIX: &str = "/.well-known/rs2/";
 
@@ -91,7 +90,13 @@ fn readable_mounts<'t>(tenant: &'t Tenant, msg: &Message) -> Vec<&'t Mount> {
             let mut probe = Message::request(http::Method::GET, &m.base_path, &msg.tenant);
             probe.principal = msg.principal.clone();
             probe.source = msg.source;
-            check_access(&probe, &m.config).is_ok()
+            // Filter on mount-level read access. For pipeline mounts the host
+            // defers execution authz to the service (per-spec), but that is too
+            // granular to advertise — discovery uses the mount's own `access`.
+            match m.config.get("access") {
+                None => true,
+                Some(access) => crate::wrapper::check_role_spec(access, "read", &probe).is_ok(),
+            }
         })
         .collect()
 }
@@ -116,7 +121,69 @@ fn meta(mount: &Mount) -> Map<String, Value> {
             out.insert(key.to_string(), v.clone());
         }
     }
+    // Surface the selected storage backend so a client can tell a `builtin:`
+    // or `code:` adapter from the node default without reading the raw config.
+    if let Some(adapter) =
+        mount.config.get("store").and_then(|s| s.get("adapter")).filter(|a| a.is_string())
+    {
+        out.insert("adapter".to_string(), adapter.clone());
+    }
+    // Spec stores author their specs under a reserved subtree; advertise it so a
+    // generic client learns the authoring root without special-casing names.
+    if let Some(subtree) = spec_subtree_of(mount) {
+        out.insert("specSubtree".to_string(), json!(subtree));
+    }
+    // How a generic client should author this store's specs (beyond plain JSON).
+    // Feature-detected; omitted for stores with no special authoring.
+    if let Some(authoring) = authoring_of(mount) {
+        out.insert("authoring".to_string(), authoring);
+    }
     out
+}
+
+/// The reserved authoring subtree of a spec-store mount (`.queries`/
+/// `.pipelines`/`.templates`), or `None` for non-spec stores. Reuses the
+/// service constants; `TEMPLATE_SUBTREE` is `js`-gated, so the template arm
+/// falls back to the literal on a non-`js` build (where a template mount can't
+/// be built anyway).
+fn spec_subtree_of(mount: &Mount) -> Option<&'static str> {
+    match mount.service.as_str() {
+        "query" => Some(crate::services::QUERY_SUBTREE),
+        "pipeline" => Some(crate::services::PIPELINE_SUBTREE),
+        #[cfg(feature = "js")]
+        "template" => Some(crate::services::TEMPLATE_SUBTREE),
+        #[cfg(not(feature = "js"))]
+        "template" => Some(".templates"),
+        _ => None,
+    }
+}
+
+/// How a generic client should author this store's specs, beyond plain JSON
+/// editing — `None` when there's nothing special (query/pipeline edit JSON
+/// directly). Feature-detected, no service-name special-casing by the client.
+/// The `template` descriptor is `js`-gated, exactly like the template mount
+/// (which can't be built without the JS engine), so it's omitted on a non-`js`
+/// build rather than advertised for a store that can't exist.
+fn authoring_of(mount: &Mount) -> Option<Value> {
+    match mount.service.as_str() {
+        // The envelope validator passes `x-…` fields through untouched, so a UI
+        // round-trips the author's concise notation in `x-source` and the
+        // canonicalized spec lives in `pipeline`. No JS engine needed.
+        "pipeline" => Some(json!({
+            "kind": "pipeline-dsl",
+            "compiledField": "pipeline",
+            "sourceField": "x-source",
+        })),
+        #[cfg(feature = "js")]
+        "template" => Some(json!({
+            "kind": "jsx",
+            "framework": "preact",
+            "compiledField": "source",
+            "sourceField": "jsxSource",
+            "render": "html",
+        })),
+        _ => None,
+    }
 }
 
 /// API pattern + facets (the polymorphism contract, carried over from
@@ -137,6 +204,9 @@ fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
         "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
         "pipeline" => ("store-transform", vec!["any-verb"]),
         "query" => ("store-view", vec!["positional-params", "url-params", "any-verb"]),
+        "template" => {
+            ("store-view", vec!["positional-params", "url-params", "json-props", "any-verb"])
+        }
         "log" => ("view", vec!["url-params", "time-range", "trace-scoped"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
@@ -220,6 +290,9 @@ fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
             "path": if base.is_empty() { "/" } else { base },
             "config": format!("{base}/raw"),
             "catalogue": format!("{base}/catalogue"),
+            "catalogues": format!("{base}/catalogues"),
+            "available": format!("{base}/catalogue/available"),
+            "install": format!("{base}/catalogue/install"),
             "mounts": format!("{base}/services"),
             "code": format!("{base}/code/"),
         })

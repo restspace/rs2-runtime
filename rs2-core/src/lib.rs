@@ -34,6 +34,7 @@ pub mod pipeline;
 pub mod retry;
 pub mod router;
 pub mod runtime;
+pub mod scheduler;
 pub mod services;
 pub mod tenant;
 pub mod wrapper;

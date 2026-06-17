@@ -8,12 +8,21 @@ use super::body::Body;
 use super::media_type::PROBLEM_JSON;
 use crate::error::RsError;
 
-/// Where a message entered the runtime. Internal calls skip external-only
-/// concerns (CORS) but not authz, idempotency, or limits (PRD §5.2).
+/// Where a message entered the runtime. Non-external calls skip external-only
+/// concerns (CORS) but not idempotency or limits (PRD §5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
+    /// Inbound from the wire — the only source that can carry forged headers,
+    /// so external-only guards (CORS) apply.
     External,
+    /// Internal **composition** — a pipeline step, a granted capability call, a
+    /// guest `fetch`. Authorized by the principal it carries (which propagates
+    /// from the original caller); it is **not** inherently trusted.
     Internal,
+    /// Runtime-originated **system** call (e.g. a scheduler tick fired per the
+    /// mount's operator-configured `schedule`). Trusted: it cannot be forged
+    /// from the wire and exists only because an operator configured it.
+    System,
 }
 
 /// W3C-style trace context threaded through every internal/external call.

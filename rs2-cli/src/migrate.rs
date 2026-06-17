@@ -49,12 +49,19 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
 
         let mut config = serde_json::Map::new();
 
-        // Access roles: the role-spec string grammar carries over directly.
+        // Access roles: the role-spec string grammar carries over, but the
+        // v1 method-keyed buckets map onto the v2 action vocabulary —
+        // readRoles→read, writeRoles→write, createRoles→invoke (POST is the
+        // action verb). v1 had no separate delete (writeRoles covered DELETE);
+        // it now default-chains to `write`. manageRoles is dropped (it was a v1
+        // UI-visibility flag, not an auth concept).
         if let Some(access) = svc.get("access").and_then(|a| a.as_object()) {
             let mut out = serde_json::Map::new();
-            for key in ["readRoles", "writeRoles", "createRoles", "manageRoles"] {
-                if let Some(v) = access.get(key) {
-                    out.insert(key.to_string(), v.clone());
+            for (v1_key, v2_key) in
+                [("readRoles", "read"), ("writeRoles", "write"), ("createRoles", "invoke")]
+            {
+                if let Some(v) = access.get(v1_key) {
+                    out.insert(v2_key.to_string(), v.clone());
                 }
             }
             if !out.is_empty() {

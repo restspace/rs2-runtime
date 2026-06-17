@@ -60,6 +60,11 @@ enum Command {
         #[arg(long)]
         bundle: bool,
     },
+    /// Build a JSX template into a deployable bundle envelope.
+    Template {
+        #[command(subcommand)]
+        action: TemplateCommand,
+    },
     /// Convert a Restspace `services.json` to an RS2 tenant config.
     Migrate {
         /// Path to the Restspace services.json.
@@ -67,6 +72,20 @@ enum Command {
         /// Output path for the RS2 tenant config.
         #[arg(short, long, default_value = "tenant.json")]
         output: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    /// Bundle a JSX entry (Preact) into a template envelope. The entry's
+    /// default export is the component; the output is `{ "source": "…" }` to
+    /// PUT to a template mount's `/<mount>/.templates/<name>`.
+    Build {
+        /// Path to the .jsx/.tsx entry whose default export is the component.
+        entry: String,
+        /// Output path (defaults to <entry-stem>.template.json).
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -83,6 +102,9 @@ fn main() {
             (if bundle { esbuild(&component) } else { Ok(component) })
                 .and_then(|artifact| deploy(&artifact, &name, &server, token.as_deref()))
         }
+        Command::Template { action } => match action {
+            TemplateCommand::Build { entry, out } => template_build(&entry, out.as_deref()),
+        },
         Command::Migrate { input, output } => migrate::migrate(&input, &output),
     };
     if let Err(e) = result {
@@ -187,6 +209,115 @@ fn esbuild(entry: &str) -> Result<String, String> {
         .map_err(|e| format!("cannot run npx esbuild (is Node.js installed?): {e}"))?;
     if !status.success() {
         return Err("esbuild failed (see its output above)".to_string());
+    }
+    println!("bundled {entry} → {out_str}");
+    Ok(out_str)
+}
+
+/// Build a JSX template into a deployable bundle envelope (`rs2 template
+/// build`). The entry's default export is a Preact component; this wraps it in
+/// the render harness, bundles with esbuild (JSX → single-file ESM, Preact +
+/// `preact-render-to-string` inlined), verifies it loads in the engine (with
+/// `--features js`), and writes `{ "source": "<bundle>" }` — bundle, check, and
+/// write in one operation. PUT that file to `/<mount>/.templates/<name>`.
+fn template_build(entry: &str, out: Option<&str>) -> Result<(), String> {
+    let entry_path = std::path::Path::new(entry);
+    if !entry_path.exists() {
+        return Err(format!("template entry '{entry}' does not exist"));
+    }
+    let dir = entry_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let file_name = entry_path
+        .file_name()
+        .ok_or_else(|| format!("invalid entry path '{entry}'"))?
+        .to_string_lossy()
+        .into_owned();
+
+    // The render harness: import the user's default-exported component and
+    // render it to HTML with the request body as props. Written next to the
+    // entry so esbuild resolves both the relative import and the project's
+    // node_modules (Preact). The harness uses `h(...)` directly (no JSX), so
+    // the user's component is the only JSX, transpiled via the automatic
+    // runtime against the bundled Preact.
+    let harness = String::from(
+        "import { h } from \"preact\";\n\
+         import { renderToString } from \"preact-render-to-string\";\n",
+    ) + &format!("import Template from \"./{file_name}\";\n")
+        + "export default async (msg) => {\n\
+         \x20 const props = (msg && msg.body) || {};\n\
+         \x20 const html = renderToString(h(Template, props));\n\
+         \x20 return { status: 200, headers: { \"content-type\": \"text/html; charset=utf-8\" }, body: \"<!doctype html>\" + html };\n\
+         };\n";
+    let harness_path = dir.join(format!(".rs2-template-harness-{}.jsx", std::process::id()));
+    std::fs::write(&harness_path, harness)
+        .map_err(|e| format!("cannot write build harness: {e}"))?;
+
+    let bundled = esbuild_jsx(&harness_path.to_string_lossy());
+    let _ = std::fs::remove_file(&harness_path);
+    let bundle_path = bundled?;
+
+    let source = std::fs::read_to_string(&bundle_path)
+        .map_err(|e| format!("cannot read bundled template: {e}"))?;
+
+    // Verify the bundle loads/evaluates as ESM in the engine before writing it.
+    // esbuild already caught transpile/resolve errors; this catches a bundle
+    // that parses but fails at module evaluation (the same smoke test the
+    // server runs on deploy). Opt-in via `--features js`, like the wasm check.
+    #[cfg(feature = "js")]
+    {
+        rs2_core::engines::js::JsEngine::new()
+            .compile_check(&source)
+            .map_err(|e| format!("template bundle failed the engine compile check: {e}"))?;
+        println!("compile check passed");
+    }
+    #[cfg(not(feature = "js"))]
+    println!("note: built without --features js; skipping engine compile check");
+
+    let envelope = serde_json::json!({ "source": source });
+
+    let out_path = out.map(String::from).unwrap_or_else(|| {
+        let stem = entry_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "template".to_string());
+        dir.join(format!("{stem}.template.json")).to_string_lossy().into_owned()
+    });
+    std::fs::write(&out_path, serde_json::to_string(&envelope).unwrap())
+        .map_err(|e| format!("cannot write {out_path}: {e}"))?;
+    println!("built template {entry} → {out_path}  (PUT it to /<mount>/.templates/<name>)");
+    Ok(())
+}
+
+/// Bundle a JSX entry with esbuild for the template service: same single-file
+/// ESM target as [`esbuild`], plus the automatic JSX runtime resolved against
+/// `preact` (so output has no imports for the sandbox's `NoopModuleLoader`).
+fn esbuild_jsx(entry: &str) -> Result<String, String> {
+    let out = std::env::temp_dir().join("rs2-template-bundle.js");
+    let out_str = out.to_string_lossy().into_owned();
+    let npx = if cfg!(windows) { "npx.cmd" } else { "npx" };
+    let status = std::process::Command::new(npx)
+        .args([
+            "--yes",
+            "esbuild",
+            entry,
+            "--bundle",
+            "--format=esm",
+            "--platform=browser",
+            "--target=es2022",
+            "--jsx=automatic",
+            "--jsx-import-source=preact",
+            "--define:process.env.NODE_ENV=\"production\"",
+            &format!("--outfile={out_str}"),
+        ])
+        .status()
+        .map_err(|e| format!("cannot run npx esbuild (is Node.js installed?): {e}"))?;
+    if !status.success() {
+        return Err("esbuild failed (see its output above) — are `preact` and \
+                    `preact-render-to-string` installed? (npm i preact preact-render-to-string)"
+            .to_string());
     }
     println!("bundled {entry} → {out_str}");
     Ok(out_str)

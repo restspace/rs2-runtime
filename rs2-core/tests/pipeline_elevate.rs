@@ -1,9 +1,12 @@
-//! Pipeline `elevate` (the v1 gateway pattern): a service can be locked so a
-//! caller's roles can't reach it directly, yet a caller-accessible pipeline
-//! that elevates a step reaches it on the caller's behalf. Elevation drops the
-//! forwarded principal so the internal call is authorized as a no-principal
-//! trusted-internal hop; without it the caller's principal is forwarded and
-//! re-checked at the target (the safe default).
+//! Pipeline `elevate` (the gateway pattern, PRD §5.2): a service can be locked
+//! so a caller's roles can't reach it directly, yet a caller-accessible
+//! pipeline whose mount is configured with an `elevate` role reaches it on the
+//! caller's behalf. Elevation **adds** the mount's operator-configured role to
+//! the call's principal (synthesizing an anonymous principal carrying just that
+//! role when the caller is unauthenticated — the login gateway), keeping the
+//! caller's identity intact. The authority is the mount config, never the spec;
+//! without `elevate` the caller's principal is forwarded and re-checked at the
+//! target (the safe default).
 
 use std::sync::Arc;
 
@@ -54,12 +57,16 @@ async fn elevate_lets_a_pipeline_front_a_locked_service() {
         Arc::new(MemDataStore::new()),
     );
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
-        // Locked to admins for both read and write.
+        // Read needs the dedicated `svc` role; admins seed it.
         { "path": "/secret", "service": "data",
-          "config": { "access": { "readRoles": "A", "writeRoles": "A" } } },
-        // Two pipeline fronts: one elevates, one doesn't.
-        { "path": "/gate", "service": "pipeline" },
-        { "path": "/plain", "service": "pipeline" }
+          "config": { "access": { "read": "svc", "write": "A" } } },
+        // `/gate` adds `svc` on elevated steps (operator-configured); execution
+        // is open, authoring is admin-only.
+        { "path": "/gate", "service": "pipeline",
+          "config": { "elevate": "svc", "access": { "invoke": "all", "write": "A" } } },
+        // `/plain` has no elevate role; the caller's principal is forwarded.
+        { "path": "/plain", "service": "pipeline",
+          "config": { "access": { "invoke": "all", "write": "A" } } }
     ]})));
     let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
 
@@ -79,18 +86,62 @@ async fn elevate_lets_a_pipeline_front_a_locked_service() {
     assert_eq!(
         rt.handle(as_role(req(Method::GET, "/secret/things/x"), "U")).await.status,
         Some(StatusCode::FORBIDDEN),
-        "direct access by a non-admin is forbidden"
+        "direct access without the `svc` role is forbidden"
     );
 
-    // …but reaches it through the elevating pipeline.
+    // …but reaches it through the elevating pipeline: the U principal gains
+    // `svc` for the inner call (its `U` identity is kept).
     let mut resp = rt.handle(as_role(req(Method::GET, "/gate"), "U")).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "elevating pipeline reaches it: {:?}", resp.body);
     assert_eq!(body_json(&mut resp).await["v"], 1, "and returns the record");
+
+    // The login-gateway case: even an anonymous caller is given a synthetic
+    // principal carrying `svc`, so the gate reaches the locked service.
+    let mut anon = rt.handle(req(Method::GET, "/gate")).await;
+    assert_eq!(anon.status, Some(StatusCode::OK), "anonymous reaches it via elevate: {:?}", anon.body);
+    assert_eq!(body_json(&mut anon).await["v"], 1);
 
     // The non-elevating pipeline forwards the U principal → still forbidden.
     assert_eq!(
         rt.handle(as_role(req(Method::GET, "/plain"), "U")).await.status,
         Some(StatusCode::FORBIDDEN),
         "without elevate, the forwarded principal is re-checked and rejected"
+    );
+}
+
+/// Closing the confused-deputy hole: an anonymously-triggered pipeline that
+/// does NOT elevate cannot reach a locked mount. Its internal call carries no
+/// principal and is no longer auto-admitted as "trusted internal" — internal
+/// composition is authorized by the principal it carries, like any call.
+#[tokio::test]
+async fn anonymous_pipeline_cannot_reach_a_locked_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/secret", "service": "data",
+          "config": { "access": { "read": "A", "write": "A" } } },
+        // A public pipeline (anyone may run it) with no elevate role.
+        { "path": "/open", "service": "pipeline",
+          "config": { "access": { "invoke": "all", "write": "A" } } }
+    ]})));
+    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+
+    let seed = as_role(req(Method::PUT, "/secret/things/x"), "A").with_json(&json!({ "v": 1 }));
+    assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED), "seed");
+    let author = as_role(req(Method::PUT, "/open/.pipelines/.root"), "A")
+        .with_json(&json!({ "pipeline": ["GET /secret/things/x"] }));
+    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author /open");
+
+    // Anonymous trigger: the pipeline runs, but its no-principal internal call
+    // to the locked mount is refused — no ambient trust.
+    let resp = rt.handle(req(Method::GET, "/open")).await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::UNAUTHORIZED),
+        "an anonymous pipeline must not reach the locked mount: {:?}",
+        resp.body
     );
 }

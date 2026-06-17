@@ -106,6 +106,10 @@ async fn spawn_resident(
                     main,
                     tenant,
                     0,
+                    // Resident loadable adapters are infrastructure (no request
+                    // principal); their guest calls use granted capabilities,
+                    // not ambient authority.
+                    None,
                     limits.materialized_body_bytes,
                     socket_allowlist,
                 );
@@ -208,7 +212,9 @@ pub(crate) struct ResidentAdapter {
     sweeper_started: AtomicBool,
     /// The adapter bundle source, read once and reused for every spawn.
     source: OnceCell<String>,
-    loader: BundleLoader,
+    /// Loads the bundle from the file store (deployed `code:` adapters).
+    /// `None` when the source is pinned up front (inline templates).
+    loader: Option<BundleLoader>,
     host: Arc<dyn HostApi>,
     limits: InvocationLimits,
     tenant: String,
@@ -255,12 +261,12 @@ impl ResidentAdapter {
             idle: Duration::from_millis(idle_ms),
             sweeper_started: AtomicBool::new(false),
             source: OnceCell::new(),
-            loader: BundleLoader {
+            loader: Some(BundleLoader {
                 cap: limits.materialized_body_bytes,
                 files,
                 name: name.to_string(),
                 version: version.to_string(),
-            },
+            }),
             host,
             limits,
             tenant: tenant.to_string(),
@@ -269,9 +275,41 @@ impl ResidentAdapter {
         })
     }
 
+    /// Build a resident adapter from in-memory bundle source (a compiled
+    /// template) rather than a deployed `code:` reference. The source is pinned
+    /// up front, so no file load ever happens, and the bundle gets no grants —
+    /// rendering is pure compute, so host capabilities default-deny.
+    pub(crate) fn from_inline(source: String, tenant: &str, limits: InvocationLimits) -> Self {
+        let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all("template"));
+        let cell = OnceCell::new();
+        // Infallible: the cell is freshly created and never raced here.
+        let _ = cell.set(source);
+        ResidentAdapter {
+            pool: Arc::new(Mutex::new(Vec::new())),
+            max_runtimes: 4,
+            idle: Duration::from_millis(60_000),
+            sweeper_started: AtomicBool::new(false),
+            source: cell,
+            loader: None,
+            host,
+            limits,
+            tenant: tenant.to_string(),
+            socket_allowlist: Vec::new(),
+            store_config: json!({}),
+        }
+    }
+
     /// The adapter bundle source, loaded once and cached for every spawn.
     async fn cached_source(&self) -> Result<String, RsError> {
-        self.source.get_or_try_init(|| self.loader.load()).await.map(|s| s.clone())
+        self.source
+            .get_or_try_init(|| async {
+                match &self.loader {
+                    Some(l) => l.load().await,
+                    None => Err(RsError::internal("resident adapter has no bundle source")),
+                }
+            })
+            .await
+            .map(|s| s.clone())
     }
 
     /// Reserve a runtime for one call: reuse an idle one, else grow the pool up

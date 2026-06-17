@@ -156,8 +156,9 @@ Done:
 - **`auth` service + RBAC** (PRD §10.5): HS512 JWT (constant-time verify) in
   `rs-auth` cookie or bearer; login/refresh (sliding past 50%)/logout; login
   lockout; argon2id hashes with bcrypt migration verify; per-mount role
-  specs (`readRoles`/`writeRoles`/`createRoles`, path-scoped grants like
-  `"U /user/{email}"`) enforced in the wrapper.
+  specs (`read`/`write`/`delete`/`invoke`, path-scoped grants like
+  `"U /user/{email}"`) enforced in the wrapper; tenant `operatorRoles` gate who
+  may change authorization.
 - **Caching, host-applied** (v1's universal `caching` config): default
   `Cache-Control: no-store` on every response; mounts opt in with
   `{"mode": "noStore"|"revalidate"|"cache", "maxAgeSeconds", "public",
@@ -193,8 +194,8 @@ M2 deviations (tracked):
 Done:
 - **`pipeline` + `query` are spec stores** (v1's store-transform/store-view
   patterns): authoring is a full store-contract surface under the reserved
-  dot-subtree (`/<mount>/.pipelines/…`, `/<mount>/.queries/…` — guard with
-  `manageRoles`); every other path on **any HTTP verb** executes the
+  dot-subtree (`/<mount>/.pipelines/…`, `/<mount>/.queries/…` — guard authoring
+  with `write`); every other path on **any HTTP verb** executes the
   longest-prefix-matched spec, with a `.root` spec governing the mount root
   (so a pipeline can transparently wrap another service — the reason verbs
   pass through; replaces v1's modal manage header). DRY by construction:

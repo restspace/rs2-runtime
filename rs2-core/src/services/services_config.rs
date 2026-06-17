@@ -280,21 +280,7 @@ impl ServicesService {
                     return Err(RsError::bad_request("invalid code bundle name"));
                 }
                 let (bytes, is_js, validated) = self.validate_bundle(&mut msg, ctx).await?;
-                let version = super::code::version_of(&bytes);
-                let (child, media_type) = if is_js {
-                    (format!("{version}.js"), "application/javascript")
-                } else {
-                    (format!("{version}.wasm"), "application/wasm")
-                };
-                files
-                    .write(
-                        &format!("/{name}/{child}"),
-                        crate::message::Body::from_bytes(
-                            bytes,
-                            crate::message::MediaType::new(media_type),
-                        ),
-                    )
-                    .await?;
+                let (version, child) = Self::store_bundle(&files, &name, bytes, is_js).await?;
                 let mut resp = msg.response(
                     http::StatusCode::CREATED,
                     Some(crate::message::Body::from_json(&serde_json::json!({
@@ -403,12 +389,21 @@ impl ServicesService {
             Some(b) => b.materialize(ctx.limits.materialized_body_bytes).await?.clone(),
             None => return Err(RsError::bad_request("deploying requires a bundle body")),
         };
+        let validated = Self::compile_check_bytes(&bytes, is_js)?;
+        Ok((bytes, is_js, validated))
+    }
+
+    /// Engine compile smoke test for bundle bytes; returns whether validation
+    /// actually ran (false when the matching engine isn't in the build). The
+    /// single feature-gated site shared by upload and catalogue install.
+    #[cfg_attr(not(any(feature = "js", feature = "wasm")), allow(unused_variables))]
+    fn compile_check_bytes(bytes: &[u8], is_js: bool) -> Result<bool, RsError> {
         #[allow(unused_mut, unused_assignments)]
         let mut validated = false;
         if is_js {
             #[cfg(feature = "js")]
             {
-                let source = std::str::from_utf8(&bytes)
+                let source = std::str::from_utf8(bytes)
                     .map_err(|_| RsError::bad_request("JS bundle is not valid UTF-8"))?;
                 crate::engines::js::JsEngine::new().compile_check(source)?;
                 validated = true;
@@ -416,11 +411,248 @@ impl ServicesService {
         } else {
             #[cfg(feature = "wasm")]
             {
-                crate::engines::wasm::WasmEngine::new()?.compile_check(&bytes)?;
+                crate::engines::wasm::WasmEngine::new()?.compile_check(bytes)?;
                 validated = true;
             }
         }
-        Ok((bytes, is_js, validated))
+        Ok(validated)
+    }
+
+    /// Write validated bundle bytes into the code store at their
+    /// content-derived name; returns (version, child filename).
+    async fn store_bundle(
+        files: &crate::capabilities::ScopedFileStore,
+        name: &str,
+        bytes: bytes::Bytes,
+        is_js: bool,
+    ) -> Result<(String, String), RsError> {
+        let version = super::code::version_of(&bytes);
+        let (child, media_type) = if is_js {
+            (format!("{version}.js"), "application/javascript")
+        } else {
+            (format!("{version}.wasm"), "application/wasm")
+        };
+        files
+            .write(
+                &format!("/{name}/{child}"),
+                crate::message::Body::from_bytes(bytes, crate::message::MediaType::new(media_type)),
+            )
+            .await?;
+        Ok((version, child))
+    }
+
+    /// `GET /catalogues` — the tenant's registered catalogues, each annotated
+    /// with whether its host is on the operator allowlist.
+    async fn list_catalogues(
+        &self,
+        msg: Message,
+        ctx: &ServiceContext,
+        control: &std::sync::Arc<dyn crate::runtime::TenantControl>,
+    ) -> Result<Message, RsError> {
+        let (config, _) = control.raw_config(&msg.tenant).await?;
+        let entries: Vec<serde_json::Value> = config
+            .get("catalogues")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| {
+                        let name = c.get("name")?.as_str()?;
+                        let url = c.get("url")?.as_str()?;
+                        let allowlisted =
+                            ctx.catalogue.as_ref().map(|cl| cl.host_allowed(url)).unwrap_or(false);
+                        Some(serde_json::json!({
+                            "name": name,
+                            "url": url,
+                            "host": super::code::url_host(url),
+                            "allowlisted": allowlisted,
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(msg.ok_json(&serde_json::json!({
+            "catalogues": entries,
+            "enabled": ctx.catalogue.is_some(),
+        })))
+    }
+
+    /// `GET /catalogue/available` — selectable items: built-in service types,
+    /// built-in adapters, and remote catalogue items (annotated `installed`).
+    /// A failing catalogue degrades to an `error` entry, not a whole failure.
+    async fn list_available(
+        &self,
+        msg: Message,
+        ctx: &ServiceContext,
+        control: &std::sync::Arc<dyn crate::runtime::TenantControl>,
+    ) -> Result<Message, RsError> {
+        let mut items: Vec<serde_json::Value> = Vec::new();
+
+        // Built-in service types (from the static catalogue).
+        let builtin = catalogue();
+        if let Some(services) = builtin.get("services").and_then(|s| s.as_array()) {
+            for s in services {
+                items.push(serde_json::json!({
+                    "name": s.get("name"),
+                    "kind": "service",
+                    "source": "builtin",
+                    "description": s.get("description"),
+                    "configSchema": s.get("configSchema"),
+                }));
+            }
+        }
+        // Built-in adapters (selectable as `builtin:<name>`).
+        if let Some(reg) = &ctx.builtin_adapters {
+            for (adapter_kind, names) in
+                [("data", reg.data_names()), ("file", reg.files_names()), ("query", reg.query_names())]
+            {
+                for name in names {
+                    items.push(serde_json::json!({
+                        "name": name,
+                        "kind": "adapter",
+                        "adapterKind": adapter_kind,
+                        "source": "builtin",
+                        "ref": format!("builtin:{name}"),
+                    }));
+                }
+            }
+        }
+
+        // Remote catalogue items.
+        if let Some(client) = &ctx.catalogue {
+            let (config, _) = control.raw_config(&msg.tenant).await?;
+            let code_store = ctx.files.as_ref().map(|f| f.prefixed(super::code::CODE_PREFIX));
+            if let Some(cats) = config.get("catalogues").and_then(|c| c.as_array()) {
+                for c in cats {
+                    let (Some(cat_name), Some(url)) = (
+                        c.get("name").and_then(|v| v.as_str()),
+                        c.get("url").and_then(|v| v.as_str()),
+                    ) else {
+                        continue;
+                    };
+                    match client.fetch_catalogue(url).await {
+                        Ok(doc) => {
+                            for item in doc.items {
+                                let installed = match &code_store {
+                                    Some(store) => {
+                                        let ext = if item.engine == "js" { "js" } else { "wasm" };
+                                        store
+                                            .head(&format!("/{}/{}.{}", item.name, item.version, ext))
+                                            .await
+                                            .is_ok()
+                                    }
+                                    None => false,
+                                };
+                                let mut v = serde_json::to_value(&item).unwrap_or_default();
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert("catalogue".into(), serde_json::json!(cat_name));
+                                    obj.insert("source".into(), serde_json::json!("catalogue"));
+                                    obj.insert(
+                                        "ref".into(),
+                                        serde_json::json!(format!("code:{}@{}", item.name, item.version)),
+                                    );
+                                    obj.insert("installed".into(), serde_json::json!(installed));
+                                }
+                                items.push(v);
+                            }
+                        }
+                        Err(e) => items.push(serde_json::json!({
+                            "catalogue": cat_name,
+                            "source": "catalogue",
+                            "error": e.detail,
+                        })),
+                    }
+                }
+            }
+        }
+
+        Ok(msg.ok_json(&serde_json::json!({ "items": items })))
+    }
+
+    /// `POST /catalogue/install` `{catalogue, name, version}` — resolve the item,
+    /// allowlist-checked fetch, verify the content hash pins the version,
+    /// compile-check, and store into `/code/` (deploy only; no mount).
+    async fn install_from_catalogue(
+        &self,
+        mut msg: Message,
+        ctx: &ServiceContext,
+        control: &std::sync::Arc<dyn crate::runtime::TenantControl>,
+    ) -> Result<Message, RsError> {
+        let client = ctx.catalogue.as_ref().ok_or_else(|| {
+            RsError::engine_unavailable(
+                "external catalogues are not enabled on this node (no operator host allowlist)",
+            )
+        })?;
+        let body = match &mut msg.body {
+            Some(b) => b.as_json(ctx.limits.materialized_body_bytes).await?,
+            None => {
+                return Err(RsError::bad_request(
+                    "install requires a JSON body { catalogue, name, version }",
+                ))
+            }
+        };
+        let field = |k: &str| -> Result<String, RsError> {
+            body.get(k)
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| RsError::bad_request(format!("install requires '{k}'")))
+        };
+        let (cat_name, item_name, item_version) =
+            (field("catalogue")?, field("name")?, field("version")?);
+
+        // Resolve the catalogue URL from tenant config.
+        let (config, _) = control.raw_config(&msg.tenant).await?;
+        let url = config
+            .get("catalogues")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| {
+                arr.iter().find(|c| c.get("name").and_then(|v| v.as_str()) == Some(&cat_name))
+            })
+            .and_then(|c| c.get("url"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| RsError::not_found(format!("no registered catalogue '{cat_name}'")))?;
+
+        let doc = client.fetch_catalogue(&url).await?;
+        let item = doc
+            .items
+            .into_iter()
+            .find(|i| i.name == item_name && i.version == item_version)
+            .ok_or_else(|| {
+                RsError::not_found(format!(
+                    "catalogue '{cat_name}' has no item '{item_name}@{item_version}'"
+                ))
+            })?;
+        if item.name.is_empty() || item.name.contains(['/', '\\', '.']) {
+            return Err(RsError::bad_request(format!("invalid code bundle name '{}'", item.name)));
+        }
+
+        // Fetch (allowlist enforced inside the client) and pin by content hash.
+        let bytes = client.fetch_bundle(&item.bundle_url).await?;
+        let computed = super::code::version_of(&bytes);
+        if computed != item.version {
+            return Err(RsError::bad_request(format!(
+                "bundle content hash '{computed}' does not match catalogue version \
+                 '{}' for '{item_name}' — refusing",
+                item.version
+            )));
+        }
+        let is_js = item.engine == "js";
+        let validated = Self::compile_check_bytes(&bytes, is_js)?;
+        let files = ctx
+            .files
+            .as_ref()
+            .ok_or_else(|| RsError::internal("services service has no file capability"))?
+            .prefixed(super::code::CODE_PREFIX);
+        let (version, _child) = Self::store_bundle(&files, &item.name, bytes, is_js).await?;
+        Ok(msg.response(
+            http::StatusCode::CREATED,
+            Some(crate::message::Body::from_json(&serde_json::json!({
+                "name": item.name,
+                "version": version,
+                "ref": format!("code:{}@{}", item.name, version),
+                "validated": validated,
+            }))),
+        ))
     }
 }
 
@@ -445,6 +677,20 @@ impl Service for ServicesService {
 
         match (&msg.method, segments.as_slice()) {
             (&http::Method::GET, ["catalogue"]) => Ok(msg.ok_json(&catalogue())),
+
+            // Registered external catalogues (+ allowlist status).
+            (&http::Method::GET, ["catalogues"]) => self.list_catalogues(msg, ctx, &control).await,
+
+            // Aggregated selectable items: built-in service types, built-in
+            // adapters, and remote catalogue items.
+            (&http::Method::GET, ["catalogue", "available"]) => {
+                self.list_available(msg, ctx, &control).await
+            }
+
+            // Fetch → verify hash → compile-check → store into /code/.
+            (&http::Method::POST, ["catalogue", "install"]) => {
+                self.install_from_catalogue(msg, ctx, &control).await
+            }
 
             // Exposed view of current mounts.
             (&http::Method::GET, ["services"]) => {

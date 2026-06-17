@@ -43,6 +43,10 @@ pub struct SpecStore {
     /// The reserved authoring subtree segment, e.g. `.pipelines`.
     subtree: &'static str,
     validate: SpecValidator,
+    /// Tenant operator roles — only an operator may set or change a spec's
+    /// `access` field (authority is operator-controlled config, not author
+    /// content). Empty ⇒ no API operator.
+    operator_roles: String,
 }
 
 /// Resolve the storage root for a spec store: mount config
@@ -63,6 +67,7 @@ impl SpecStore {
     /// `files` is the raw (unscoped) tenant file adapter; the façade roots
     /// it under `root` and scopes it to the tenant — the private capability
     /// only the inner `FileService` sees.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         files: Arc<dyn crate::capabilities::FileStore>,
         tenant: &str,
@@ -70,6 +75,7 @@ impl SpecStore {
         subtree: &'static str,
         limits: InvocationLimits,
         validate: SpecValidator,
+        operator_roles: Option<String>,
     ) -> Self {
         let prefixed: Arc<dyn crate::capabilities::FileStore> =
             Arc::new(PrefixedFileStore::new(files, root));
@@ -93,8 +99,17 @@ impl SpecStore {
                 "spec-store",
             ),
             log_store: None,
+            catalogue: None,
+            builtin_adapters: None,
+            secrets: None,
         };
-        SpecStore { inner: FileService::new(), inner_ctx, subtree, validate }
+        SpecStore {
+            inner: FileService::new(),
+            inner_ctx,
+            subtree,
+            validate,
+            operator_roles: operator_roles.unwrap_or_default(),
+        }
     }
 
     /// Whether a request path enters the authoring subtree (its first
@@ -121,6 +136,22 @@ impl SpecStore {
                 Some(b) => b.as_json(self.inner_ctx.limits.materialized_body_bytes).await?,
                 None => return Err(RsError::bad_request("spec write requires a JSON body")),
             };
+            // Authority gate: a spec's `access` field is operator-controlled
+            // configuration (per-spec authorization), not author content. A
+            // non-operator may author or edit a spec but must leave `access`
+            // exactly as stored; setting, changing, or removing it requires an
+            // operator principal (a GET-modify-PUT that resends the existing
+            // `access` is fine).
+            let incoming_access = doc.get("access");
+            let existing_doc = self.read(&msg.url.service_path).await.ok();
+            let existing_access = existing_doc.as_ref().and_then(|d| d.get("access"));
+            if incoming_access != existing_access
+                && !crate::wrapper::is_operator(msg.principal.as_ref(), &self.operator_roles)
+            {
+                return Err(RsError::forbidden(
+                    "setting or changing a spec's 'access' requires an operator (operatorRoles)",
+                ));
+            }
             let canonical = (self.validate)(&doc)?;
             msg.body = Some(Body::from_bytes(canonical.to_string(), MediaType::json()));
         }

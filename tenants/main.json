@@ -1,6 +1,31 @@
 {
   "mounts": [
-    { "path": "/files", "service": "file" },
-    { "path": "/data", "service": "data", "config": { "enforceSchema": true } }
+    {
+      "path": "/files",
+      "service": "file"
+    },
+    {
+      "config": {
+        "enforceSchema": true
+      },
+      "path": "/data",
+      "service": "data"
+    },
+    {
+      "path": "/services",
+      "service": "services"
+    },
+    {
+      "path": "/q",
+      "service": "query"
+    },
+    {
+      "path": "/pipes",
+      "service": "pipeline"
+    },
+    {
+      "path": "/templates",
+      "service": "template"
+    }
   ]
 }

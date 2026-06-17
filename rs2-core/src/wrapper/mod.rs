@@ -10,7 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
 use crate::contract::InvocationLimits;
 use crate::error::RsError;
-use crate::message::{Message, Source};
+use crate::message::{Message, Principal, Source};
 
 /// Limit table (PRD §9.3 defaults). Operator ceilings; tenant-configurable
 /// downward (the downward-merge lands with tenant config in M2 self-config).
@@ -71,7 +71,7 @@ pub struct CachePolicy {
     pub mode: CacheMode,
     pub max_age_seconds: u64,
     /// `public` is honored only on mounts anonymously readable (`access`
-    /// absent, `"open"`, or `readRoles: "all"`); otherwise the policy is
+    /// absent, `"open"`, or `read: "all"`); otherwise the policy is
     /// clamped to `private` + `Vary: Authorization, Cookie` — a shared
     /// cache must never serve one principal's response to another.
     pub public: bool,
@@ -105,7 +105,7 @@ impl CachePolicy {
             None => true,
             Some(serde_json::Value::String(s)) => s == "open",
             Some(serde_json::Value::Object(spec)) => {
-                spec.get("readRoles").and_then(|v| v.as_str()).unwrap_or("all") == "all"
+                spec.get("read").and_then(|v| v.as_str()).unwrap_or("all") == "all"
             }
             _ => false,
         }
@@ -373,33 +373,63 @@ impl TenantLimiter {
     }
 }
 
-/// Per-mount authorization (PRD §10.5 role model). The mount's `access`
-/// config is either a string policy (`"open"` / `"authenticated"`) or a
-/// role-spec object:
+/// The action a request's HTTP method maps to (PRD §5.2). POST — and any other
+/// non-idempotent verb — is the *action* verb (`invoke`): a store's keyless
+/// create, a pipeline run, an auth login. PUT/PATCH are the idempotent upsert
+/// (`write`); DELETE is `delete`; GET/HEAD/OPTIONS are `read`.
+pub(crate) fn action_for(method: &http::Method) -> &'static str {
+    match *method {
+        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS => "read",
+        http::Method::PUT | http::Method::PATCH => "write",
+        http::Method::DELETE => "delete",
+        _ => "invoke",
+    }
+}
+
+/// Resolve the role-spec string an action key gates within a role object,
+/// applying the default chain: `read`→`"all"`, `write`→`"A"`, and both
+/// `delete` and `invoke` default to whatever `write` resolves to.
+fn resolve_role<'a>(
+    spec: &'a serde_json::Map<String, serde_json::Value>,
+    action_key: &str,
+) -> &'a str {
+    let write = spec.get("write").and_then(|v| v.as_str()).unwrap_or("A");
+    match action_key {
+        "read" => spec.get("read").and_then(|v| v.as_str()).unwrap_or("all"),
+        "delete" => spec.get("delete").and_then(|v| v.as_str()).unwrap_or(write),
+        "invoke" => spec.get("invoke").and_then(|v| v.as_str()).unwrap_or(write),
+        _ => write,
+    }
+}
+
+/// Evaluate an `access` value for one action key against the message. The value
+/// is either a string policy (`"open"` / `"authenticated"`) or a role-spec
+/// object keyed by action (`read`/`write`/`delete`/`invoke`).
 ///
-/// ```json
-/// { "readRoles": "all", "writeRoles": "A E", "createRoles": "A E U",
-///   "manageRoles": "A" }
-/// ```
+/// Role-spec strings are space-separated tokens: `all`, `authenticated`, role
+/// names, and path-scoped grants — a role token followed by a path pattern
+/// (`"U /user/{email}"`) grants that role only on matching paths, with
+/// `{email}` substituted from the principal id.
 ///
-/// Role-spec strings are space-separated tokens: `all`, `authenticated`,
-/// role letters/names, and path-scoped grants — a role token followed by a
-/// path pattern (`"U /user/{email}"`) grants that role only on matching
-/// paths, with `{email}` substituted from the principal id.
-///
-/// Internal calls with no principal are trusted composition (the original
-/// principal propagates when present); CORS-style external-only concerns
-/// never apply, but role specs do whenever a principal is attached.
-pub fn check_access(msg: &Message, mount_config: &serde_json::Value) -> Result<(), RsError> {
-    let access = match mount_config.get("access") {
-        None => return Ok(()),
-        Some(a) => a,
-    };
+/// Shared by the mount-level host check ([`check_access`]) and the pipeline
+/// per-spec execution check (`PipelineService`).
+pub(crate) fn check_role_spec(
+    access: &serde_json::Value,
+    action_key: &str,
+    msg: &Message,
+) -> Result<(), RsError> {
+    // Runtime-originated system calls (e.g. scheduler ticks) are trusted: they
+    // cannot be forged from the wire and exist only by operator config. Plain
+    // internal *composition* (pipeline steps, guest fetch) is NOT trusted — it
+    // is authorized by the principal it carries, like any other call.
+    if msg.source == Source::System {
+        return Ok(());
+    }
     match access {
         serde_json::Value::String(s) => match s.as_str() {
             "open" => Ok(()),
             "authenticated" => {
-                if msg.principal.is_some() || msg.source == Source::Internal {
+                if msg.principal.is_some() {
                     Ok(())
                 } else {
                     Err(RsError::unauthorized("this mount requires authentication"))
@@ -408,19 +438,7 @@ pub fn check_access(msg: &Message, mount_config: &serde_json::Value) -> Result<(
             other => Err(RsError::internal(format!("unknown access policy '{other}'"))),
         },
         serde_json::Value::Object(spec) => {
-            if msg.principal.is_none() && msg.source == Source::Internal {
-                return Ok(());
-            }
-            let write = spec.get("writeRoles").and_then(|v| v.as_str()).unwrap_or("A");
-            let role_spec = match msg.method {
-                http::Method::GET | http::Method::HEAD | http::Method::OPTIONS => {
-                    spec.get("readRoles").and_then(|v| v.as_str()).unwrap_or("all")
-                }
-                http::Method::POST => {
-                    spec.get("createRoles").and_then(|v| v.as_str()).unwrap_or(write)
-                }
-                _ => write,
-            };
+            let role_spec = resolve_role(spec, action_key);
             if satisfies_role_spec(role_spec, msg) {
                 Ok(())
             } else if msg.principal.is_none() {
@@ -434,6 +452,39 @@ pub fn check_access(msg: &Message, mount_config: &serde_json::Value) -> Result<(
         }
         _ => Err(RsError::internal("invalid 'access' config")),
     }
+}
+
+/// Per-mount authorization (PRD §5.2 role model). The mount's `access` config
+/// gates each request by the action its method maps to ([`action_for`]).
+///
+/// A **pipeline** mount enforces its *execution* surface per-spec inside the
+/// service (the mount `access` is the floor; a matched spec may override it
+/// looser or tighter), so the host defers it here. Authoring paths (a
+/// dot-prefixed first service segment — the instruction-plane subtree) stay
+/// host-enforced against the mount `access` like any other path.
+pub fn check_access(msg: &Message, mount: &crate::router::Mount) -> Result<(), RsError> {
+    let is_authoring =
+        msg.url.service_segments().first().is_some_and(|s| s.starts_with('.'));
+    if mount.service == "pipeline" && !is_authoring {
+        return Ok(());
+    }
+    let access = match mount.config.get("access") {
+        None => return Ok(()),
+        Some(a) => a,
+    };
+    check_role_spec(access, action_for(&msg.method), msg)
+}
+
+/// Whether a principal holds any role designated as a tenant **operator** role
+/// (`operatorRoles`, space-separated). Operators are the only principals
+/// permitted to change authorization config (a mount's or spec's `access`,
+/// role assignment). A path-scoped grant grammar does not apply — operator
+/// status is a plain role-membership test.
+pub(crate) fn is_operator(principal: Option<&Principal>, operator_roles: &str) -> bool {
+    let Some(p) = principal else { return false };
+    operator_roles
+        .split_whitespace()
+        .any(|role| p.roles.iter().any(|have| have == role))
 }
 
 /// Evaluate a role-spec string against the message's principal and path.
@@ -576,15 +627,22 @@ mod tests {
 
     #[test]
     fn access_stub_requires_principal() {
+        let mount = |config| crate::router::Mount {
+            base_path: String::new(),
+            service: "file".into(),
+            config,
+        };
         let msg = Message::request(Method::GET, "/x", "t1");
-        assert!(check_access(&msg, &serde_json::json!({})).is_ok());
-        assert!(check_access(&msg, &serde_json::json!({"access": "authenticated"})).is_err());
+        assert!(check_access(&msg, &mount(serde_json::json!({}))).is_ok());
+        assert!(check_access(&msg, &mount(serde_json::json!({"access": "authenticated"}))).is_err());
         let mut authed = Message::request(Method::GET, "/x", "t1");
         authed.principal = Some(crate::message::Principal {
             id: "u1".into(),
             roles: vec!["U".into()],
             kind: "user".into(),
         });
-        assert!(check_access(&authed, &serde_json::json!({"access": "authenticated"})).is_ok());
+        assert!(
+            check_access(&authed, &mount(serde_json::json!({"access": "authenticated"}))).is_ok()
+        );
     }
 }

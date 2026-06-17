@@ -29,6 +29,13 @@ pub trait ConfigLoader: Send + Sync {
         Err(RsError::engine_unavailable("this config loader does not support raw access"))
     }
 
+    /// Enumerate known tenants for host-driven background work (the scheduler).
+    /// Default: none — loaders that can't enumerate opt out, and the scheduler
+    /// still covers the tenancy-derived set (single tenant / multi domain map).
+    async fn list_tenants(&self) -> Result<Vec<String>, RsError> {
+        Ok(vec![])
+    }
+
     /// Persist a raw config document; `expected_version` mismatches fail
     /// with 409. Returns the new version.
     async fn save_raw(
@@ -179,6 +186,28 @@ impl Runtime {
     /// config — the M2 self-config hot-reload path swaps atomically here.
     pub async fn purge_tenant(&self, name: &str) {
         self.tenants.write().await.remove(name);
+    }
+
+    /// Spawn the host scheduler (G1): a detached task that periodically fires a
+    /// synthetic internal request at every mount carrying a `config.schedule`.
+    /// No-op when nothing is scheduled; the task holds a `Weak` and exits when
+    /// the runtime drops. Single-node by default — configure a shared
+    /// `ScheduleStore` (Adapters::with_schedule_store) for HA fire-once.
+    pub fn spawn_scheduler(self: &std::sync::Arc<Self>) {
+        self.spawn_scheduler_with(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(15),
+        );
+    }
+
+    /// [`Self::spawn_scheduler`] with explicit due-check and reconcile cadences
+    /// (tests pass short ones).
+    pub fn spawn_scheduler_with(
+        self: &std::sync::Arc<Self>,
+        tick: std::time::Duration,
+        reconcile: std::time::Duration,
+    ) {
+        tokio::spawn(scheduler_loop(self.self_ref.clone(), tick, reconcile));
     }
 
     /// Handle a message; failures become problem+json responses. CORS
@@ -342,7 +371,7 @@ impl Runtime {
             .ok_or_else(|| RsError::not_found(format!("no service mounted at '{}'", msg.url.path)))?;
         msg.url.apply_mount(&mount.base_path);
 
-        check_access(&msg, &mount.config)?;
+        check_access(&msg, mount)?;
 
         // OPTIONS is a read-only capability probe (G3): describe the resolved
         // mount — pattern, facets, schema hint — with an `Allow` header, so a
@@ -462,4 +491,205 @@ impl Runtime {
         }
         result
     }
+}
+
+// ---- scheduler loop (G1) -------------------------------------------------
+
+/// One armed schedule's mutable timing state.
+struct SchedEntry {
+    schedule: crate::scheduler::Schedule,
+    state: SchedState,
+}
+
+enum SchedState {
+    Interval { last_fired: tokio::time::Instant },
+    Cron { next_due: time::OffsetDateTime },
+}
+
+impl SchedEntry {
+    /// If a new occurrence is due, advance the cursor and return its
+    /// deterministic occurrence-id (ms); else `None`.
+    fn due_occurrence(
+        &mut self,
+        now: tokio::time::Instant,
+        now_wall: time::OffsetDateTime,
+    ) -> Option<i64> {
+        match (&self.schedule, &mut self.state) {
+            (crate::scheduler::Schedule::Interval(every), SchedState::Interval { last_fired }) => {
+                if now.saturating_duration_since(*last_fired) >= *every {
+                    *last_fired = now;
+                    Some(crate::scheduler::interval_bucket_ms(now_wall, *every))
+                } else {
+                    None
+                }
+            }
+            (crate::scheduler::Schedule::Cron(cron), SchedState::Cron { next_due }) => {
+                if now_wall >= *next_due {
+                    let occ = (next_due.unix_timestamp_nanos() / 1_000_000) as i64;
+                    *next_due = cron
+                        .next_occurrence_after(now_wall)
+                        .unwrap_or(now_wall + time::Duration::days(366));
+                    Some(occ)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// How long a claim is remembered — a couple of periods, floored at 60s.
+    fn claim_ttl(&self) -> std::time::Duration {
+        match &self.schedule {
+            crate::scheduler::Schedule::Interval(every) => {
+                (*every * 2).max(std::time::Duration::from_secs(60))
+            }
+            crate::scheduler::Schedule::Cron(_) => std::time::Duration::from_secs(120),
+        }
+    }
+}
+
+/// Clears a mount's in-flight marker on drop (panic-safe overlap guard).
+struct InFlightGuard {
+    set: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.key);
+        }
+    }
+}
+
+/// The detached scheduler task: two cadences (reconcile + due-check); exits when
+/// the runtime drops (the `Weak` no longer upgrades).
+async fn scheduler_loop(
+    weak: std::sync::Weak<Runtime>,
+    tick: std::time::Duration,
+    reconcile: std::time::Duration,
+) {
+    use std::collections::{HashMap, HashSet};
+    let mut desired: HashMap<(String, String), SchedEntry> = HashMap::new();
+    let mut config_versions: HashMap<String, String> = HashMap::new();
+    let in_flight = std::sync::Arc::new(std::sync::Mutex::new(HashSet::<(String, String)>::new()));
+    let mut last_reconcile: Option<tokio::time::Instant> = None;
+
+    loop {
+        tokio::time::sleep(tick).await;
+        let Some(rt) = weak.upgrade() else { return };
+
+        if last_reconcile.map_or(true, |t| t.elapsed() >= reconcile) {
+            last_reconcile = Some(tokio::time::Instant::now());
+            reconcile_schedules(&rt, &mut desired, &mut config_versions).await;
+        }
+
+        let now = tokio::time::Instant::now();
+        let now_wall = time::OffsetDateTime::now_utc();
+        for (key, entry) in desired.iter_mut() {
+            let Some(occurrence_ms) = entry.due_occurrence(now, now_wall) else { continue };
+            // Overlap guard: skip while this mount's previous fire is running.
+            {
+                let mut set = in_flight.lock().unwrap();
+                if set.contains(key) {
+                    continue;
+                }
+                set.insert(key.clone());
+            }
+            // Cluster dedupe: only the claim winner fires this occurrence.
+            let claim_key = format!("{}|{}", key.0, key.1);
+            let won = rt
+                .adapters
+                .schedule
+                .claim(&claim_key, occurrence_ms, entry.claim_ttl())
+                .await
+                .unwrap_or(false);
+            if !won {
+                in_flight.lock().unwrap().remove(key);
+                continue;
+            }
+            let rt2 = rt.clone();
+            let guard = InFlightGuard { set: in_flight.clone(), key: key.clone() };
+            let (tenant, base) = key.clone();
+            tokio::spawn(async move {
+                let _guard = guard; // removes the in-flight marker on completion/panic
+                fire_tick(&rt2, &tenant, &base).await;
+            });
+        }
+        drop(rt); // release the strong ref so the runtime can drop between ticks
+    }
+}
+
+/// Re-derive the desired schedule set from each watched tenant's config (cheap
+/// `load_raw`, skipped on unchanged version). Per-tenant errors skip, never kill.
+async fn reconcile_schedules(
+    rt: &std::sync::Arc<Runtime>,
+    desired: &mut std::collections::HashMap<(String, String), SchedEntry>,
+    config_versions: &mut std::collections::HashMap<String, String>,
+) {
+    let watched = watched_tenants(rt).await;
+    for tenant in &watched {
+        let (cfg, version) = match rt.loader.load_raw(tenant).await {
+            Ok(cv) => cv,
+            Err(_) => continue,
+        };
+        if config_versions.get(tenant).map(|v| v == &version).unwrap_or(false) {
+            continue;
+        }
+        desired.retain(|(t, _), _| t != tenant);
+        let now = tokio::time::Instant::now();
+        let now_wall = time::OffsetDateTime::now_utc();
+        if let Some(mounts) = cfg.get("mounts").and_then(|m| m.as_array()) {
+            for mount in mounts {
+                let base = mount.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                let Some(sched_cfg) = mount.get("config").and_then(|c| c.get("schedule")) else {
+                    continue;
+                };
+                let Ok(schedule) = crate::scheduler::Schedule::from_config(sched_cfg) else {
+                    continue; // already rejected at PUT /raw; defensive
+                };
+                let state = match &schedule {
+                    crate::scheduler::Schedule::Interval(_) => {
+                        SchedState::Interval { last_fired: now }
+                    }
+                    crate::scheduler::Schedule::Cron(cron) => {
+                        match cron.next_occurrence_after(now_wall) {
+                            Some(next_due) => SchedState::Cron { next_due },
+                            None => continue, // never matches in a year; skip
+                        }
+                    }
+                };
+                desired.insert((tenant.clone(), base.to_string()), SchedEntry { schedule, state });
+            }
+        }
+        config_versions.insert(tenant.clone(), version);
+    }
+    desired.retain(|(t, _), _| watched.contains(t));
+    config_versions.retain(|t, _| watched.contains(t));
+}
+
+/// The tenants the scheduler watches: the tenancy-derived set plus whatever the
+/// loader can enumerate.
+async fn watched_tenants(rt: &std::sync::Arc<Runtime>) -> Vec<String> {
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    match &rt.tenancy {
+        Tenancy::Single { tenant } => {
+            set.insert(tenant.clone());
+        }
+        Tenancy::Multi { domain_map, .. } => {
+            for t in domain_map.values() {
+                set.insert(t.clone());
+            }
+        }
+    }
+    if let Ok(list) = rt.loader.list_tenants().await {
+        set.extend(list);
+    }
+    set.into_iter().collect()
+}
+
+/// Build and dispatch the synthetic internal tick (`POST` + `x-rs2-trigger`).
+async fn fire_tick(rt: &std::sync::Arc<Runtime>, tenant: &str, base_path: &str) {
+    let _ = rt.handle(crate::scheduler::tick_message(tenant, base_path)).await;
 }

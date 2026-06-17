@@ -1,7 +1,7 @@
 //! `log` reader service (PRD §14): query the node log store, scoped to the
 //! requesting tenant. Read-only; the URL-params idiom mirrors the `query`
-//! service. Logs are operational data — guard the mount with `access` /
-//! `manageRoles` like any other.
+//! service. Logs are operational data — guard the mount with `access` like any
+//! other (e.g. `read: "A"`).
 //!
 //! - `GET /<mount>?$take=100&severity=warn&traceId=..&service=/orders&since=..&until=..&q=substr`
 //!   → newest-first records (JSON array, or `text/plain` NDJSON via `Accept`).

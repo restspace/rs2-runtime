@@ -52,7 +52,7 @@ fn surface_config() -> serde_json::Value {
             { "path": "/broken", "service": "pipeline" },
             { "path": "/services", "service": "services" },
             { "path": "/secret", "service": "file",
-              "config": { "access": { "readRoles": "A", "writeRoles": "A" } } }
+              "config": { "access": { "read": "A", "write": "A" } } }
         ]
     })
 }
@@ -295,7 +295,7 @@ async fn discovery_surface_filters_and_advertises() {
     author_pipelines(&rt).await;
 
     // /services catalogue: anonymous caller sees readable mounts only —
-    // /secret (readRoles: "A") is filtered out.
+    // /secret (read: "A") is filtered out.
     let mut services = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
     assert_eq!(services.status, Some(StatusCode::OK));
     let doc = body_json(&mut services).await;
@@ -598,4 +598,87 @@ async fn deployed_wasm_component_serves_requests() {
     assert_eq!(hit.header("x-engine"), Some("wasm"));
     let echoed = body_json(&mut hit).await;
     assert_eq!(echoed["method"], "GET");
+}
+
+/// Spec stores advertise their reserved authoring subtree (`.queries`/
+/// `.pipelines`/`.templates`) on discovery, so a generic client learns the
+/// authoring root without special-casing service names. Non-spec stores omit it.
+#[tokio::test]
+async fn spec_subtree_advertised_on_spec_stores() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(
+        dir.path(),
+        json!({ "mounts": [
+            { "path": "/files", "service": "file" },
+            { "path": "/data", "service": "data" },
+            { "path": "/q", "service": "query" },
+            { "path": "/p", "service": "pipeline" },
+        ] }),
+    );
+
+    let mut resp = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
+    let doc = body_json(&mut resp).await;
+    let entry = |path: &str| {
+        doc["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["path"] == path)
+            .cloned()
+            .unwrap_or_else(|| panic!("mount {path} missing: {doc}"))
+    };
+    assert_eq!(entry("/q")["specSubtree"], ".queries");
+    assert_eq!(entry("/p")["specSubtree"], ".pipelines");
+    assert!(entry("/files").get("specSubtree").is_none(), "file is not a spec store");
+    assert!(entry("/data").get("specSubtree").is_none(), "data is not a spec store");
+
+    // query edits specs as plain JSON — no `authoring` descriptor; pipeline
+    // advertises its DSL round-trip; file/data are not spec stores.
+    assert!(entry("/q").get("authoring").is_none(), "query authors plain JSON");
+    assert_eq!(
+        entry("/p")["authoring"],
+        json!({ "kind": "pipeline-dsl", "compiledField": "pipeline", "sourceField": "x-source" })
+    );
+    assert!(entry("/files").get("authoring").is_none());
+    assert!(entry("/data").get("authoring").is_none());
+
+    // Also folded into the OPTIONS capability probe (describe_mount uses meta).
+    let mut opts = rt.handle(req(Method::OPTIONS, "/q")).await;
+    let desc = body_json(&mut opts).await;
+    assert_eq!(desc["specSubtree"], ".queries");
+    assert!(desc.get("authoring").is_none());
+    let mut popts = rt.handle(req(Method::OPTIONS, "/p")).await;
+    assert_eq!(body_json(&mut popts).await["authoring"]["kind"], "pipeline-dsl");
+}
+
+/// The `template` spec store (JS engine) advertises `.templates` and the JSX
+/// authoring descriptor so a generic client knows how to edit/compile it.
+#[cfg(feature = "js")]
+#[tokio::test]
+async fn spec_subtree_and_authoring_advertised_on_template() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), json!({ "mounts": [{ "path": "/t", "service": "template" }] }));
+
+    let mut resp = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
+    let doc = body_json(&mut resp).await;
+    let t = doc["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["path"] == "/t")
+        .cloned()
+        .unwrap_or_else(|| panic!("template mount missing: {doc}"));
+    assert_eq!(t["specSubtree"], ".templates");
+    assert_eq!(
+        t["authoring"],
+        json!({
+            "kind": "jsx", "framework": "preact",
+            "compiledField": "source", "sourceField": "jsxSource", "render": "html"
+        })
+    );
+
+    // Also on the OPTIONS capability probe.
+    let mut opts = rt.handle(req(Method::OPTIONS, "/t")).await;
+    let desc = body_json(&mut opts).await;
+    assert_eq!(desc["authoring"]["kind"], "jsx");
 }

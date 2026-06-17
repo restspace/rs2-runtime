@@ -36,7 +36,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::contract::{Engine, HostApi, InvocationLimits, LogLevel, ServiceCode};
 use crate::error::{codes, RsError};
-use crate::message::{Body, MediaType, Message, Source};
+use crate::message::{Body, MediaType, Message, Principal, Source};
 
 /// Bootstrap: capture the host ops into closures, install the native hooks
 /// the compat prelude expects (`__rs2_native_*`, `__rs2_sleep`), and define
@@ -117,6 +117,10 @@ pub(crate) struct InvocationState {
     main: tokio::runtime::Handle,
     tenant: String,
     depth: u16,
+    /// The invoking principal — a `code:` service runs as its caller, so guest
+    /// `fetch`/`request` is bounded by the caller's access (`None` for resident
+    /// loadable adapters, which are infrastructure with no request principal).
+    principal: Option<Principal>,
     materialize_cap: u64,
     host_error: Mutex<Option<RsError>>,
     /// Open sockets for the `socket` capability. Per-invocation runtimes open
@@ -132,11 +136,13 @@ pub(crate) struct InvocationState {
 impl InvocationState {
     /// Construct shared invocation state. `socket_allowlist` is the mount's
     /// `socket` grant patterns; `depth` seeds re-entrant dispatch.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         host: Arc<dyn HostApi>,
         main: tokio::runtime::Handle,
         tenant: String,
         depth: u16,
+        principal: Option<Principal>,
         materialize_cap: u64,
         socket_allowlist: Vec<String>,
     ) -> Arc<Self> {
@@ -145,6 +151,7 @@ impl InvocationState {
             main,
             tenant,
             depth,
+            principal,
             materialize_cap,
             host_error: Mutex::new(None),
             sockets: Mutex::new(HashMap::new()),
@@ -294,8 +301,16 @@ fn fail_socket(inv: &InvocationState, e: RsError) -> Value {
 }
 
 /// Build an internal `Message` from a guest request envelope
-/// `{ method?, url, headers?, body?, mediaType? }`.
-fn message_from_request(req: &Value, tenant: &str, depth: u16) -> Message {
+/// `{ method?, url, headers?, body?, mediaType? }`. The guest call carries the
+/// invoking principal (a `code:` service runs **as its caller**), so its
+/// `fetch`/`request` is authorized exactly as the caller would be — never with
+/// ambient authority.
+fn message_from_request(
+    req: &Value,
+    tenant: &str,
+    depth: u16,
+    principal: Option<Principal>,
+) -> Message {
     let method = req
         .get("method")
         .and_then(|m| m.as_str())
@@ -304,6 +319,7 @@ fn message_from_request(req: &Value, tenant: &str, depth: u16) -> Message {
     let url = req.get("url").and_then(|u| u.as_str()).unwrap_or("/");
     let mut call = Message::request(method, url, tenant);
     call.source = Source::Internal;
+    call.principal = principal;
     call.depth = depth.saturating_add(1);
     if let Some(headers) = req.get("headers").and_then(|h| h.as_object()) {
         for (k, v) in headers {
@@ -432,7 +448,7 @@ fn op_rs2_request(
     #[serde] req: serde_json::Value,
 ) -> serde_json::Value {
     let inv = state.borrow::<Arc<InvocationState>>().clone();
-    let call = message_from_request(&req, &inv.tenant, inv.depth);
+    let call = message_from_request(&req, &inv.tenant, inv.depth, inv.principal.clone());
     let host = inv.host.clone();
     let cap = inv.materialize_cap;
     // A structured host error is returned as a marker the prelude rethrows
@@ -479,7 +495,7 @@ fn op_rs2_state_put(state: &mut OpState, #[string] key: String, #[string] value:
 #[serde]
 fn op_rs2_fetch(state: &mut OpState, #[serde] req: serde_json::Value) -> serde_json::Value {
     let inv = state.borrow::<Arc<InvocationState>>().clone();
-    let call = message_from_request(&req, &inv.tenant, inv.depth);
+    let call = message_from_request(&req, &inv.tenant, inv.depth, inv.principal.clone());
     let host = inv.host.clone();
     let cap = inv.materialize_cap;
     let err = match block_on_main(&inv.main, run_host_fetch(host, call, cap)) {
@@ -685,6 +701,9 @@ impl Engine for JsEngine {
         let main = tokio::runtime::Handle::current();
         let tenant = msg.tenant.clone();
         let depth = msg.depth;
+        // A `code:` service runs as its caller: the principal propagates into
+        // the guest's own `fetch`/`request` calls.
+        let principal = msg.principal.clone();
         let limits = limits.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             let inv = InvocationState::new(
@@ -692,6 +711,7 @@ impl Engine for JsEngine {
                 main,
                 tenant,
                 depth,
+                principal,
                 limits.materialized_body_bytes,
                 socket_allowlist_from_config(&config),
             );

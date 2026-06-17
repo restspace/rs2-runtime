@@ -57,6 +57,9 @@ impl PipelineService {
                 serde_json::from_value::<RetryPolicy>(retry.clone())
                     .map_err(|e| RsError::bad_request(format!("invalid 'retry' policy: {e}")))?;
             }
+            if let Some(access) = obj.get("access") {
+                validate_access_shape(access)?;
+            }
             let mut canonical = obj.clone();
             canonical.insert(
                 "pipeline".to_string(),
@@ -69,6 +72,56 @@ impl PipelineService {
     fn spec_from_doc(doc: &Value) -> Result<PipelineSpec, RsError> {
         serde_json::from_value(doc.get("pipeline").cloned().unwrap_or(Value::Null))
             .map_err(|e| RsError::internal(format!("stored pipeline is corrupt: {e}")))
+    }
+}
+
+/// The effective per-spec access: the spec's `access` overlaid on the mount's
+/// `access` floor. When both are role objects the spec wins **per key** (so a
+/// spec can loosen `invoke` while inheriting the mount's `read`); otherwise the
+/// most-specific present value (the spec) wins wholesale. `None` ⇒ open.
+fn effective_access(mount: Option<&Value>, spec: Option<&Value>) -> Option<Value> {
+    match (mount, spec) {
+        (None, None) => None,
+        (Some(m), None) => Some(m.clone()),
+        (None, Some(s)) => Some(s.clone()),
+        (Some(Value::Object(m)), Some(Value::Object(s))) => {
+            let mut merged = m.clone();
+            for (k, v) in s {
+                merged.insert(k.clone(), v.clone());
+            }
+            Some(Value::Object(merged))
+        }
+        (Some(_), Some(s)) => Some(s.clone()),
+    }
+}
+
+/// Validate the shape of a spec envelope's `access` field: a string shorthand
+/// (`"open"` / `"authenticated"`) or an object of string role specs keyed only
+/// by the action vocabulary (`read`/`write`/`delete`/`invoke`). `manage` and
+/// unknown keys are rejected (a spec is not a management scope, and the guard
+/// catches typos like `invokeRoles`).
+fn validate_access_shape(access: &Value) -> Result<(), RsError> {
+    match access {
+        Value::String(s) if s == "open" || s == "authenticated" => Ok(()),
+        Value::String(s) => Err(RsError::bad_request(format!(
+            "unknown access policy '{s}' (expected \"open\" or \"authenticated\")"
+        ))),
+        Value::Object(map) => {
+            for (key, val) in map {
+                if !matches!(key.as_str(), "read" | "write" | "delete" | "invoke") {
+                    return Err(RsError::bad_request(format!(
+                        "unknown access key '{key}' (allowed: read, write, delete, invoke)"
+                    )));
+                }
+                if !val.is_string() {
+                    return Err(RsError::bad_request(format!(
+                        "access '{key}' must be a role-spec string"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(RsError::bad_request("'access' must be a string or role object")),
     }
 }
 
@@ -110,6 +163,18 @@ impl Service for PipelineService {
         };
         let spec = Self::spec_from_doc(&doc)?;
 
+        // Per-spec authorization. The host defers a pipeline mount's execution
+        // surface to here: the matched spec's `access` overrides the mount's
+        // `access` floor per key (`.root` is the mount-wide floor), evaluated
+        // with the same verb→action map — POST→invoke = "run this pipeline".
+        if let Some(access) = effective_access(ctx.config.get("access"), doc.get("access")) {
+            crate::wrapper::check_role_spec(
+                &access,
+                crate::wrapper::action_for(&msg.method),
+                &msg,
+            )?;
+        }
+
         let requester = ctx
             .requester
             .clone()
@@ -130,7 +195,18 @@ impl Service for PipelineService {
             mount_retry.as_ref(),
             ctx.tenant_retry.as_ref(),
         ]);
-        let executor = Executor::new(requester, limits.clone(), retry);
+        let mut executor = Executor::new(requester, limits.clone(), retry)
+            // The role an `elevate` step adds, from operator-controlled mount
+            // config (`"elevate": "<role>"`). Authority lives here, not in the
+            // authored spec.
+            .with_elevate_role(
+                ctx.config.get("elevate").and_then(|v| v.as_str()).map(str::to_string),
+            );
+        // Bind the mount's granted secrets as `$<name>` variables (host-side),
+        // so a transform can `$hmacVerify('sha256', $<name>, $_rawBody, $sig)`.
+        if let Some(secrets) = &ctx.secrets {
+            executor = executor.with_vars(secrets.clone());
+        }
 
         let result =
             match tokio::time::timeout(limits.wall_clock, executor.run(&spec, msg, to_step)).await

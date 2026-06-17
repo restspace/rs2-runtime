@@ -72,10 +72,10 @@ fn demo_config() -> serde_json::Value {
             { "path": "/data", "service": "data" },
             { "path": "/auth", "service": "auth" },
             { "path": "/admin", "service": "file",
-              "config": { "access": { "readRoles": "all", "writeRoles": "A" } } },
+              "config": { "access": { "read": "all", "write": "A" } } },
             { "path": "/order-summary", "service": "pipeline" },
             { "path": "/services", "service": "services",
-              "config": { "access": { "readRoles": "all", "writeRoles": "A" } } }
+              "config": { "access": { "read": "all", "write": "A" } } }
         ]
     })
 }
@@ -199,7 +199,7 @@ async fn auth_login_rbac_and_lockout() {
     forbidden.set_header("authorization", &format!("Bearer {user_token}"));
     assert_eq!(rt.handle(forbidden).await.status, Some(StatusCode::FORBIDDEN));
 
-    // Reads stay open ("readRoles": "all").
+    // Reads stay open ("read": "all").
     assert_eq!(
         rt.handle(req(Method::GET, "/admin/notes.txt")).await.status,
         Some(StatusCode::OK)
@@ -474,4 +474,114 @@ async fn g7_pipeline_dispatch_benchmark() {
         "G7: {n} two-step pipeline invocations in {elapsed:?} ({:.2} ms/invocation)",
         elapsed.as_secs_f64() * 1000.0 / n as f64
     );
+}
+
+// ---------------------------------------------------------------------------
+// G2: event fan-out — a trigger launches a pipeline (no runtime machinery
+// beyond the pipeline service: any verb from any source executes a stored spec)
+// ---------------------------------------------------------------------------
+
+/// An unauthenticated external POST (a provider webhook) at a `pipeline` mount
+/// runs its `.root` flow, which fans out to a downstream mount and acks the
+/// provider — proving "trigger → pipeline" end-to-end with no new runtime code.
+#[tokio::test]
+async fn webhook_post_launches_a_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = json!({
+        "mounts": [
+            { "path": "/data", "service": "data" },
+            // Open for the provider's unauthenticated POST.
+            { "path": "/hooks", "service": "pipeline",
+              "config": { "access": { "invoke": "all", "write": "all" } } }
+        ]
+    });
+    let adapters =
+        Adapters::new(Arc::new(LocalFsFileStore::new(dir.path())), Arc::new(MemDataStore::new()));
+    let loader = Arc::new(MutableLoader(Mutex::new(config)));
+    let rt =
+        Runtime::new(Tenancy::Single { tenant: "demo".into() }, adapters, loader, LimitTable::default());
+
+    // The trigger flow: store the event downstream, then ack 200 to the provider.
+    let root = json!({ "pipeline": [ "PUT /data/events/incoming", { "received": true } ] });
+    let author = req(Method::PUT, "/hooks/.pipelines/.root").with_json(&root);
+    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author .root");
+
+    // A real external webhook POST (default Source::External, no principal).
+    let hook = req(Method::POST, "/hooks/stripe").with_json(&json!({ "id": "evt_1", "amount": 100 }));
+    assert_eq!(hook.source, Source::External, "a webhook is an external request");
+    let mut resp = rt.handle(hook).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
+    assert_eq!(body_json(&mut resp).await["received"], true, "the pipeline acked");
+
+    // The flow fanned out: the event was stored downstream by the pipeline.
+    let mut stored = rt.handle(req(Method::GET, "/data/events/incoming")).await;
+    assert_eq!(stored.status, Some(StatusCode::OK));
+    let event = body_json(&mut stored).await;
+    assert_eq!(event["id"], "evt_1");
+    assert_eq!(event["amount"], 100);
+}
+
+/// G3: a webhook→pipeline flow verifies the request's HMAC signature inline
+/// (`$hmacVerify` over `$_rawBody`, secret bound host-side) — valid passes and
+/// fans out; a wrong signature is gated to a 4xx, with the secret never exposed.
+#[tokio::test]
+async fn webhook_hmac_signature_is_verified_inline() {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    const KEY: &str = "whsec_test_key";
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = json!({
+        "secrets": { "wh": KEY },
+        "mounts": [
+            { "path": "/data", "service": "data" },
+            { "path": "/hooks", "service": "pipeline",
+              "config": { "access": { "invoke": "all", "write": "all" },
+                          "secrets": ["wh"] } }
+        ]
+    });
+    let adapters =
+        Adapters::new(Arc::new(LocalFsFileStore::new(dir.path())), Arc::new(MemDataStore::new()));
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "demo".into() },
+        adapters,
+        Arc::new(MutableLoader(Mutex::new(config))),
+        LimitTable::default(),
+    );
+
+    // Gate on the signature over the raw body, then fan out. Typed steps: a
+    // bare-string DSL step is a call, so the whole-body gate uses `transform`.
+    let root = json!({ "pipeline": { "steps": [
+        { "transform": "$hmacVerify('sha256', $wh, $_rawBody, $_headers.\"x-signature\") ? $ : $error('invalid signature')" },
+        { "call": { "method": "PUT", "url": "/data/events/incoming" } },
+        { "transform": { "received": true } }
+    ] } });
+    assert_eq!(
+        rt.handle(req(Method::PUT, "/hooks/.pipelines/.root").with_json(&root)).await.status,
+        Some(StatusCode::CREATED),
+        "author .root"
+    );
+
+    // The exact bytes the provider signs are the serialized body.
+    let body = json!({ "id": "evt_1", "amount": 100 });
+    let raw = serde_json::to_vec(&body).unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(KEY.as_bytes()).unwrap();
+    mac.update(&raw);
+    let sig: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+
+    // Valid signature → the flow runs and stores the event.
+    let mut valid = req(Method::POST, "/hooks/stripe").with_json(&body);
+    valid.set_header("x-signature", &sig);
+    let mut resp = rt.handle(valid).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
+    assert_eq!(body_json(&mut resp).await["received"], true);
+    let mut stored = rt.handle(req(Method::GET, "/data/events/incoming")).await;
+    assert_eq!(stored.status, Some(StatusCode::OK));
+    assert_eq!(body_json(&mut stored).await["id"], "evt_1");
+
+    // Wrong signature → gated before any downstream effect.
+    let mut forged = req(Method::POST, "/hooks/stripe").with_json(&body);
+    forged.set_header("x-signature", &"0".repeat(64));
+    assert_eq!(rt.handle(forged).await.status, Some(StatusCode::BAD_REQUEST), "forged signature rejected");
 }
