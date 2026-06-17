@@ -30,6 +30,7 @@ pub mod error;
 pub mod idempotency;
 pub mod logging;
 pub mod message;
+pub mod path_pattern;
 pub mod pipeline;
 pub mod retry;
 pub mod router;

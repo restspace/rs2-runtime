@@ -212,6 +212,9 @@ impl PipelineSpec {
                 if http::Method::from_bytes(call.method.as_bytes()).is_err() {
                     errors.push(format!("{here}: invalid method '{}'", call.method));
                 }
+                if let Err(e) = crate::path_pattern::validate(&call.url) {
+                    errors.push(format!("{here}: {}", e.detail));
+                }
             }
             if step.elevate && step.call.is_none() {
                 errors.push(format!("{here}: 'elevate' applies only to call steps"));

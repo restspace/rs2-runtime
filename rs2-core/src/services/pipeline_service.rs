@@ -153,7 +153,7 @@ impl Service for PipelineService {
         // ---- execution: any verb, longest stored prefix, .root fallback ----
         let segments: Vec<String> =
             msg.url.service_segments().iter().map(|s| s.to_string()).collect();
-        let Some((doc, _split)) = self.store.resolve(&segments).await? else {
+        let Some((doc, matched_len)) = self.store.resolve(&segments).await? else {
             return Err(RsError::not_found(format!(
                 "no stored pipeline matches '{}' (author one at {}{}/…)",
                 msg.url.service_path,
@@ -162,6 +162,15 @@ impl Service for PipelineService {
             )));
         };
         let spec = Self::spec_from_doc(&doc)?;
+
+        // The peeled sub-path (segments beyond the matched spec prefix) is the
+        // URL plane for `${url.path[…]}` in call URLs — so a `.root` spec can
+        // transparently forward the addressed key (e.g. `/users/<email>` →
+        // `/data/users/${url.path[0]}`).
+        let peeled: Vec<String> = segments[matched_len..].to_vec();
+        let base_segs: Vec<String> = msg.url.base_segments().iter().map(|s| s.to_string()).collect();
+        let url_name = peeled.last().cloned();
+        let url_query = msg.url.query.clone();
 
         // Per-spec authorization. The host defers a pipeline mount's execution
         // surface to here: the matched spec's `access` overrides the mount's
@@ -201,7 +210,8 @@ impl Service for PipelineService {
             // authored spec.
             .with_elevate_role(
                 ctx.config.get("elevate").and_then(|v| v.as_str()).map(str::to_string),
-            );
+            )
+            .with_url(peeled, base_segs, url_name, url_query);
         // Bind the mount's granted secrets as `$<name>` variables (host-side),
         // so a transform can `$hmacVerify('sha256', $<name>, $_rawBody, $sig)`.
         if let Some(secrets) = &ctx.secrets {

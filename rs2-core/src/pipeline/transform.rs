@@ -14,9 +14,14 @@ use sha2::{Sha256, Sha512};
 
 use crate::error::RsError;
 
-/// Cap on evaluation depth and wall time per expression.
+/// Cap on evaluation depth and wall time per expression. The time limit guards
+/// against runaway JSONata (infinite loops, pathological recursion); it must
+/// also leave headroom for the host crypto functions — `$hashPassword` runs
+/// argon2id, which is deliberately ~100ms+ (and several times that in a debug
+/// build or on a loaded node), so a 1s cap would spuriously trip. The pipeline
+/// wall-clock (default 120s) remains the outer bound.
 const MAX_DEPTH: usize = 100;
-const TIME_LIMIT_MS: usize = 1000;
+const TIME_LIMIT_MS: usize = 5000;
 
 /// Evaluate one JSONata expression against `input` with variable bindings.
 pub fn evaluate(

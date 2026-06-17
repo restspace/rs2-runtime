@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::RsError;
 use crate::message::{Body, Message, Principal, Source};
+use crate::path_pattern::{self, UrlView};
 use crate::retry::{retry_request, EffectClass, RetryPolicy};
 
 use super::condition::Condition;
@@ -85,6 +86,13 @@ pub struct Executor {
     /// spec content — so an author can opt a call into elevation but can never
     /// choose how much authority it gains. `None` ⇒ `elevate` is inert.
     elevate_role: Option<String>,
+    /// The incoming request's URL plane, exposed to call-URL patterns as
+    /// `${url.path[…]}` etc. For a pipeline this carries the *peeled* sub-path
+    /// (segments beyond the matched spec prefix), enabling `.root` passthrough.
+    url_path: Vec<String>,
+    url_base: Vec<String>,
+    url_name: Option<String>,
+    url_query: String,
 }
 
 /// What a step did with the in-flight message.
@@ -108,7 +116,28 @@ impl Executor {
             report: Arc::new(std::sync::Mutex::new(Vec::new())),
             initial_vars: Map::new(),
             elevate_role: None,
+            url_path: Vec::new(),
+            url_base: Vec::new(),
+            url_name: None,
+            url_query: String::new(),
         }
+    }
+
+    /// Supply the incoming request's URL plane for `${url.…}` patterns in call
+    /// URLs. `path` is the segment list patterns index against — the pipeline
+    /// service passes the *peeled* sub-path here.
+    pub fn with_url(
+        mut self,
+        path: Vec<String>,
+        base: Vec<String>,
+        name: Option<String>,
+        query: String,
+    ) -> Self {
+        self.url_path = path;
+        self.url_base = base;
+        self.url_name = name;
+        self.url_query = query;
+        self
     }
 
     /// Seed host-provided variables (e.g. granted secrets) into every run's
@@ -577,7 +606,15 @@ impl Executor {
 
         // Interpolation context: variables ∪ input-body JSON fields ∪ query.
         let interp_ctx = self.interpolation_context(&mut msg, vars).await?;
-        let url = interpolate(&call.url, &interp_ctx)?;
+        let path_refs: Vec<&str> = self.url_path.iter().map(String::as_str).collect();
+        let base_refs: Vec<&str> = self.url_base.iter().map(String::as_str).collect();
+        let url_view = UrlView {
+            path: &path_refs,
+            base: &base_refs,
+            name: self.url_name.as_deref(),
+            query: &self.url_query,
+        };
+        let url = path_pattern::resolve(&call.url, &url_view, &interp_ctx)?;
 
         // Request body: requests with bodies forward the in-flight body.
         // Cloneable (materialized) bodies feed every retry attempt; a
@@ -952,55 +989,9 @@ fn clone_with_body(msg: &Message, body: Option<Body>) -> Message {
     }
 }
 
-/// Replace `${name}` / `${name.path}` with values from the context.
-/// Strings interpolate raw; other values as JSON.
-fn interpolate(template: &str, ctx: &Map<String, Value>) -> Result<String, RsError> {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| RsError::bad_request(format!("unterminated ${{...}} in '{template}'")))?;
-        let path = &after[..end];
-        let mut parts = path.split('.');
-        let head = parts.next().unwrap_or("");
-        let mut value = ctx.get(head).cloned().unwrap_or(Value::Null);
-        for key in parts {
-            value = match value {
-                Value::Object(mut o) => o.remove(key).unwrap_or(Value::Null),
-                _ => Value::Null,
-            };
-        }
-        match value {
-            Value::String(s) => out.push_str(&s),
-            Value::Null => {
-                return Err(RsError::bad_request(format!(
-                    "interpolation '${{{path}}}' resolved to nothing"
-                )))
-            }
-            other => out.push_str(&other.to_string()),
-        }
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn interpolation_resolves_paths_and_rejects_missing() {
-        let ctx = serde_json::json!({ "id": "o1", "order": { "customerId": 7 } });
-        let ctx = ctx.as_object().unwrap();
-        assert_eq!(interpolate("/data/orders/${id}", ctx).unwrap(), "/data/orders/o1");
-        assert_eq!(interpolate("/c/${order.customerId}", ctx).unwrap(), "/c/7");
-        assert!(interpolate("/x/${missing}", ctx).is_err());
-        assert!(interpolate("/x/${unclosed", ctx).is_err());
-    }
 
     #[test]
     fn derived_keys_are_stable_and_distinct() {
@@ -1015,6 +1006,40 @@ mod tests {
         async fn request(&self, msg: Message) -> Message {
             msg
         }
+    }
+
+    /// Captures the URL of each forwarded request and returns an OK response.
+    struct RecordingRequester {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Requester for RecordingRequester {
+        async fn request(&self, msg: Message) -> Message {
+            self.seen.lock().unwrap().push(msg.url.path.clone());
+            msg.ok_json(&serde_json::json!({ "ok": true }))
+        }
+    }
+
+    #[tokio::test]
+    async fn root_pipeline_forwards_peeled_path_segment() {
+        // `.root` passthrough: GET /users/ada@example.com → the call URL
+        // `/data/users/${url.path[0]}` resolves the peeled segment.
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let exec = Executor::new(
+            Arc::new(RecordingRequester { seen: seen.clone() }),
+            PipelineLimits::default(),
+            RetryPolicy::no_retry(),
+        )
+        .with_url(vec!["ada@example.com".to_string()], vec![], Some("ada@example.com".to_string()), String::new());
+        let spec = PipelineSpec {
+            mode: Mode::Serial,
+            steps: vec![Step::call("GET", "/data/users/${url.path[0]}")],
+            ..Default::default()
+        };
+        let msg = Message::request(http::Method::GET, "/users/ada@example.com", "t");
+        let out = exec.run(&spec, msg, None).await.unwrap();
+        assert!(out.is_ok());
+        assert_eq!(seen.lock().unwrap().as_slice(), &["/data/users/ada@example.com".to_string()]);
     }
 
     fn parallel_transforms(n: usize) -> PipelineSpec {

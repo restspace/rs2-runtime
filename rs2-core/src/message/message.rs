@@ -114,6 +114,16 @@ impl MsgUrl {
         self.service_path.split('/').filter(|s| !s.is_empty()).collect()
     }
 
+    /// Non-empty segments of the mount prefix (`base_path`).
+    pub fn base_segments(&self) -> Vec<&str> {
+        self.base_path.split('/').filter(|s| !s.is_empty()).collect()
+    }
+
+    /// The resource name: the last service-path segment, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.service_segments().last().copied()
+    }
+
     /// Whether the request addresses a directory (trailing slash or mount root).
     pub fn is_directory(&self) -> bool {
         self.service_path.ends_with('/')
