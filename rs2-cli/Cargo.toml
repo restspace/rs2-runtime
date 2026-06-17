@@ -12,9 +12,12 @@ path = "src/main.rs"
 rs2-core = { path = "../rs2-core" }
 rs2-server = { path = "../rs2-server" }
 tokio = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 ureq = "2"
+shlex = "1"
+mime_guess = "2"
 
 [features]
 # Enables the deployment-time component compile check in `rs2 test`.

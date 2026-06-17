@@ -4,6 +4,9 @@
 //! (validate a manifest + component), `deploy` (upload via the self-config
 //! API), `migrate` (convert a Restspace `services.json`).
 
+mod client;
+mod commands;
+mod config;
 mod migrate;
 mod scaffold;
 
@@ -73,6 +76,51 @@ enum Command {
         #[arg(short, long, default_value = "tenant.json")]
         output: String,
     },
+    /// Authenticate to a server and save the token to `rsconfig.json`.
+    Login {
+        /// Server base URL (else `host` from rsconfig.json).
+        #[arg(long)]
+        host: Option<String>,
+        /// Login email (else `login.email` from rsconfig.json).
+        #[arg(long)]
+        email: Option<String>,
+        /// Password (else `RS2_PASSWORD`, else `login.password`).
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Send a local file to a path on the server (PUT).
+    Send {
+        /// Destination path on the server, e.g. `/files/report.pdf`.
+        path: String,
+        /// Local file to upload.
+        #[arg(long)]
+        file: String,
+        /// Content-Type (else inferred from the file extension).
+        #[arg(long)]
+        content_type: Option<String>,
+    },
+    /// Manage service mounts on the server.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
+    /// Run a script of `rs2` commands (one per line; aborts on first failure).
+    Run {
+        /// Path to the script file.
+        script: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Add a new mount from a JSON file. Fails if the path is already mounted.
+    Add {
+        /// Path to the mount-spec JSON (`{ path?, service, config? }`).
+        file: String,
+        /// Override / supply the mount path (e.g. `/notes`).
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -91,7 +139,16 @@ enum TemplateCommand {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
+    if let Err(e) = dispatch(cli.command) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Execute one parsed command. Factored out of `main` so `rs2 run` can re-enter
+/// it for each line of a script.
+fn dispatch(command: Command) -> Result<(), String> {
+    match command {
         Command::New { name, js } => scaffold::new_service(&name, js),
         Command::Dev { config } => {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -106,11 +163,41 @@ fn main() {
             TemplateCommand::Build { entry, out } => template_build(&entry, out.as_deref()),
         },
         Command::Migrate { input, output } => migrate::migrate(&input, &output),
-    };
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        Command::Login { host, email, password } => {
+            commands::login(host.as_deref(), email.as_deref(), password.as_deref())
+        }
+        Command::Send { path, file, content_type } => {
+            commands::send(&path, &file, content_type.as_deref())
+        }
+        Command::Service { action } => match action {
+            ServiceCommand::Add { file, path } => commands::service_add(&file, path.as_deref()),
+        },
+        Command::Run { script } => run_script(&script),
     }
+}
+
+/// `rs2 run` — execute a script where each non-blank, non-`#` line is an `rs2`
+/// invocation with `rs2` omitted. Lines run in order; the first failure aborts.
+fn run_script(script: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(script).map_err(|e| format!("cannot read {script}: {e}"))?;
+    for (i, raw) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let lineno = i + 1;
+        let mut args = shlex::split(line)
+            .ok_or_else(|| format!("line {lineno}: unbalanced quotes: {line}"))?;
+        if matches!(args.first().map(String::as_str), Some("dev")) {
+            return Err(format!("line {lineno}: `dev` runs a server and cannot be used in a script"));
+        }
+        args.insert(0, "rs2".to_string());
+        let cli = Cli::try_parse_from(&args)
+            .map_err(|e| format!("line {lineno}: {}: {}", line, e.to_string().trim()))?;
+        println!("$ {line}");
+        dispatch(cli.command).map_err(|e| format!("line {lineno} failed: {line}\n  {e}"))?;
+    }
+    Ok(())
 }
 
 /// Manifest consistency + component validation (PRD §11): the in-process
