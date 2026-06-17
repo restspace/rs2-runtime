@@ -1,6 +1,7 @@
 //! Pipeline transforms (PRD §8.2): JSONata expressions over the JSON body
 //! with message context variables (`$_status`, `$_ok`, `$_headers`, `$_rawBody`,
-//! named variables) and host crypto functions (`$hmac`, `$hmacVerify`).
+//! named variables) and host crypto functions (`$hmac`, `$hmacVerify`,
+//! `$hashPassword`, `$verifyPassword`).
 //!
 //! Engine: the `jsonata-rs` crate (the PRD's "evaluate Rust JSONata early
 //! in M2" risk item). It is evaluated timeboxed; expressions are strings in
@@ -37,6 +38,13 @@ pub fn evaluate(
     // variable; the raw request bytes as `$_rawBody`.
     jsonata.register_function("hmac", 3, jsonata_hmac);
     jsonata.register_function("hmacVerify", 4, jsonata_hmac_verify);
+    // Password hashing (G3): a provisioning pipeline can hash a plaintext
+    // password before PUTting a user record — `$hashPassword(password)` returns
+    // an argon2id PHC string, the same scheme `auth` mints on login, so seeded
+    // users authenticate without a separate hashing step. `$verifyPassword` is
+    // the inverse check (argon2id or legacy bcrypt).
+    jsonata.register_function("hashPassword", 1, jsonata_hash_password);
+    jsonata.register_function("verifyPassword", 2, jsonata_verify_password);
     let input_text = input.to_string();
     let result = jsonata
         .evaluate_timeboxed(Some(&input_text), Some(MAX_DEPTH), Some(TIME_LIMIT_MS))
@@ -139,6 +147,26 @@ fn jsonata_hmac_verify<'a>(
         arg_str(args, 2).as_bytes(),
         &arg_str(args, 3),
     );
+    Ok(jsonata_rs::Value::bool(ok))
+}
+
+/// `$hashPassword(password)` → argon2id PHC string (`""` on failure, which
+/// never verifies). Reuses the same hasher `auth` uses for login records.
+fn jsonata_hash_password<'a>(
+    ctx: jsonata_rs::FunctionContext<'a, '_>,
+    args: &[&'a J<'a>],
+) -> jsonata_rs::Result<&'a J<'a>> {
+    let hash = crate::services::auth::hash_password(&arg_str(args, 0)).unwrap_or_default();
+    Ok(jsonata_rs::Value::string(ctx.arena, &hash))
+}
+
+/// `$verifyPassword(password, hash)` → bool. Accepts argon2id PHC strings and
+/// legacy bcrypt hashes; any malformed hash → `false`.
+fn jsonata_verify_password<'a>(
+    _ctx: jsonata_rs::FunctionContext<'a, '_>,
+    args: &[&'a J<'a>],
+) -> jsonata_rs::Result<&'a J<'a>> {
+    let ok = crate::services::auth::verify_password(&arg_str(args, 0), &arg_str(args, 1));
     Ok(jsonata_rs::Value::bool(ok))
 }
 
@@ -272,6 +300,41 @@ mod tests {
         let bad_algo =
             apply(&json!(format!("$hmacVerify('md5', '{KEY}', '{MSG}', '{MAC}')")), &json!(null), &serde_json::Map::new()).unwrap();
         assert_eq!(bad_algo, json!(false));
+    }
+
+    #[test]
+    fn hash_password_round_trips_through_verify() {
+        // `$hashPassword` output is an argon2id PHC string that verifies.
+        let hash = apply(
+            &json!("$hashPassword('s3cr3t')"),
+            &json!(null),
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+        let hash = hash.as_str().expect("hash is a string");
+        assert!(hash.starts_with("$argon2"), "argon2id PHC string, got {hash}");
+
+        let check = |password: &str| {
+            apply(
+                &json!(format!("$verifyPassword('{password}', '{hash}')")),
+                &json!(null),
+                &serde_json::Map::new(),
+            )
+            .unwrap()
+        };
+        assert_eq!(check("s3cr3t"), json!(true), "correct password");
+        assert_eq!(check("wrong"), json!(false), "wrong password");
+    }
+
+    #[test]
+    fn verify_password_rejects_malformed_hash() {
+        let out = apply(
+            &json!("$verifyPassword('pw', 'not-a-hash')"),
+            &json!(null),
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+        assert_eq!(out, json!(false));
     }
 
     #[test]
