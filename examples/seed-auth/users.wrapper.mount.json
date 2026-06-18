@@ -5,6 +5,26 @@
     "description": "User store facade. GET reads a key or the listing; PUT takes { password, roles?, kind? }, hashes the password into passwordHash (argon2id), and writes to /data/users/<key>. Declares the `store` pattern so clients drive it like the dataset it fronts.",
     "access": { "read": "authenticated", "write": "A", "invoke": "A" },
     "pattern": "store",
+    "inputSchema": {
+      "type": "object",
+      "description": "User create/update body. The plaintext password is hashed on write; roles/kind default if omitted.",
+      "required": ["password"],
+      "properties": {
+        "password": { "type": "string", "minLength": 1 },
+        "roles": { "type": "string" },
+        "kind": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "type": "object",
+      "description": "Stored user record. passwordHash is operator-only and redacted for other readers (hence optional here).",
+      "properties": {
+        "passwordHash": { "type": "string" },
+        "roles": { "type": "string" },
+        "kind": { "type": "string" }
+      }
+    },
     "pipeline": {
       "mode": "conditional",
       "steps": [

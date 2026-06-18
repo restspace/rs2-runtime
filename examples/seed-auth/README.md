@@ -83,6 +83,17 @@ Sub-calls carry the caller's principal, so `/data`'s own schema + field-authz
 still apply (passwordHash/roles operator-only). Plaintext passwords never reach
 the store.
 
+It also declares its own request/response contract:
+
+- **`inputSchema`** (`{ password, roles?, kind? }`, `password` required) is
+  **enforced** — a PUT body that fails it is rejected with `422` before the
+  pipeline runs. This is the facade's *accepted input*, distinct from the stored
+  record (the transform turns `password` into `passwordHash`).
+- **`outputSchema`** (the stored record, `passwordHash` optional since it's
+  redacted for non-operators) is **advisory** — surfaced in
+  `/.well-known/rs2/services`, `OPTIONS`, the OpenAPI doc, and the agent surface,
+  but not enforced (responses vary: a keyed record vs the directory listing).
+
 ## Run it
 
 From this directory (requires a build of the `rs2` CLI — see the repo README;

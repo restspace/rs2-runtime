@@ -116,7 +116,20 @@ fn exposed_on(mount: &Mount, surface: Option<&str>) -> bool {
 
 fn meta(mount: &Mount) -> Map<String, Value> {
     let mut out = Map::new();
-    for key in ["x-agent", "x-policy", "x-expose", "x-render", "x-context", "description"] {
+    // The agent-surface metadata keys, plus a wrapper's declared request/
+    // response schemas (`inputSchema`/`outputSchema` — only present on wrapper
+    // configs). Copied into the services catalogue, the OPTIONS descriptor, and
+    // the agent surface alike.
+    for key in [
+        "x-agent",
+        "x-policy",
+        "x-expose",
+        "x-render",
+        "x-context",
+        "description",
+        "inputSchema",
+        "outputSchema",
+    ] {
         if let Some(v) = mount.config.get(key) {
             out.insert(key.to_string(), v.clone());
         }
@@ -396,6 +409,29 @@ async fn agent_surface_doc(
                     queries.push(with_pattern(entry, mount));
                 }
             }
+            // A wrapper appears by the shape it declares: a `store*` pattern is an
+            // entity (it fronts a dataset), anything else an action. `meta()`
+            // carries its `inputSchema`/`outputSchema` so a planner sees the
+            // request/response contract.
+            "wrapper" => {
+                let (pattern, _) = pattern_of(mount);
+                let mut entry = json!({
+                    "path": base,
+                    "idempotency": { "header": "Idempotency-Key", "honored": true },
+                });
+                for (k, v) in meta(mount) {
+                    entry[k] = v;
+                }
+                if pattern.starts_with("store") {
+                    entry["kind"] = json!("entity");
+                    entities.push(with_pattern(entry, mount));
+                } else {
+                    entry["kind"] = json!("action");
+                    entry["effect"] =
+                        mount.config.get("effect").cloned().unwrap_or(json!("unsafe"));
+                    actions.push(with_pattern(entry, mount));
+                }
+            }
             _ => {}
         }
     }
@@ -553,6 +589,36 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     }),
                 );
             }
+            // A wrapper fronts another mount with one inline pipeline; advertise
+            // a single path item carrying its declared request/response schemas
+            // (inputSchema enforced, outputSchema advisory) on the verbs its
+            // declared pattern allows.
+            "wrapper" => {
+                let input = mount.config.get("inputSchema");
+                let output = mount.config.get("outputSchema");
+                let mut item = Map::new();
+                item.insert(
+                    "description".to_string(),
+                    json!("Single inline pipeline fronting another mount; forwards the exact \
+                           path beyond the mount with ${url.rest}."),
+                );
+                for method in allowed_methods(mount) {
+                    let (key, is_write, effect) = match method {
+                        "GET" => ("get", false, "pure"),
+                        "PUT" => ("put", true, "idempotent"),
+                        "POST" => ("post", true, "unsafe"),
+                        "PATCH" => ("patch", true, "unsafe"),
+                        "DELETE" => ("delete", false, "idempotent"),
+                        _ => continue, // HEAD / OPTIONS / MOVE: not OpenAPI operations
+                    };
+                    let req = if is_write { input } else { None };
+                    item.insert(
+                        key.to_string(),
+                        op_with_schemas("Run the wrapper pipeline", effect, req, output),
+                    );
+                }
+                paths.insert(format!("{base}/{{path}}"), Value::Object(item));
+            }
             _ => {}
         }
     }
@@ -632,4 +698,27 @@ fn op(summary: &str, effect: &str) -> Value {
             "200": { "description": "Success" }
         }
     })
+}
+
+/// [`op`] plus an inline JSON `requestBody` (`input`) and/or `200` response
+/// (`output`) schema — used to advertise a `wrapper`'s declared contract.
+fn op_with_schemas(
+    summary: &str,
+    effect: &str,
+    input: Option<&Value>,
+    output: Option<&Value>,
+) -> Value {
+    let mut op = op(summary, effect);
+    if let Some(schema) = input {
+        op["requestBody"] = json!({
+            "content": { "application/json": { "schema": schema.clone() } }
+        });
+    }
+    if let Some(schema) = output {
+        op["responses"]["200"] = json!({
+            "description": "Success",
+            "content": { "application/json": { "schema": schema.clone() } }
+        });
+    }
+    op
 }

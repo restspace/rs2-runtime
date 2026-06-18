@@ -211,6 +211,16 @@ pub struct WrapperConfig {
     pub pattern: Option<String>,
     /// Optional discovery facets advertised alongside the pattern.
     pub facets: Option<Vec<String>>,
+    /// JSON Schema for the request body the wrapper accepts. **Enforced**: a
+    /// body that fails it is rejected with 422 before the pipeline runs (only
+    /// on verbs that carry a body — PUT/POST/PATCH). Surfaced in discovery,
+    /// OpenAPI (`requestBody`), and the agent surface.
+    pub input_schema: Option<Value>,
+    /// JSON Schema describing the wrapper's success response. **Advisory** —
+    /// surfaced in discovery, OpenAPI (`200`), and the agent surface, but not
+    /// enforced at runtime (a facade's responses vary: a keyed record vs a
+    /// store listing, and field-authz may redact fields).
+    pub output_schema: Option<Value>,
     /// Role an `elevate` step adds to sub-calls (operator-controlled).
     pub elevate: Option<String>,
     pub retry: Option<RetryPolicy>,
