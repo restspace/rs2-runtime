@@ -21,12 +21,14 @@ Running `rs2 run seed-auth.rs2` performs these steps in order:
    or `RS2_ADMIN_PASSWORD`.)
 3. `login` — authenticate as the new admin. **Everything after is operator-gated.**
 4. `send /data/users/.schema.json` — install the `users` schema (field authz).
-5. `service add users.pipeline.mount.json` — mount the `/users` pipeline.
-6. `send /users/.pipelines/.root` — install the password-hashing pipeline spec.
-7. `service set-access` — lock down: the user store becomes operator-write with
+5. `service add users.wrapper.mount.json` — mount the `/users` facade: a
+   single-pipeline `wrapper` that declares the `store` pattern and carries its
+   password-hashing pipeline inline in the mount config (no `.root` spec to
+   author).
+6. `service set-access` — lock down: the user store becomes operator-write with
    schema + field-authz enforced, and `/services` becomes operator-only.
 
-The equivalent one-liner for the auth core (without the `/users` pipeline) is:
+The equivalent one-liner for the auth core (without the `/users` facade) is:
 
 ```sh
 rs2 auth init --admin-email admin@demo.local --admin-password demo-admin-pw
@@ -40,8 +42,7 @@ rs2 auth init --admin-email admin@demo.local --admin-password demo-admin-pw
 | `tenants/main.json` | Starting tenant: a single **open** `/services` mount, no auth |
 | `rsconfig.json` | CLI config: server URL + the admin login to create |
 | `users.schema.json` | `users` dataset schema with per-field access rules |
-| `users.pipeline.mount.json` | `/users` pipeline mount |
-| `users.root.pipeline.json` | `.root` spec: GET reads, PUT hashes then writes |
+| `users.wrapper.mount.json` | `/users` `wrapper` mount: `store` pattern + inline password-hashing pipeline |
 | `sample-user.json` | Example body for creating a user |
 | `seed-auth.rs2` | The `rs2 run` script tying it together |
 
@@ -61,20 +62,26 @@ creates them, and the lockdown step tightens `/data`.
 - **`roles`** is operator-only to write — a user can read their roles but can
   never self-promote.
 
-### The password-hashing pipeline (`users.root.pipeline.json`)
+### The `/users` wrapper (`users.wrapper.mount.json`)
 
-`.root` governs the whole `/users` mount on every verb. It forwards the
-addressed key with the `${url.path[0]}` URL-pattern (the first peeled path
-segment):
+The `wrapper` service runs one pipeline — held inline in `config.pipeline` — for
+every verb and sub-path of the mount, so `/users` *is* the facade (no `.root`
+spec to author). It declares `"pattern": "store"`, so discovery and `OPTIONS`
+present `/users` like the dataset it fronts. It forwards the **exact** path
+beyond the mount with `${url.rest}` (byte-exact, leading + trailing slash), which
+makes the key case and the directory listing one URL:
 
-- `GET /users/` → lists the store (`GET /data/users/`).
-- `GET /users/<email>` → `GET /data/users/${url.path[0]}`.
+- `GET /users/` → `GET /data/users/` (listing — `${url.rest}` is `/`).
+- `GET /users/<email>` → `GET /data/users/<email>`.
 - `PUT /users/<email>` with `{ "password": "…", "roles"?: "…" }` → a transform
   replaces `password` with `passwordHash` via `$hashPassword(...)` (argon2id),
-  then `PUT /data/users/${url.path[0]}`.
+  then `PUT /data/users${url.rest}`.
 
-Permissions on the spec: `read` = any authenticated principal, `write`/`invoke`
-= admin (`A`). Plaintext passwords never reach the store.
+Permissions live on the **mount** `access` (the wrapper is host-enforced, not
+per-spec): `read` = any authenticated principal, `write`/`invoke` = admin (`A`).
+Sub-calls carry the caller's principal, so `/data`'s own schema + field-authz
+still apply (passwordHash/roles operator-only). Plaintext passwords never reach
+the store.
 
 ## Run it
 

@@ -6,7 +6,7 @@
 # Each line below is an `rs2` command with the leading `rs2` omitted; they run
 # in order and the script aborts on the first failure. The node starts with no
 # auth at all — just an open `/services` mount — and this script turns it into a
-# locked-down node with a working login and a password-hashing user pipeline.
+# locked-down node with a working login and a password-hashing user store.
 
 # 1. Enable auth: generate a jwtSecret, set operatorRoles, mount /auth, and open
 #    a temporary user-store /data mount (write-open, schema-free) for step 2.
@@ -24,13 +24,13 @@ login
 #    roles is operator-only to write (so a user can never self-promote).
 send /data/users/.schema.json --file users.schema.json
 
-# 5. Mount the /users management pipeline.
-service add users.pipeline.mount.json
+# 5. Mount the /users facade: a single-pipeline `wrapper` declaring the `store`
+#    pattern, with the inline spec baked into its config. GET reads (a key, or
+#    the listing via ${url.rest}); PUT hashes `password` then writes. No .root
+#    spec to author — the pipeline lives in the mount config.
+service add users.wrapper.mount.json
 
-# 6. Install its .root spec: GET reads, PUT hashes `password` then writes.
-send /users/.pipelines/.root --file users.root.pipeline.json
-
-# 7. Lock down: the user store becomes operator-write + schema/field-authz
+# 6. Lock down: the user store becomes operator-write + schema/field-authz
 #    enforced, and /services becomes operator-only. Closes the bootstrap window.
 service set-access /data --access '{"read":"authenticated","write":"A"}' --set enforceSchema=true --set fieldLevelAuthz=true
 service set-access /services --access '{"read":"A","write":"A"}'

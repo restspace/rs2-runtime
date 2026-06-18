@@ -129,6 +129,62 @@ async fn wrapper_declares_discovery_pattern() {
     assert!(facets.contains(&"schema"), "facets: {facets:?}");
 }
 
+/// The seed-auth shape: a `store`-pattern wrapper fronting `/data/users` with a
+/// conditional GET/PUT pipeline that hashes `password` on write and uses
+/// `${url.rest}` for both the addressed key and the directory listing.
+#[tokio::test]
+async fn wrapper_hashing_store_facade() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = json!({
+        "mounts": [
+            { "path": "/data", "service": "data", "config": { "access": "open" } },
+            { "path": "/users", "service": "wrapper", "config": {
+                "access": "open",
+                "pattern": "store",
+                "pipeline": { "mode": "conditional", "steps": [
+                    { "if": "method == 'GET'",
+                      "call": { "method": "GET", "url": "/data/users${url.rest}" } },
+                    { "if": "method == 'PUT'", "pipeline": { "mode": "serial", "steps": [
+                        { "transform": {
+                            "passwordHash": "$hashPassword(password)",
+                            "roles": "roles ? roles : 'U'",
+                            "kind": "kind ? kind : 'user'"
+                        } },
+                        { "call": { "method": "PUT", "url": "/data/users${url.rest}",
+                                    "effect": "idempotent" } }
+                    ]}}
+                ]}
+            }}
+        ]
+    });
+    let rt = runtime(config, dir.path());
+
+    // PUT a user through the facade: plaintext password is hashed, never stored.
+    let put = req(Method::PUT, "/users/ada@example.com")
+        .with_json(&json!({ "password": "ada-secret-pw", "roles": "U" }));
+    let put_status = rt.handle(put).await.status;
+    assert!(
+        matches!(put_status, Some(StatusCode::OK) | Some(StatusCode::CREATED)),
+        "{put_status:?}"
+    );
+
+    // GET the key back: a hashed record, no plaintext `password`.
+    let mut got = rt.handle(req(Method::GET, "/users/ada@example.com")).await;
+    assert_eq!(got.status, Some(StatusCode::OK), "{:?}", got.body);
+    let rec = body_json(&mut got).await;
+    assert!(rec.get("password").is_none(), "plaintext must not be stored: {rec}");
+    assert!(
+        rec["passwordHash"].as_str().unwrap_or("").starts_with("$argon2"),
+        "argon2id hash expected: {rec}"
+    );
+    assert_eq!(rec["roles"], "U");
+    assert_eq!(rec["kind"], "user");
+
+    // The listing works via ${url.rest} = "/": GET /users/ → GET /data/users/.
+    let list = rt.handle(req(Method::GET, "/users/")).await;
+    assert_eq!(list.status, Some(StatusCode::OK), "{:?}", list.body);
+}
+
 /// An unknown declared `pattern` is a config error at build time.
 #[tokio::test]
 async fn wrapper_rejects_unknown_pattern() {

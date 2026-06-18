@@ -1,5 +1,0 @@
-{
-  "path": "/users",
-  "service": "pipeline",
-  "config": { "access": { "write": "A" } }
-}
