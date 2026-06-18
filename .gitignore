@@ -6,3 +6,6 @@ conformance/echo-guest/target
 conformance/echo-guest/Cargo.lock
 bash.exe.stackdump
 /.cargo/config.toml
+# Runtime state created by running an example node (file/data stores).
+examples/*/data/
+examples/*/data-store/
