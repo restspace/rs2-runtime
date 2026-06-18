@@ -76,7 +76,7 @@ async fn g1_dispatch_overhead_under_1ms_p99() {
         Arc::new(LocalFsFileStore::new(dir.path())),
         Arc::new(MemDataStore::new()),
     );
-    let config = json!({ "mounts": [ { "path": "/data", "service": "data" } ] });
+    let config = json!({ "mounts": [ { "path": "/data", "service": "data", "config": { "access": "open" } } ] });
     let rt = Runtime::new(
         Tenancy::Single { tenant: "t".into() },
         adapters.clone(),
@@ -157,10 +157,10 @@ async fn g3_pathological_tenant_cannot_degrade_neighbors() {
     let spin_version = rs2_core::services::code::version_of(SPIN.as_bytes());
     let hog_version = rs2_core::services::code::version_of(HOG.as_bytes());
     let config = json!({ "mounts": [
-        { "path": "/data", "service": "data" },
-        { "path": "/services", "service": "services" },
-        { "path": "/spin", "service": format!("code:spin@{spin_version}") },
-        { "path": "/hog", "service": format!("code:hog@{hog_version}") }
+        { "path": "/data", "service": "data", "config": { "access": "open" } },
+        { "path": "/services", "service": "services", "config": { "access": "open" } },
+        { "path": "/spin", "service": format!("code:spin@{spin_version}"), "config": { "access": "open" } },
+        { "path": "/hog", "service": format!("code:hog@{hog_version}"), "config": { "access": "open" } }
     ]});
 
     let dir = tempfile::tempdir().unwrap();

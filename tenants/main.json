@@ -2,30 +2,31 @@
   "mounts": [
     {
       "path": "/files",
-      "service": "file"
+      "service": "file",
+      "config": { "access": "open" }
     },
     {
       "config": {
-        "enforceSchema": true
+        "enforceSchema": true,
+        "access": "open"
       },
       "path": "/data",
       "service": "data"
     },
     {
       "path": "/services",
-      "service": "services"
+      "service": "services",
+      "config": { "access": "open" }
     },
     {
       "path": "/q",
-      "service": "query"
+      "service": "query",
+      "config": { "access": "open" }
     },
     {
       "path": "/pipes",
-      "service": "pipeline"
-    },
-    {
-      "path": "/templates",
-      "service": "template"
+      "service": "pipeline",
+      "config": { "access": "open" }
     }
   ]
 }

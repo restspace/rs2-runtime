@@ -17,7 +17,9 @@ use std::time::Duration;
 use http::{Method, StatusCode};
 use serde_json::json;
 
-use rs2_core::contract::{CapabilityTarget, Engine, GrantedHost, HostApi, InvocationLimits, ServiceCode};
+use rs2_core::contract::{
+    CapabilityTarget, Engine, GrantedHost, HostApi, InvocationLimits, ServiceCode,
+};
 use rs2_core::engines::js::JsEngine;
 use rs2_core::message::Message;
 
@@ -47,14 +49,17 @@ fn host_with_fetch(
     ))
 }
 
-async fn run(
-    bundle: &str,
-    host: Arc<dyn HostApi>,
-) -> Result<serde_json::Value, rs2_core::RsError> {
+async fn run(bundle: &str, host: Arc<dyn HostApi>) -> Result<serde_json::Value, rs2_core::RsError> {
     let engine = JsEngine::new();
     let code = ServiceCode::JsBundle(Arc::new(bundle.to_string()));
     let mut resp = engine
-        .invoke(&code, Message::request(Method::POST, "/svc", "t1"), &json!({}), host, &limits())
+        .invoke(
+            &code,
+            Message::request(Method::POST, "/svc", "t1"),
+            &json!({}),
+            host,
+            &limits(),
+        )
         .await?;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     resp.body.as_mut().unwrap().as_json(1024 * 1024).await
@@ -185,11 +190,11 @@ async fn slack_pattern_query_building_and_base64_auth() {
         assert_eq!(msg.url.query, "channel=C123&limit=2");
         assert_eq!(
             msg.header("authorization"),
-            Some(format!("Basic {}", "bot:secret-token").as_str()).map(|_| msg
-                .header("authorization")
-                .unwrap()),
+            Some(format!("Basic {}", "bot:secret-token").as_str())
+                .map(|_| msg.header("authorization").unwrap()),
         );
-        let mut resp = msg.ok_json(&json!({ "ok": true, "messages": [ {"text": "a"}, {"text": "b"} ] }));
+        let mut resp =
+            msg.ok_json(&json!({ "ok": true, "messages": [ {"text": "a"}, {"text": "b"} ] }));
         resp.set_header("x-rate-limit-remaining", "99");
         Ok(resp)
     });
@@ -373,8 +378,9 @@ async fn e2e_http_out_grant_allows_and_denies_by_host() {
     // Pre-deploy the bundle directly into the code store.
     let version = rs2_core::services::code::version_of(bundle.as_bytes());
     let config = json!({ "mounts": [
-        { "path": "/services", "service": "services" },
+        { "path": "/services", "service": "services", "config": { "access": "open" } },
         { "path": "/sdk", "service": format!("code:pay@{version}"), "config": {
+            "access": "open",
             "grants": { "fetch": { "type": "httpOut", "hosts": ["api.stripe.com"] } }
         } }
     ]});
@@ -384,17 +390,28 @@ async fn e2e_http_out_grant_allows_and_denies_by_host() {
         Arc::new(Loader(config)),
         LimitTable::default(),
     );
-    let deploy = Message::request(Method::POST, "/services/code/pay/", "t").with_body(
-        Body::from_bytes(bundle.as_bytes().to_vec(), MediaType::new("application/javascript")),
-    );
+    let deploy =
+        Message::request(Method::POST, "/services/code/pay/", "t").with_body(Body::from_bytes(
+            bundle.as_bytes().to_vec(),
+            MediaType::new("application/javascript"),
+        ));
     assert_eq!(rt.handle(deploy).await.status, Some(StatusCode::CREATED));
 
-    let mut resp = rt.handle(Message::request(Method::GET, "/sdk/charge", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(Method::GET, "/sdk/charge", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     let out = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     assert_eq!(out["paid"], true);
-    assert_eq!(out["denied"], "capability_denied", "disallowed host never reaches the adapter");
+    assert_eq!(
+        out["denied"], "capability_denied",
+        "disallowed host never reaches the adapter"
+    );
     let hits = http.0.lock().unwrap();
-    assert_eq!(hits.len(), 1, "only the allowlisted host was called: {hits:?}");
+    assert_eq!(
+        hits.len(),
+        1,
+        "only the allowlisted host was called: {hits:?}"
+    );
     assert_eq!(hits[0], "https://api.stripe.com/v1/charges");
 }

@@ -36,13 +36,15 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
         "auth": { "jwtSecret": "cache-secret" },
         "mounts": [
             // No caching config: the default posture.
-            { "path": "/data", "service": "data" },
+            { "path": "/data", "service": "data", "config": { "access": "open" } },
             // Openly readable + public cache: the static-site/CDN case.
             { "path": "/assets", "service": "file", "config": {
+                "access": "open",
                 "caching": { "mode": "cache", "maxAgeSeconds": 3600,
                              "public": true, "immutable": true } } },
             // Revalidate mode: always fresh, 304s save bandwidth.
             { "path": "/fresh", "service": "data", "config": {
+                "access": "open",
                 "caching": { "mode": "revalidate" } } },
             // public requested on an authenticated mount: must clamp.
             { "path": "/private", "service": "file", "config": {
@@ -50,10 +52,16 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
                 "caching": { "mode": "cache", "maxAgeSeconds": 600, "public": true } } },
             // Caching config on the auth mount must not leak onto cookies.
             { "path": "/auth", "service": "auth", "config": {
+                "access": "open",
                 "caching": { "mode": "cache", "maxAgeSeconds": 600, "public": true } } }
         ]
     })));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 fn req(method: Method, path: &str) -> Message {
@@ -78,7 +86,9 @@ async fn default_posture_is_no_store_everywhere() {
     assert_eq!(resp.header("cache-control"), Some("no-store"));
 
     // The generated discovery surface (permission-filtered per caller).
-    let resp = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
+    let resp = rt
+        .handle(req(Method::GET, "/.well-known/rs2/services"))
+        .await;
     assert_eq!(resp.header("cache-control"), Some("no-store"));
 }
 
@@ -160,8 +170,10 @@ async fn conditional_gets_return_304() {
     let rt = rt(dir.path());
 
     // file: ETag revalidation.
-    let put = req(Method::PUT, "/assets/app.js")
-        .with_body(Body::from_string("x()", MediaType::new("application/javascript")));
+    let put = req(Method::PUT, "/assets/app.js").with_body(Body::from_string(
+        "x()",
+        MediaType::new("application/javascript"),
+    ));
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
     let first = rt.handle(req(Method::GET, "/assets/app.js")).await;
     let etag = first.header("etag").unwrap().to_string();

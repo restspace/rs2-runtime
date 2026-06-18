@@ -119,7 +119,11 @@ impl CachePolicy {
             return;
         }
         let clamped = self.public && !openly_readable;
-        let scope = if self.public && !clamped { "public" } else { "private" };
+        let scope = if self.public && !clamped {
+            "public"
+        } else {
+            "private"
+        };
         let value = match self.mode {
             CacheMode::NoStore => "no-store".to_string(),
             CacheMode::Revalidate => format!("{scope}, no-cache"),
@@ -186,7 +190,10 @@ pub fn origin_matches(pattern: &str, origin: &str) -> bool {
     }
     // Host-level patterns compare against the origin's host (port ignored
     // unless the pattern carries one).
-    let host_port = origin.split_once("://").map(|(_, hp)| hp).unwrap_or(&origin);
+    let host_port = origin
+        .split_once("://")
+        .map(|(_, hp)| hp)
+        .unwrap_or(&origin);
     let host = host_port.split(':').next().unwrap_or(host_port);
     if let Some(suffix) = pattern.strip_prefix("*.") {
         return host == suffix || host.ends_with(&format!(".{suffix}"));
@@ -200,7 +207,9 @@ pub fn origin_matches(pattern: &str, origin: &str) -> bool {
 /// Whether the Origin header names the same host the request was sent to —
 /// in which case CORS does not apply at all.
 pub fn is_same_origin(origin: &str, request_host: Option<&str>) -> bool {
-    let Some(request_host) = request_host else { return false };
+    let Some(request_host) = request_host else {
+        return false;
+    };
     let origin_host = origin.split_once("://").map(|(_, hp)| hp).unwrap_or(origin);
     origin_host.eq_ignore_ascii_case(request_host.trim())
 }
@@ -213,11 +222,17 @@ impl CorsPolicy {
     }
 
     pub fn is_trusted(&self, origin: &str) -> bool {
-        self.trusted_origins.iter().any(|p| origin_matches(p, origin))
+        self.trusted_origins
+            .iter()
+            .any(|p| origin_matches(p, origin))
     }
 
     pub fn is_allowed(&self, origin: &str) -> bool {
-        self.is_trusted(origin) || self.allowed_origins.iter().any(|p| origin_matches(p, origin))
+        self.is_trusted(origin)
+            || self
+                .allowed_origins
+                .iter()
+                .any(|p| origin_matches(p, origin))
     }
 
     /// Add CORS response headers for a permitted cross-origin caller.
@@ -236,7 +251,12 @@ impl CorsPolicy {
 
     /// Answer a preflight (`OPTIONS` + `Origin` + request-method header)
     /// from a permitted origin; `None` lets the request route normally.
-    pub fn preflight(&self, msg: &Message, origin: &str, request_host: Option<&str>) -> Option<Message> {
+    pub fn preflight(
+        &self,
+        msg: &Message,
+        origin: &str,
+        request_host: Option<&str>,
+    ) -> Option<Message> {
         if is_same_origin(origin, request_host) || !self.is_allowed(origin) {
             return None;
         }
@@ -259,12 +279,19 @@ impl CorsPolicy {
     /// The CSRF guard (v1 rule, host-enforced): a cookie-authenticated
     /// **unsafe** request from a cross-site, untrusted origin is rejected
     /// before routing. Bearer-token and non-browser requests are unaffected.
-    pub fn check_cookie_csrf(&self, msg: &Message, origin: &str, request_host: Option<&str>) -> Result<(), RsError> {
+    pub fn check_cookie_csrf(
+        &self,
+        msg: &Message,
+        origin: &str,
+        request_host: Option<&str>,
+    ) -> Result<(), RsError> {
         if is_same_origin(origin, request_host) || self.is_trusted(origin) {
             return Ok(());
         }
-        let unsafe_method =
-            !matches!(msg.method, http::Method::GET | http::Method::HEAD | http::Method::OPTIONS);
+        let unsafe_method = !matches!(
+            msg.method,
+            http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+        );
         let has_auth_cookie = msg
             .header("cookie")
             .map(|c| c.split(';').any(|p| p.trim_start().starts_with("rs-auth=")))
@@ -435,7 +462,9 @@ pub(crate) fn check_role_spec(
                     Err(RsError::unauthorized("this mount requires authentication"))
                 }
             }
-            other => Err(RsError::internal(format!("unknown access policy '{other}'"))),
+            other => Err(RsError::internal(format!(
+                "unknown access policy '{other}'"
+            ))),
         },
         serde_json::Value::Object(spec) => {
             let role_spec = resolve_role(spec, action_key);
@@ -462,15 +491,34 @@ pub(crate) fn check_role_spec(
 /// looser or tighter), so the host defers it here. Authoring paths (a
 /// dot-prefixed first service segment — the instruction-plane subtree) stay
 /// host-enforced against the mount `access` like any other path.
+///
+/// **Fail closed:** a mount with no `access` is *not* reachable. A public mount
+/// must opt in explicitly with `"access": "open"`; omitting `access` denies all
+/// callers rather than silently exposing the mount.
 pub fn check_access(msg: &Message, mount: &crate::router::Mount) -> Result<(), RsError> {
-    let is_authoring =
-        msg.url.service_segments().first().is_some_and(|s| s.starts_with('.'));
+    let is_authoring = msg
+        .url
+        .service_segments()
+        .first()
+        .is_some_and(|s| s.starts_with('.'));
     if mount.service == "pipeline" && !is_authoring {
         return Ok(());
     }
     let access = match mount.config.get("access") {
-        None => return Ok(()),
         Some(a) => a,
+        // No policy configured: deny. 401 for an anonymous caller (so a client
+        // knows to authenticate), 403 once a principal is present (no role can
+        // satisfy an unconfigured mount).
+        None if msg.principal.is_some() => {
+            return Err(RsError::forbidden(
+                "this mount has no access policy configured",
+            ))
+        }
+        None => {
+            return Err(RsError::unauthorized(
+                "this mount has no access policy configured",
+            ))
+        }
     };
     check_role_spec(access, action_for(&msg.method), msg)
 }
@@ -534,7 +582,11 @@ pub fn check_declared_body_size(msg: &Message, limits: &LimitTable) -> Result<()
             // sizes beyond any plausible handling.
             const ABSOLUTE_CAP: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
             if size > ABSOLUTE_CAP {
-                return Err(RsError::limit_exceeded("request_body_bytes", size, ABSOLUTE_CAP));
+                return Err(RsError::limit_exceeded(
+                    "request_body_bytes",
+                    size,
+                    ABSOLUTE_CAP,
+                ));
             }
         }
     }
@@ -564,14 +616,29 @@ mod tests {
     #[test]
     fn origin_patterns_match_origins() {
         assert!(origin_matches("*", "https://x.y"));
-        assert!(origin_matches("https://app.acme.com", "https://app.acme.com"));
-        assert!(!origin_matches("https://app.acme.com", "http://app.acme.com"), "scheme matters for full-origin patterns");
-        assert!(origin_matches("app.acme.com", "https://app.acme.com:8443"), "bare hostname ignores scheme+port");
+        assert!(origin_matches(
+            "https://app.acme.com",
+            "https://app.acme.com"
+        ));
+        assert!(
+            !origin_matches("https://app.acme.com", "http://app.acme.com"),
+            "scheme matters for full-origin patterns"
+        );
+        assert!(
+            origin_matches("app.acme.com", "https://app.acme.com:8443"),
+            "bare hostname ignores scheme+port"
+        );
         assert!(origin_matches("*.acme.dev", "https://x.acme.dev"));
-        assert!(origin_matches("*.acme.dev", "https://acme.dev"), "wildcard matches apex");
+        assert!(
+            origin_matches("*.acme.dev", "https://acme.dev"),
+            "wildcard matches apex"
+        );
         assert!(!origin_matches("*.acme.dev", "https://evil-acme.dev"));
         assert!(is_same_origin("https://api.acme.com", Some("api.acme.com")));
-        assert!(is_same_origin("https://api.acme.com:8443", Some("api.acme.com:8443")));
+        assert!(is_same_origin(
+            "https://api.acme.com:8443",
+            Some("api.acme.com:8443")
+        ));
         assert!(!is_same_origin("https://other.com", Some("api.acme.com")));
         assert!(!is_same_origin("https://api.acme.com", None));
     }
@@ -585,22 +652,38 @@ mod tests {
         let cookie_post = |origin_ok: bool| {
             let mut msg = Message::request(Method::POST, "/data/x", "t");
             msg.set_header("cookie", "rs-auth=tok");
-            let origin = if origin_ok { "https://app.acme.com" } else { "https://evil.com" };
+            let origin = if origin_ok {
+                "https://app.acme.com"
+            } else {
+                "https://evil.com"
+            };
             policy.check_cookie_csrf(&msg, origin, Some("api.acme.com"))
         };
-        assert!(cookie_post(true).is_ok(), "trusted origin may write with a cookie");
-        assert!(cookie_post(false).is_err(), "untrusted cross-origin cookie write rejected");
+        assert!(
+            cookie_post(true).is_ok(),
+            "trusted origin may write with a cookie"
+        );
+        assert!(
+            cookie_post(false).is_err(),
+            "untrusted cross-origin cookie write rejected"
+        );
 
         // Reads, bearer auth, and same-origin writes all pass.
         let mut read = Message::request(Method::GET, "/data/x", "t");
         read.set_header("cookie", "rs-auth=tok");
-        assert!(policy.check_cookie_csrf(&read, "https://evil.com", Some("api.acme.com")).is_ok());
+        assert!(policy
+            .check_cookie_csrf(&read, "https://evil.com", Some("api.acme.com"))
+            .is_ok());
         let mut bearer = Message::request(Method::POST, "/data/x", "t");
         bearer.set_header("authorization", "Bearer tok");
-        assert!(policy.check_cookie_csrf(&bearer, "https://evil.com", Some("api.acme.com")).is_ok());
+        assert!(policy
+            .check_cookie_csrf(&bearer, "https://evil.com", Some("api.acme.com"))
+            .is_ok());
         let mut same = Message::request(Method::POST, "/data/x", "t");
         same.set_header("cookie", "rs-auth=tok");
-        assert!(policy.check_cookie_csrf(&same, "https://api.acme.com", Some("api.acme.com")).is_ok());
+        assert!(policy
+            .check_cookie_csrf(&same, "https://api.acme.com", Some("api.acme.com"))
+            .is_ok());
     }
 
     #[test]
@@ -635,16 +718,24 @@ mod tests {
             config,
         };
         let msg = Message::request(Method::GET, "/x", "t1");
-        assert!(check_access(&msg, &mount(serde_json::json!({}))).is_ok());
-        assert!(check_access(&msg, &mount(serde_json::json!({"access": "authenticated"}))).is_err());
+        // Fail closed: a mount with no `access` policy denies (401 anonymous).
+        let err = check_access(&msg, &mount(serde_json::json!({}))).unwrap_err();
+        assert_eq!(err.status, 401);
+        // A public mount must opt in explicitly.
+        assert!(check_access(&msg, &mount(serde_json::json!({"access": "open"}))).is_ok());
+        assert!(
+            check_access(&msg, &mount(serde_json::json!({"access": "authenticated"}))).is_err()
+        );
         let mut authed = Message::request(Method::GET, "/x", "t1");
         authed.principal = Some(crate::message::Principal {
             id: "u1".into(),
             roles: vec!["U".into()],
             kind: "user".into(),
         });
-        assert!(
-            check_access(&authed, &mount(serde_json::json!({"access": "authenticated"}))).is_ok()
-        );
+        assert!(check_access(
+            &authed,
+            &mount(serde_json::json!({"access": "authenticated"}))
+        )
+        .is_ok());
     }
 }

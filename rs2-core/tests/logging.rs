@@ -33,34 +33,73 @@ async fn file_store_round_trip_and_filters() {
     store.flush().await;
 
     // newest-first tail
-    let all = store.query("acme", &LogQuery { take: 10, ..Default::default() }).await.unwrap();
+    let all = store
+        .query(
+            "acme",
+            &LogQuery {
+                take: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(all.len(), 3);
     assert_eq!(all[0].body, "third boom");
     assert_eq!(all[2].body, "first");
 
     // severity floor
     let warns = store
-        .query("acme", &LogQuery { take: 10, min_severity: Some(Severity::Warn), ..Default::default() })
+        .query(
+            "acme",
+            &LogQuery {
+                take: 10,
+                min_severity: Some(Severity::Warn),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(warns.len(), 2);
 
     // service (mount) filter
     let a = store
-        .query("acme", &LogQuery { take: 10, service: Some("/a".into()), ..Default::default() })
+        .query(
+            "acme",
+            &LogQuery {
+                take: 10,
+                service: Some("/a".into()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(a.len(), 2);
 
     // body substring
     let boom = store
-        .query("acme", &LogQuery { take: 10, contains: Some("boom".into()), ..Default::default() })
+        .query(
+            "acme",
+            &LogQuery {
+                take: 10,
+                contains: Some("boom".into()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(boom.len(), 1);
 
     // take limit (newest)
-    let one = store.query("acme", &LogQuery { take: 1, ..Default::default() }).await.unwrap();
+    let one = store
+        .query(
+            "acme",
+            &LogQuery {
+                take: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].body, "third boom");
 }
@@ -73,10 +112,28 @@ async fn file_store_tenant_isolation() {
     store.emit(rec(Severity::Info, "globex", "globex-line"));
     store.flush().await;
 
-    let a = store.query("acme", &LogQuery { take: 10, ..Default::default() }).await.unwrap();
+    let a = store
+        .query(
+            "acme",
+            &LogQuery {
+                take: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(a.len(), 1);
     assert_eq!(a[0].body, "acme-line");
-    let g = store.query("globex", &LogQuery { take: 10, ..Default::default() }).await.unwrap();
+    let g = store
+        .query(
+            "globex",
+            &LogQuery {
+                take: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].body, "globex-line");
 }
@@ -91,7 +148,14 @@ async fn file_store_trace_filter_and_time_range() {
     store.flush().await;
 
     let traced = store
-        .query("acme", &LogQuery { take: 10, trace_id: Some(t.trace_id.clone()), ..Default::default() })
+        .query(
+            "acme",
+            &LogQuery {
+                take: 10,
+                trace_id: Some(t.trace_id.clone()),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(traced.len(), 1);
@@ -100,7 +164,14 @@ async fn file_store_trace_filter_and_time_range() {
     // A `since` in the far future excludes everything.
     let future = rs2_core::logging::now_unix_nano() + 1_000_000_000_000;
     let none = store
-        .query("acme", &LogQuery { take: 10, since: Some(future), ..Default::default() })
+        .query(
+            "acme",
+            &LogQuery {
+                take: 10,
+                since: Some(future),
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(none.len(), 0);
@@ -116,7 +187,16 @@ async fn file_store_rotation_preserves_newest() {
     }
     store.flush().await;
 
-    let newest = store.query("acme", &LogQuery { take: 1, ..Default::default() }).await.unwrap();
+    let newest = store
+        .query(
+            "acme",
+            &LogQuery {
+                take: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(newest.len(), 1);
     assert_eq!(newest[0].body, "line-049");
 
@@ -125,7 +205,10 @@ async fn file_store_rotation_preserves_newest() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().starts_with("acme.ndjson."))
         .count();
-    assert!(backups >= 1, "expected rotated backup files, found {backups}");
+    assert!(
+        backups >= 1,
+        "expected rotated backup files, found {backups}"
+    );
 }
 
 // ---- boundary + service logs through the runtime ----
@@ -153,20 +236,41 @@ fn logging_runtime(
     let loader = Arc::new(StaticLoader(json!({
         "auth": { "jwtSecret": "log-secret" },
         "mounts": [
-            { "path": "/files", "service": "file" },
-            { "path": "/auth", "service": "auth" },
-            { "path": "/logs", "service": "log" }
+            { "path": "/files", "service": "file", "config": { "access": "open" } },
+            { "path": "/auth", "service": "auth", "config": { "access": "open" } },
+            { "path": "/logs", "service": "log", "config": { "access": "open" } }
         ]
     })));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t1".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
     (rt, log)
 }
 
 async fn read_logs(rt: &Runtime, path: &str) -> Vec<Value> {
     let mut resp = rt.handle(Message::request(Method::GET, path, "t1")).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "reader should return 200");
-    let bytes = resp.body.as_mut().unwrap().materialize(1 << 20).await.unwrap();
-    serde_json::from_slice::<Value>(&bytes).unwrap().as_array().cloned().unwrap()
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "reader should return 200"
+    );
+    let bytes = resp
+        .body
+        .as_mut()
+        .unwrap()
+        .materialize(1 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice::<Value>(&bytes)
+        .unwrap()
+        .as_array()
+        .cloned()
+        .unwrap()
 }
 
 #[tokio::test]
@@ -180,14 +284,22 @@ async fn boundary_logs_severity_otlp_and_reader() {
             .with_body(Body::from_string("hi", MediaType::new("text/plain"))),
     )
     .await;
-    let ok = rt.handle(Message::request(Method::GET, "/files/a.txt", "t1")).await;
+    let ok = rt
+        .handle(Message::request(Method::GET, "/files/a.txt", "t1"))
+        .await;
     assert_eq!(ok.status, Some(StatusCode::OK));
-    let missing = rt.handle(Message::request(Method::GET, "/files/nope.txt", "t1")).await;
+    let missing = rt
+        .handle(Message::request(Method::GET, "/files/nope.txt", "t1"))
+        .await;
     assert_eq!(missing.status, Some(StatusCode::NOT_FOUND));
     log.flush().await;
 
     let records = read_logs(&rt, "/logs?$take=50").await;
-    assert!(records.len() >= 3, "want >=3 boundary logs, got {}", records.len());
+    assert!(
+        records.len() >= 3,
+        "want >=3 boundary logs, got {}",
+        records.len()
+    );
 
     // OTLP field names / resource attribute present.
     let first = &records[0];
@@ -259,7 +371,8 @@ async fn info_floor_suppresses_debug_internal() {
     // Info floor: external success logs at Info (kept). There are no internal
     // hops here, but this pins the floor behavior for the common config.
     let (rt, log) = logging_runtime(fdir.path(), ldir.path(), Severity::Info);
-    rt.handle(Message::request(Method::GET, "/files/", "t1")).await;
+    rt.handle(Message::request(Method::GET, "/files/", "t1"))
+        .await;
     log.flush().await;
     let records = read_logs(&rt, "/logs?$take=50").await;
     assert!(records.iter().all(|r| r["severityText"] != "DEBUG"));
@@ -272,7 +385,9 @@ async fn info_floor_suppresses_debug_internal() {
 async fn js_console_log_reaches_sink_stamped_custom() {
     use std::collections::HashMap;
 
-    use rs2_core::contract::{Engine, GrantedHost, HostApi, InvocationLimits, LogContext, ServiceCode};
+    use rs2_core::contract::{
+        Engine, GrantedHost, HostApi, InvocationLimits, LogContext, ServiceCode,
+    };
     use rs2_core::engines::js::JsEngine;
 
     let dir = tempfile::tempdir().unwrap();
@@ -311,18 +426,39 @@ async fn js_console_log_reaches_sink_stamped_custom() {
         materialized_body_bytes: 8 << 20,
     };
     let resp = engine
-        .invoke(&code, Message::request(Method::POST, "/svc", "t1"), &json!({}), host, &limits)
+        .invoke(
+            &code,
+            Message::request(Method::POST, "/svc", "t1"),
+            &json!({}),
+            host,
+            &limits,
+        )
         .await
         .unwrap();
     assert_eq!(resp.status, Some(StatusCode::OK));
 
     store.flush().await;
-    let records = store.query("t1", &LogQuery { take: 10, ..Default::default() }).await.unwrap();
-    let hello = records.iter().find(|r| r.body == "hello from sandbox").expect("console.log line");
+    let records = store
+        .query(
+            "t1",
+            &LogQuery {
+                take: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let hello = records
+        .iter()
+        .find(|r| r.body == "hello from sandbox")
+        .expect("console.log line");
     assert_eq!(hello.attr_str("rs2.source"), Some("custom"));
     assert_eq!(hello.attr_str("rs2.service"), Some("demo@v1"));
     assert_eq!(hello.attr_str("rs2.mount"), Some("/svc"));
     assert_eq!(hello.trace_id, "trace123");
-    let warn = records.iter().find(|r| r.body == "careful now").expect("console.warn line");
+    let warn = records
+        .iter()
+        .find(|r| r.body == "careful now")
+        .expect("console.warn line");
     assert_eq!(warn.severity, Severity::Warn);
 }

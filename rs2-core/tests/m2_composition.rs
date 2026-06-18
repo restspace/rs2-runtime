@@ -68,12 +68,12 @@ fn demo_config() -> serde_json::Value {
     json!({
         "auth": { "jwtSecret": "demo-secret", "maxAttempts": 3, "lockMinutes": 1 },
         "mounts": [
-            { "path": "/files", "service": "file" },
-            { "path": "/data", "service": "data" },
-            { "path": "/auth", "service": "auth" },
+            { "path": "/files", "service": "file", "config": { "access": "open" } },
+            { "path": "/data", "service": "data", "config": { "access": "open" } },
+            { "path": "/auth", "service": "auth", "config": { "access": "open" } },
             { "path": "/admin", "service": "file",
               "config": { "access": { "read": "all", "write": "A" } } },
-            { "path": "/order-summary", "service": "pipeline" },
+            { "path": "/order-summary", "service": "pipeline", "config": { "access": "open" } },
             { "path": "/services", "service": "services",
               "config": { "access": { "read": "all", "write": "A" } } }
         ]
@@ -86,7 +86,14 @@ fn demo_runtime(file_root: &std::path::Path) -> Arc<Runtime> {
         Arc::new(MemDataStore::new()),
     );
     let loader = Arc::new(MutableLoader(Mutex::new(demo_config())));
-    Runtime::new(Tenancy::Single { tenant: "demo".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single {
+            tenant: "demo".into(),
+        },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 fn req(method: Method, path: &str) -> Message {
@@ -105,7 +112,12 @@ async fn author_order_summary(rt: &Runtime) {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(10 * 1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(10 * 1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 // ---------------------------------------------------------------------------
@@ -135,17 +147,23 @@ async fn demo_tenant_pipeline_runs_end_to_end() {
 
     // ?$plan introspection on the authoring path: the transform forces a
     // segment boundary, and the stored form is typed (DSL canonicalized).
-    let mut plan_resp =
-        rt.handle(req(Method::GET, "/order-summary/.pipelines/.root?$plan")).await;
+    let mut plan_resp = rt
+        .handle(req(Method::GET, "/order-summary/.pipelines/.root?$plan"))
+        .await;
     assert_eq!(plan_resp.status, Some(StatusCode::OK));
     let plan = body_json(&mut plan_resp).await;
     let segments = plan["plan"]["segments"].as_array().unwrap();
     assert_eq!(segments.len(), 2, "call | transform = two segments: {plan}");
-    assert!(plan["pipeline"]["steps"][0]["call"].is_object(), "stored form is typed: {plan}");
+    assert!(
+        plan["pipeline"]["steps"][0]["call"].is_object(),
+        "stored form is typed: {plan}"
+    );
 
     // The .root spec governs every subpath of the mount (wrap-the-mount):
     // arbitrary deeper paths still execute it, verb and URL intact.
-    let wrapped = rt.handle(req(Method::GET, "/order-summary/any/deeper/path?id=o1")).await;
+    let wrapped = rt
+        .handle(req(Method::GET, "/order-summary/any/deeper/path?id=o1"))
+        .await;
     assert_eq!(wrapped.status, Some(StatusCode::OK), "{:?}", wrapped.body);
 }
 
@@ -169,7 +187,10 @@ async fn auth_login_rbac_and_lockout() {
     // Anonymous write to the admin mount → 401.
     let denied = req(Method::PUT, "/admin/notes.txt")
         .with_body(Body::from_string("x", MediaType::new("text/plain")));
-    assert_eq!(rt.handle(denied).await.status, Some(StatusCode::UNAUTHORIZED));
+    assert_eq!(
+        rt.handle(denied).await.status,
+        Some(StatusCode::UNAUTHORIZED)
+    );
 
     // Login as admin → JWT.
     let mut login = rt
@@ -179,7 +200,10 @@ async fn auth_login_rbac_and_lockout() {
         .await;
     assert_eq!(login.status, Some(StatusCode::OK));
     assert!(login.header("set-cookie").unwrap().starts_with("rs-auth="));
-    let token = body_json(&mut login).await["token"].as_str().unwrap().to_string();
+    let token = body_json(&mut login).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Admin can write.
     let mut write = req(Method::PUT, "/admin/notes.txt")
@@ -193,11 +217,17 @@ async fn auth_login_rbac_and_lockout() {
             "email": "uma@demo.test", "password": "umapw"
         })))
         .await;
-    let user_token = body_json(&mut user_login).await["token"].as_str().unwrap().to_string();
+    let user_token = body_json(&mut user_login).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let mut forbidden = req(Method::PUT, "/admin/notes.txt")
         .with_body(Body::from_string("nope", MediaType::new("text/plain")));
     forbidden.set_header("authorization", &format!("Bearer {user_token}"));
-    assert_eq!(rt.handle(forbidden).await.status, Some(StatusCode::FORBIDDEN));
+    assert_eq!(
+        rt.handle(forbidden).await.status,
+        Some(StatusCode::FORBIDDEN)
+    );
 
     // Reads stay open ("read": "all").
     assert_eq!(
@@ -227,12 +257,18 @@ async fn auth_login_rbac_and_lockout() {
         })))
         .await;
     assert_eq!(locked.status, Some(StatusCode::UNAUTHORIZED));
-    assert!(locked.header("retry-after").is_some(), "lockout advertises Retry-After");
+    assert!(
+        locked.header("retry-after").is_some(),
+        "lockout advertises Retry-After"
+    );
 
     // A tampered token is rejected outright (401), not treated as anonymous.
     let mut tampered = req(Method::GET, "/admin/notes.txt");
     tampered.set_header("authorization", &format!("Bearer {token}x"));
-    assert_eq!(rt.handle(tampered).await.status, Some(StatusCode::UNAUTHORIZED));
+    assert_eq!(
+        rt.handle(tampered).await.status,
+        Some(StatusCode::UNAUTHORIZED)
+    );
 }
 
 #[tokio::test]
@@ -251,7 +287,10 @@ async fn self_config_hot_reload_swaps_atomically() {
             "email": "ada@demo.test", "password": "adapw"
         })))
         .await;
-    let token = body_json(&mut login).await["token"].as_str().unwrap().to_string();
+    let token = body_json(&mut login).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let bearer = format!("Bearer {token}");
 
     // The new mount does not exist yet.
@@ -266,7 +305,10 @@ async fn self_config_hot_reload_swaps_atomically() {
     assert_eq!(raw.status, Some(StatusCode::OK));
     let etag = raw.header("etag").unwrap().trim_matches('"').to_string();
     let mut config = body_json(&mut raw).await;
-    assert_eq!(config["auth"]["jwtSecret"], "<secret>", "secret never readable back");
+    assert_eq!(
+        config["auth"]["jwtSecret"], "<secret>",
+        "secret never readable back"
+    );
 
     // An invalid config is rejected wholesale; the running tenant is intact.
     let mut broken = config.clone();
@@ -277,14 +319,16 @@ async fn self_config_hot_reload_swaps_atomically() {
     put.set_header("authorization", &bearer);
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::BAD_REQUEST));
     assert_eq!(
-        rt.handle(req(Method::GET, "/order-summary/.pipelines/")).await.status,
+        rt.handle(req(Method::GET, "/order-summary/.pipelines/"))
+            .await
+            .status,
         Some(StatusCode::OK),
         "running tenant untouched after invalid PUT"
     );
 
     // Add a valid mount with If-Match → 204 + new version; hot-swapped.
     config["mounts"].as_array_mut().unwrap().push(json!({
-        "path": "/notes", "service": "file"
+        "path": "/notes", "service": "file", "config": { "access": "open" }
     }));
     let mut put = req(Method::PUT, "/services/raw").with_json(&config);
     put.set_header("if-match", &format!("\"{etag}\""));
@@ -305,7 +349,11 @@ async fn self_config_hot_reload_swaps_atomically() {
             "email": "ada@demo.test", "password": "adapw"
         })))
         .await;
-    assert_eq!(relogin.status, Some(StatusCode::OK), "secret preserved through round trip");
+    assert_eq!(
+        relogin.status,
+        Some(StatusCode::OK),
+        "secret preserved through round trip"
+    );
 
     // A stale If-Match now conflicts.
     let mut stale = req(Method::PUT, "/services/raw").with_json(&config);
@@ -360,7 +408,10 @@ async fn g6_idempotency_key_dedupes_and_replays() {
     reuse.set_header("idempotency-key", "k-widget-1");
     let mut conflict = rt.handle(reuse).await;
     assert_eq!(conflict.status, Some(StatusCode::UNPROCESSABLE_ENTITY));
-    assert_eq!(body_json(&mut conflict).await["code"], "idempotency_key_reuse");
+    assert_eq!(
+        body_json(&mut conflict).await["code"],
+        "idempotency_key_reuse"
+    );
 
     // Keys are scoped per path: the same key elsewhere is fresh.
     let mut other = req(Method::POST, "/data/gadgets").with_json(&json!({ "n": 1 }));
@@ -386,7 +437,10 @@ async fn g6_segment_retry_dedupes_keyed_effects() {
         async fn request(&self, msg: Message) -> Message {
             match msg.url.path.as_str() {
                 "/payments/charge" => {
-                    let key = msg.header("idempotency-key").expect("keyed call has a key").to_string();
+                    let key = msg
+                        .header("idempotency-key")
+                        .expect("keyed call has a key")
+                        .to_string();
                     let mut charges = self.0.charges.lock().unwrap();
                     if !charges.contains(&key) {
                         charges.push(key); // dedupe: same key executes once
@@ -429,8 +483,11 @@ async fn g6_segment_retry_dedupes_keyed_effects() {
         jitter: Jitter::None,
         ..Default::default()
     };
-    let executor =
-        Executor::new(Arc::new(MockRequester(backend.clone())), PipelineLimits::default(), retry);
+    let executor = Executor::new(
+        Arc::new(MockRequester(backend.clone())),
+        PipelineLimits::default(),
+        retry,
+    );
 
     let mut input = Message::request(Method::POST, "/run", "demo").with_json(&json!({}));
     input.source = Source::Internal;
@@ -489,29 +546,50 @@ async fn webhook_post_launches_a_pipeline() {
     let dir = tempfile::tempdir().unwrap();
     let config = json!({
         "mounts": [
-            { "path": "/data", "service": "data" },
+            { "path": "/data", "service": "data", "config": { "access": "open" } },
             // Open for the provider's unauthenticated POST.
             { "path": "/hooks", "service": "pipeline",
               "config": { "access": { "invoke": "all", "write": "all" } } }
         ]
     });
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir.path())), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(MutableLoader(Mutex::new(config)));
-    let rt =
-        Runtime::new(Tenancy::Single { tenant: "demo".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single {
+            tenant: "demo".into(),
+        },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
     // The trigger flow: store the event downstream, then ack 200 to the provider.
     let root = json!({ "pipeline": [ "PUT /data/events/incoming", { "received": true } ] });
     let author = req(Method::PUT, "/hooks/.pipelines/.root").with_json(&root);
-    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author .root");
+    assert_eq!(
+        rt.handle(author).await.status,
+        Some(StatusCode::CREATED),
+        "author .root"
+    );
 
     // A real external webhook POST (default Source::External, no principal).
-    let hook = req(Method::POST, "/hooks/stripe").with_json(&json!({ "id": "evt_1", "amount": 100 }));
-    assert_eq!(hook.source, Source::External, "a webhook is an external request");
+    let hook =
+        req(Method::POST, "/hooks/stripe").with_json(&json!({ "id": "evt_1", "amount": 100 }));
+    assert_eq!(
+        hook.source,
+        Source::External,
+        "a webhook is an external request"
+    );
     let mut resp = rt.handle(hook).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
-    assert_eq!(body_json(&mut resp).await["received"], true, "the pipeline acked");
+    assert_eq!(
+        body_json(&mut resp).await["received"],
+        true,
+        "the pipeline acked"
+    );
 
     // The flow fanned out: the event was stored downstream by the pipeline.
     let mut stored = rt.handle(req(Method::GET, "/data/events/incoming")).await;
@@ -535,16 +613,20 @@ async fn webhook_hmac_signature_is_verified_inline() {
     let config = json!({
         "secrets": { "wh": KEY },
         "mounts": [
-            { "path": "/data", "service": "data" },
+            { "path": "/data", "service": "data", "config": { "access": "open" } },
             { "path": "/hooks", "service": "pipeline",
               "config": { "access": { "invoke": "all", "write": "all" },
                           "secrets": ["wh"] } }
         ]
     });
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir.path())), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
     let rt = Runtime::new(
-        Tenancy::Single { tenant: "demo".into() },
+        Tenancy::Single {
+            tenant: "demo".into(),
+        },
         adapters,
         Arc::new(MutableLoader(Mutex::new(config))),
         LimitTable::default(),
@@ -558,7 +640,9 @@ async fn webhook_hmac_signature_is_verified_inline() {
         { "transform": { "received": true } }
     ] } });
     assert_eq!(
-        rt.handle(req(Method::PUT, "/hooks/.pipelines/.root").with_json(&root)).await.status,
+        rt.handle(req(Method::PUT, "/hooks/.pipelines/.root").with_json(&root))
+            .await
+            .status,
         Some(StatusCode::CREATED),
         "author .root"
     );
@@ -568,7 +652,12 @@ async fn webhook_hmac_signature_is_verified_inline() {
     let raw = serde_json::to_vec(&body).unwrap();
     let mut mac = Hmac::<Sha256>::new_from_slice(KEY.as_bytes()).unwrap();
     mac.update(&raw);
-    let sig: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let sig: String = mac
+        .finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
 
     // Valid signature → the flow runs and stores the event.
     let mut valid = req(Method::POST, "/hooks/stripe").with_json(&body);
@@ -583,5 +672,9 @@ async fn webhook_hmac_signature_is_verified_inline() {
     // Wrong signature → gated before any downstream effect.
     let mut forged = req(Method::POST, "/hooks/stripe").with_json(&body);
     forged.set_header("x-signature", &"0".repeat(64));
-    assert_eq!(rt.handle(forged).await.status, Some(StatusCode::BAD_REQUEST), "forged signature rejected");
+    assert_eq!(
+        rt.handle(forged).await.status,
+        Some(StatusCode::BAD_REQUEST),
+        "forged signature rejected"
+    );
 }

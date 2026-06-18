@@ -557,8 +557,10 @@ fn bson_decode_doc(b: &[u8], start: usize) -> (Value, usize) {
                 let (d, no) = bson_decode_doc(b, off);
                 off = no;
                 let o = d.as_object().unwrap();
-                let mut items: Vec<(usize, Value)> =
-                    o.iter().map(|(k, v)| (k.parse().unwrap_or(0), v.clone())).collect();
+                let mut items: Vec<(usize, Value)> = o
+                    .iter()
+                    .map(|(k, v)| (k.parse().unwrap_or(0), v.clone()))
+                    .collect();
                 items.sort_by_key(|(i, _)| *i);
                 Value::Array(items.into_iter().map(|(_, v)| v).collect())
             }
@@ -592,7 +594,8 @@ async fn spawn_mock_mongo() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     // collection -> (_id -> document)
-    let store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
     tokio::spawn(async move {
         while let Ok((sock, _)) = listener.accept().await {
             tokio::spawn(serve_mongo(sock, store.clone()));
@@ -601,7 +604,10 @@ async fn spawn_mock_mongo() -> u16 {
     port
 }
 
-async fn serve_mongo(mut sock: TcpStream, store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>) {
+async fn serve_mongo(
+    mut sock: TcpStream,
+    store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
+) {
     loop {
         let mut header = [0u8; 16];
         if sock.read_exact(&mut header).await.is_err() {
@@ -635,13 +641,24 @@ async fn serve_mongo(mut sock: TcpStream, store: Arc<Mutex<BTreeMap<String, BTre
 
 fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, Value>>>) -> Value {
     let str_of = |key: &str| cmd.get(key).and_then(|v| v.as_str());
-    let id_of = |d: &Value| d.get("q").and_then(|q| q.get("_id")).and_then(|v| v.as_str()).map(String::from);
+    let id_of = |d: &Value| {
+        d.get("q")
+            .and_then(|q| q.get("_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
     let mut s = store.lock().unwrap();
 
     if let Some(coll) = str_of("find") {
         let skip = cmd.get("skip").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let limit = cmd.get("limit").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as usize;
-        let want_id = cmd.get("filter").and_then(|f| f.get("_id")).and_then(|v| v.as_str());
+        let limit = cmd
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX) as usize;
+        let want_id = cmd
+            .get("filter")
+            .and_then(|f| f.get("_id"))
+            .and_then(|v| v.as_str());
         let mut batch: Vec<Value> = Vec::new();
         if let Some(map) = s.get(coll) {
             match want_id {
@@ -655,7 +672,11 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
         return json!({ "ok": 1.0, "n": s.get(coll).map(|m| m.len()).unwrap_or(0) as i64 });
     }
     if let Some(coll) = str_of("update") {
-        let updates = cmd.get("updates").and_then(|u| u.as_array()).cloned().unwrap_or_default();
+        let updates = cmd
+            .get("updates")
+            .and_then(|u| u.as_array())
+            .cloned()
+            .unwrap_or_default();
         let (mut n, mut nmod) = (0i64, 0i64);
         let mut upserted: Vec<Value> = Vec::new();
         let map = s.entry(coll.to_string()).or_default();
@@ -678,7 +699,11 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
         return reply;
     }
     if let Some(coll) = str_of("delete") {
-        let deletes = cmd.get("deletes").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        let deletes = cmd
+            .get("deletes")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
         let mut n = 0i64;
         if let Some(map) = s.get_mut(coll) {
             for d in &deletes {
@@ -696,7 +721,10 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
         return json!({ "ok": 1.0 });
     }
     if cmd.get("listCollections").is_some() {
-        let batch: Vec<Value> = s.keys().map(|name| json!({ "name": name, "type": "collection" })).collect();
+        let batch: Vec<Value> = s
+            .keys()
+            .map(|name| json!({ "name": name, "type": "collection" }))
+            .collect();
         return json!({ "ok": 1.0, "cursor": { "firstBatch": batch, "id": 0, "ns": "test.$cmd.listCollections" } });
     }
     json!({ "ok": 1.0 }) // hello / ping / unknown
@@ -730,7 +758,11 @@ async fn spawn_mock_redis_with_delay(delay: std::time::Duration) -> (u16, Arc<At
     (port, conns)
 }
 
-async fn serve_conn(mut sock: TcpStream, store: Arc<Mutex<BTreeMap<String, String>>>, delay: std::time::Duration) {
+async fn serve_conn(
+    mut sock: TcpStream,
+    store: Arc<Mutex<BTreeMap<String, String>>>,
+    delay: std::time::Duration,
+) {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(args) = read_command(&mut sock, &mut buf).await {
         let reply = exec(&args, &store);
@@ -783,7 +815,11 @@ async fn read_command(sock: &mut TcpStream, buf: &mut Vec<u8>) -> Option<Vec<Str
     let n: usize = header.strip_prefix('*')?.parse().ok()?;
     let mut args = Vec::with_capacity(n);
     for _ in 0..n {
-        let len: usize = read_line(sock, buf).await?.strip_prefix('$')?.parse().ok()?;
+        let len: usize = read_line(sock, buf)
+            .await?
+            .strip_prefix('$')?
+            .parse()
+            .ok()?;
         let data = read_n(sock, buf, len).await?;
         read_n(sock, buf, 2).await?; // trailing CRLF
         args.push(String::from_utf8_lossy(&data).to_string());
@@ -808,8 +844,11 @@ fn exec(args: &[String], store: &Mutex<BTreeMap<String, String>>) -> Vec<u8> {
         "EXISTS" => integer(store.contains_key(&args[1]) as i64),
         "KEYS" => {
             let prefix = args[1].strip_suffix('*').unwrap_or(&args[1]);
-            let matched: Vec<Vec<u8>> =
-                store.keys().filter(|k| k.starts_with(prefix)).map(|k| bulk(k)).collect();
+            let matched: Vec<Vec<u8>> = store
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .map(|k| bulk(k))
+                .collect();
             let mut out = format!("*{}\r\n", matched.len()).into_bytes();
             for m in matched {
                 out.extend_from_slice(&m);
@@ -836,7 +875,12 @@ fn req(method: Method, path: &str) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -863,20 +907,34 @@ async fn guest_backed_data_store_satisfies_the_store_contract() {
     let loader = Arc::new(StaticLoader(json!({ "mounts": [{
         "path": "/data",
         "service": "data",
-        "config": { "store": {
+        "config": { "access": "open", "store": {
             "adapter": "code:redis@v1",
             "host": "127.0.0.1",
             "port": port,
             "grants": { "redis": { "type": "socket", "hosts": [format!("127.0.0.1:{port}")] } }
         }}
     }]})));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
     // PUT create / overwrite, empty body, ETag.
-    let resp = rt.handle(req(Method::PUT, "/data/things/alpha").with_json(&json!({ "n": 1 }))).await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT create: {:?}", resp.body);
+    let resp = rt
+        .handle(req(Method::PUT, "/data/things/alpha").with_json(&json!({ "n": 1 })))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "PUT create: {:?}",
+        resp.body
+    );
     assert!(resp.body.is_none(), "PUT returns no body");
-    let resp = rt.handle(req(Method::PUT, "/data/things/alpha").with_json(&json!({ "n": 2 }))).await;
+    let resp = rt
+        .handle(req(Method::PUT, "/data/things/alpha").with_json(&json!({ "n": 2 })))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "PUT overwrite");
 
     // GET child: the resource, with a version ETag.
@@ -886,11 +944,27 @@ async fn guest_backed_data_store_satisfies_the_store_contract() {
     assert_eq!(body_json(&mut resp).await["n"], 2);
 
     // Keyless POST: 201 + Location, the new child is fetchable.
-    let resp = rt.handle(req(Method::POST, "/data/things/").with_json(&json!({ "n": 3 }))).await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "keyless POST: {:?}", resp.body);
-    let location = resp.header("location").expect("POST returns Location").to_string();
-    assert!(location.starts_with("/data/things/"), "Location under container");
-    assert_eq!(rt.handle(req(Method::GET, &location)).await.status, Some(StatusCode::OK));
+    let resp = rt
+        .handle(req(Method::POST, "/data/things/").with_json(&json!({ "n": 3 })))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "keyless POST: {:?}",
+        resp.body
+    );
+    let location = resp
+        .header("location")
+        .expect("POST returns Location")
+        .to_string();
+    assert!(
+        location.starts_with("/data/things/"),
+        "Location under container"
+    );
+    assert_eq!(
+        rt.handle(req(Method::GET, &location)).await.status,
+        Some(StatusCode::OK)
+    );
 
     // Container listing: one shape, one media type, paginated.
     let mut resp = rt.handle(req(Method::GET, "/data/things/")).await;
@@ -901,19 +975,31 @@ async fn guest_backed_data_store_satisfies_the_store_contract() {
     assert!(total >= 2, "X-Total-Count counts both children");
     let listing = body_json(&mut resp).await;
     assert!(
-        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "alpha" && e["dir"] == false),
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "alpha" && e["dir"] == false),
         "child appears as an entry: {listing}"
     );
     let mut resp = rt.handle(req(Method::GET, "/data/things/?$take=1")).await;
     let page = body_json(&mut resp).await;
     assert_eq!(page["entries"].as_array().unwrap().len(), 1, "$take pages");
-    assert_eq!(page["total"].as_u64(), Some(total), "paged total is the full count");
+    assert_eq!(
+        page["total"].as_u64(),
+        Some(total),
+        "paged total is the full count"
+    );
 
     // Mount root lists the dataset as a directory entry.
     let mut resp = rt.handle(req(Method::GET, "/data/")).await;
     let root = body_json(&mut resp).await;
     assert!(
-        root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "things/" && e["dir"] == true),
+        root["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "things/" && e["dir"] == true),
         "dataset is a dir entry at the root: {root}"
     );
 
@@ -923,17 +1009,25 @@ async fn guest_backed_data_store_satisfies_the_store_contract() {
     let mut listing = rt.handle(req(Method::GET, "/data/things/")).await;
     let listing = body_json(&mut listing).await;
     assert!(
-        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == ".schema.json"),
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == ".schema.json"),
         "schema is a fixed child: {listing}"
     );
 
     // DELETE child: 204, then gone.
     assert_eq!(
-        rt.handle(req(Method::DELETE, "/data/things/alpha")).await.status,
+        rt.handle(req(Method::DELETE, "/data/things/alpha"))
+            .await
+            .status,
         Some(StatusCode::NO_CONTENT)
     );
     assert_eq!(
-        rt.handle(req(Method::GET, "/data/things/alpha")).await.status,
+        rt.handle(req(Method::GET, "/data/things/alpha"))
+            .await
+            .status,
         Some(StatusCode::NOT_FOUND),
         "deleted child is gone"
     );
@@ -945,13 +1039,19 @@ async fn guest_backed_data_store_satisfies_the_store_contract() {
         "non-empty container delete is 409 without confirm"
     );
     assert_eq!(
-        rt.handle(req(Method::DELETE, "/data/things/?confirm=things")).await.status,
+        rt.handle(req(Method::DELETE, "/data/things/?confirm=things"))
+            .await
+            .status,
         Some(StatusCode::NO_CONTENT),
         "confirmed delete"
     );
 
     // The resident runtime pooled one connection across every request above.
-    assert_eq!(conns.load(Ordering::SeqCst), 1, "adapter pooled a single connection");
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        1,
+        "adapter pooled a single connection"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -965,15 +1065,24 @@ async fn missing_adapter_bundle_is_a_clear_error() {
     let loader = Arc::new(StaticLoader(json!({ "mounts": [{
         "path": "/data",
         "service": "data",
-        "config": { "store": {
+        "config": { "access": "open", "store": {
             "adapter": "code:absent@v9",
             "port": port,
             "grants": { "redis": { "type": "socket", "hosts": [format!("127.0.0.1:{port}")] } }
         }}
     }]})));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
     let resp = rt.handle(req(Method::GET, "/data/things/alpha")).await;
-    assert_eq!(resp.status, Some(StatusCode::NOT_FOUND), "undeployed adapter → 404");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::NOT_FOUND),
+        "undeployed adapter → 404"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -985,30 +1094,53 @@ async fn guest_backed_query_store_executes_a_stored_query() {
 
     // Deploy both adapters against the same mock: data (to seed records) and
     // query (to execute stored queries by scanning the dataset).
-    files.write("t", ".rs2-code/redis/v1.js", js(format!("{RESP_CLIENT}{DATA_HANDLER}"))).await.unwrap();
     files
-        .write("t", ".rs2-code/redis-query/v1.js", js(format!("{RESP_CLIENT}{QUERY_HANDLER}")))
+        .write(
+            "t",
+            ".rs2-code/redis/v1.js",
+            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+        )
+        .await
+        .unwrap();
+    files
+        .write(
+            "t",
+            ".rs2-code/redis-query/v1.js",
+            js(format!("{RESP_CLIENT}{QUERY_HANDLER}")),
+        )
         .await
         .unwrap();
 
     let socket = json!({ "type": "socket", "hosts": [format!("127.0.0.1:{port}")] });
     let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
-        { "path": "/data", "service": "data", "config": { "store": {
+        { "path": "/data", "service": "data", "config": { "access": "open", "store": {
             "adapter": "code:redis@v1", "host": "127.0.0.1", "port": port,
             "grants": { "redis": socket.clone() }
         }}},
-        { "path": "/q", "service": "query", "config": { "store": {
+        { "path": "/q", "service": "query", "config": { "access": "open", "store": {
             "adapter": "code:redis-query@v1", "host": "127.0.0.1", "port": port,
             "grants": { "redis": socket }
         }}}
     ]})));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
     // Seed records through the guest data mount.
-    for (k, status, total) in [("o1", "open", 50), ("o2", "closed", 200), ("o3", "open", 150)] {
+    for (k, status, total) in [
+        ("o1", "open", 50),
+        ("o2", "closed", 200),
+        ("o3", "open", 150),
+    ] {
         let resp = rt
-            .handle(req(Method::PUT, &format!("/data/orders/{k}")).with_json(&json!({ "status": status, "total": total })))
+            .handle(
+                req(Method::PUT, &format!("/data/orders/{k}"))
+                    .with_json(&json!({ "status": status, "total": total })),
+            )
             .await;
         assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {k}");
     }
@@ -1020,25 +1152,53 @@ async fn guest_backed_query_store_executes_a_stored_query() {
         "params": { "type": "object", "properties": { "status": { "type": "string" } } }
     });
     let put = req(Method::PUT, "/q/.queries/by-status").with_json(&envelope);
-    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED), "author query");
+    assert_eq!(
+        rt.handle(put).await.status,
+        Some(StatusCode::CREATED),
+        "author query"
+    );
 
     // Execute: the param substitutes structurally, the guest query store runs
     // it against the shared backend, and the matching rows come back.
-    let mut resp = rt.handle(req(Method::GET, "/q/by-status?status=open")).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "execute: {:?}", resp.body);
+    let mut resp = rt
+        .handle(req(Method::GET, "/q/by-status?status=open"))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "execute: {:?}",
+        resp.body
+    );
     assert_eq!(resp.header("x-total-count"), Some("2"), "X-Total-Count");
     let rows = body_json(&mut resp).await;
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 2, "two open orders: {rows:?}");
-    assert!(rows.iter().all(|r| r["status"] == "open"), "only open orders: {rows:?}");
+    assert!(
+        rows.iter().all(|r| r["status"] == "open"),
+        "only open orders: {rows:?}"
+    );
 
     // Pagination narrows rows, not the reported total.
-    let mut resp = rt.handle(req(Method::GET, "/q/by-status?status=open&$take=1")).await;
-    assert_eq!(resp.header("x-total-count"), Some("2"), "paged total is the full count");
-    assert_eq!(body_json(&mut resp).await.as_array().unwrap().len(), 1, "$take pages");
+    let mut resp = rt
+        .handle(req(Method::GET, "/q/by-status?status=open&$take=1"))
+        .await;
+    assert_eq!(
+        resp.header("x-total-count"),
+        Some("2"),
+        "paged total is the full count"
+    );
+    assert_eq!(
+        body_json(&mut resp).await.as_array().unwrap().len(),
+        1,
+        "$take pages"
+    );
 
     // Each guest mount pooled its own single connection (data + query = 2).
-    assert_eq!(conns.load(Ordering::SeqCst), 2, "one pooled connection per resident mount");
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        2,
+        "one pooled connection per resident mount"
+    );
 }
 
 /// Build a single-`/data` runtime backed by the redis adapter, with extra
@@ -1052,10 +1212,15 @@ fn data_rt(port: u16, files: Arc<LocalFsFileStore>, extra: serde_json::Value) ->
         store[k] = v.clone();
     }
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
-        { "path": "/data", "service": "data", "config": { "store": store } }
+        { "path": "/data", "service": "data", "config": { "access": "open", "store": store } }
     ]})));
     let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1066,7 +1231,14 @@ async fn pool_grows_under_concurrency_and_caps_at_max_runtimes() {
     let dir = tempfile::tempdir().unwrap();
     let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
     let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
-    files.write("t", ".rs2-code/redis/v1.js", js(format!("{RESP_CLIENT}{DATA_HANDLER}"))).await.unwrap();
+    files
+        .write(
+            "t",
+            ".rs2-code/redis/v1.js",
+            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+        )
+        .await
+        .unwrap();
     // idleMs:0 disables eviction so it can't interfere with the count.
     let rt = data_rt(port, files, json!({ "maxRuntimes": 2, "idleMs": 0 }));
 
@@ -1079,7 +1251,11 @@ async fn pool_grows_under_concurrency_and_caps_at_max_runtimes() {
     for r in [&a, &b, &c, &d] {
         assert_eq!(r.status, Some(StatusCode::NOT_FOUND), "missing key → 404");
     }
-    assert_eq!(conns.load(Ordering::SeqCst), 2, "pool grew to maxRuntimes=2 and capped there");
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        2,
+        "pool grew to maxRuntimes=2 and capped there"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1088,13 +1264,26 @@ async fn idle_runtimes_are_evicted_and_respawn() {
     let dir = tempfile::tempdir().unwrap();
     let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
     let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
-    files.write("t", ".rs2-code/redis/v1.js", js(format!("{RESP_CLIENT}{DATA_HANDLER}"))).await.unwrap();
+    files
+        .write(
+            "t",
+            ".rs2-code/redis/v1.js",
+            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+        )
+        .await
+        .unwrap();
     let rt = data_rt(port, files, json!({ "idleMs": 150 }));
 
     // First call spawns a runtime and opens one connection.
-    let resp = rt.handle(req(Method::PUT, "/data/things/a").with_json(&json!({ "n": 1 }))).await;
+    let resp = rt
+        .handle(req(Method::PUT, "/data/things/a").with_json(&json!({ "n": 1 })))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED));
-    assert_eq!(conns.load(Ordering::SeqCst), 1, "one connection after first call");
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        1,
+        "one connection after first call"
+    );
 
     // Idle past the eviction window + a few sweeper ticks: the runtime is
     // dropped, closing its socket.
@@ -1103,9 +1292,17 @@ async fn idle_runtimes_are_evicted_and_respawn() {
     // The next call finds an empty pool and re-spawns → a fresh connection. (If
     // the idle runtime had survived, this would reuse it and stay at 1.)
     let mut resp = rt.handle(req(Method::GET, "/data/things/a")).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "record still in the backend");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "record still in the backend"
+    );
     assert_eq!(body_json(&mut resp).await["n"], 1);
-    assert_eq!(conns.load(Ordering::SeqCst), 2, "idle runtime was evicted; next call re-spawned");
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        2,
+        "idle runtime was evicted; next call re-spawned"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1113,20 +1310,32 @@ async fn guest_backed_file_store_satisfies_the_store_contract() {
     let dir = tempfile::tempdir().unwrap();
     let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
     let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
-    files.write("t", ".rs2-code/files/v1.js", js(FILE_ADAPTER.to_string())).await.unwrap();
+    files
+        .write("t", ".rs2-code/files/v1.js", js(FILE_ADAPTER.to_string()))
+        .await
+        .unwrap();
 
     let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
-        { "path": "/files", "service": "file", "config": { "store": { "adapter": "code:files@v1" } } }
+        { "path": "/files", "service": "file", "config": { "access": "open", "store": { "adapter": "code:files@v1" } } }
     ]})));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
     let body = |i: u32| Body::from_string(format!("content-{i}"), MediaType::new("text/plain"));
 
     // PUT create / overwrite, empty body.
-    let resp = rt.handle(req(Method::PUT, "/files/docs/alpha").with_body(body(1))).await;
+    let resp = rt
+        .handle(req(Method::PUT, "/files/docs/alpha").with_body(body(1)))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT create");
     assert!(resp.body.is_none(), "PUT returns no body");
-    let resp = rt.handle(req(Method::PUT, "/files/docs/alpha").with_body(body(2))).await;
+    let resp = rt
+        .handle(req(Method::PUT, "/files/docs/alpha").with_body(body(2)))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "PUT overwrite");
 
     // GET child: content + ETag (from the store-reported version).
@@ -1137,11 +1346,19 @@ async fn guest_backed_file_store_satisfies_the_store_contract() {
     assert_eq!(&bytes[..], b"content-2");
 
     // Keyless POST → 201 + Location, fetchable.
-    let resp = rt.handle(req(Method::POST, "/files/docs/").with_body(body(3))).await;
+    let resp = rt
+        .handle(req(Method::POST, "/files/docs/").with_body(body(3)))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "keyless POST");
     let location = resp.header("location").expect("Location").to_string();
-    assert!(location.starts_with("/files/docs/"), "Location under container");
-    assert_eq!(rt.handle(req(Method::GET, &location)).await.status, Some(StatusCode::OK));
+    assert!(
+        location.starts_with("/files/docs/"),
+        "Location under container"
+    );
+    assert_eq!(
+        rt.handle(req(Method::GET, &location)).await.status,
+        Some(StatusCode::OK)
+    );
 
     // Container listing: dir+json shape, paginated.
     let mut resp = rt.handle(req(Method::GET, "/files/docs/")).await;
@@ -1152,37 +1369,64 @@ async fn guest_backed_file_store_satisfies_the_store_contract() {
     assert!(total >= 2, "X-Total-Count counts both children");
     let listing = body_json(&mut resp).await;
     assert!(
-        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "alpha" && e["dir"] == false),
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "alpha" && e["dir"] == false),
         "child appears as an entry: {listing}"
     );
     let mut resp = rt.handle(req(Method::GET, "/files/docs/?$take=1")).await;
     let page = body_json(&mut resp).await;
     assert_eq!(page["entries"].as_array().unwrap().len(), 1, "$take pages");
-    assert_eq!(page["total"].as_u64(), Some(total), "paged total is the full count");
+    assert_eq!(
+        page["total"].as_u64(),
+        Some(total),
+        "paged total is the full count"
+    );
 
     // Mount root lists the directory.
     let mut resp = rt.handle(req(Method::GET, "/files/")).await;
     let root = body_json(&mut resp).await;
     assert!(
-        root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "docs/" && e["dir"] == true),
+        root["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "docs/" && e["dir"] == true),
         "directory at the root: {root}"
     );
 
     // HEAD reports the size; a Range serves a 206 slice (the `range` facet).
     let resp = rt.handle(req(Method::HEAD, "/files/docs/alpha")).await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.header("content-length"), Some("9"), "HEAD content-length (content-2)");
+    assert_eq!(
+        resp.header("content-length"),
+        Some("9"),
+        "HEAD content-length (content-2)"
+    );
     let mut ranged = req(Method::GET, "/files/docs/alpha");
     ranged.set_header("range", "bytes=0-6");
     let mut resp = rt.handle(ranged).await;
-    assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT), "range → 206");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::PARTIAL_CONTENT),
+        "range → 206"
+    );
     let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
     assert_eq!(&bytes[..], b"content", "first 7 bytes");
 
     // DELETE child → 204, gone.
-    assert_eq!(rt.handle(req(Method::DELETE, "/files/docs/alpha")).await.status, Some(StatusCode::NO_CONTENT));
     assert_eq!(
-        rt.handle(req(Method::GET, "/files/docs/alpha")).await.status,
+        rt.handle(req(Method::DELETE, "/files/docs/alpha"))
+            .await
+            .status,
+        Some(StatusCode::NO_CONTENT)
+    );
+    assert_eq!(
+        rt.handle(req(Method::GET, "/files/docs/alpha"))
+            .await
+            .status,
         Some(StatusCode::NOT_FOUND),
         "deleted child is gone"
     );
@@ -1194,14 +1438,20 @@ async fn guest_backed_file_store_satisfies_the_store_contract() {
         "non-empty container delete is 409 without confirm"
     );
     assert_eq!(
-        rt.handle(req(Method::DELETE, "/files/docs/?confirm=docs")).await.status,
+        rt.handle(req(Method::DELETE, "/files/docs/?confirm=docs"))
+            .await
+            .status,
         Some(StatusCode::NO_CONTENT),
         "confirmed delete"
     );
     let mut resp = rt.handle(req(Method::GET, "/files/")).await;
     let root = body_json(&mut resp).await;
     assert!(
-        !root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "docs/"),
+        !root["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "docs/"),
         "deleted directory left the root listing: {root}"
     );
 }
@@ -1212,21 +1462,44 @@ async fn guest_backed_mongo_data_store_satisfies_the_store_contract() {
     let dir = tempfile::tempdir().unwrap();
     let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
     let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
-    files.write("t", ".rs2-code/mongo/v1.js", js(MONGO_ADAPTER.to_string())).await.unwrap();
+    files
+        .write("t", ".rs2-code/mongo/v1.js", js(MONGO_ADAPTER.to_string()))
+        .await
+        .unwrap();
 
     let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
     let loader = Arc::new(StaticLoader(json!({ "mounts": [{
-        "path": "/data", "service": "data", "config": { "store": {
+        "path": "/data", "service": "data", "config": { "access": "open", "store": {
             "adapter": "code:mongo@v1", "host": "127.0.0.1", "port": port, "db": "test",
             "grants": { "mongo": { "type": "socket", "hosts": [format!("127.0.0.1:{port}")] } }
         }}
     }]})));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
     // PUT create / overwrite over the real Mongo wire protocol.
-    let resp = rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "status": "open", "total": 50 }))).await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT create: {:?}", resp.body);
-    let resp = rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "status": "open", "total": 55 }))).await;
+    let resp = rt
+        .handle(
+            req(Method::PUT, "/data/orders/o1")
+                .with_json(&json!({ "status": "open", "total": 50 })),
+        )
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "PUT create: {:?}",
+        resp.body
+    );
+    let resp = rt
+        .handle(
+            req(Method::PUT, "/data/orders/o1")
+                .with_json(&json!({ "status": "open", "total": 55 })),
+        )
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "PUT overwrite");
 
     // GET round-trips the record (BSON encode → mock → BSON decode).
@@ -1239,10 +1512,15 @@ async fn guest_backed_mongo_data_store_satisfies_the_store_contract() {
     assert!(rec.get("_id").is_none(), "_id is stripped from the record");
 
     // Keyless POST → 201 + Location, fetchable.
-    let resp = rt.handle(req(Method::POST, "/data/orders/").with_json(&json!({ "status": "new" }))).await;
+    let resp = rt
+        .handle(req(Method::POST, "/data/orders/").with_json(&json!({ "status": "new" })))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "keyless POST");
     let location = resp.header("location").expect("Location").to_string();
-    assert_eq!(rt.handle(req(Method::GET, &location)).await.status, Some(StatusCode::OK));
+    assert_eq!(
+        rt.handle(req(Method::GET, &location)).await.status,
+        Some(StatusCode::OK)
+    );
 
     // Container listing + pagination (find + count commands).
     let mut resp = rt.handle(req(Method::GET, "/data/orders/")).await;
@@ -1251,35 +1529,66 @@ async fn guest_backed_mongo_data_store_satisfies_the_store_contract() {
     assert!(total >= 2, "X-Total-Count");
     let listing = body_json(&mut resp).await;
     assert!(
-        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == "o1" && e["dir"] == false),
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "o1" && e["dir"] == false),
         "record appears as an entry: {listing}"
     );
     let mut resp = rt.handle(req(Method::GET, "/data/orders/?$take=1")).await;
     let page = body_json(&mut resp).await;
     assert_eq!(page["entries"].as_array().unwrap().len(), 1, "$take pages");
-    assert_eq!(page["total"].as_u64(), Some(total), "paged total is the full count");
+    assert_eq!(
+        page["total"].as_u64(),
+        Some(total),
+        "paged total is the full count"
+    );
 
     // Mount root lists the collection as a dataset.
     let mut resp = rt.handle(req(Method::GET, "/data/")).await;
     let root = body_json(&mut resp).await;
     assert!(
-        root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "orders/" && e["dir"] == true),
+        root["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "orders/" && e["dir"] == true),
         "dataset at the root: {root}"
     );
 
     // Schema facet: install (a separate collection), read back, shown in listing.
     let put = req(Method::PUT, "/data/orders/.schema.json").with_json(&json!({ "type": "object" }));
-    assert_eq!(rt.handle(put).await.status, Some(StatusCode::OK), "install schema");
-    let mut resp = rt.handle(req(Method::GET, "/data/orders/.schema.json")).await;
-    assert_eq!(body_json(&mut resp).await["type"], "object", "schema reads back");
+    assert_eq!(
+        rt.handle(put).await.status,
+        Some(StatusCode::OK),
+        "install schema"
+    );
+    let mut resp = rt
+        .handle(req(Method::GET, "/data/orders/.schema.json"))
+        .await;
+    assert_eq!(
+        body_json(&mut resp).await["type"],
+        "object",
+        "schema reads back"
+    );
     let mut listing = rt.handle(req(Method::GET, "/data/orders/")).await;
     assert!(
-        body_json(&mut listing).await["entries"].as_array().unwrap().iter().any(|e| e["name"] == ".schema.json"),
+        body_json(&mut listing).await["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == ".schema.json"),
         "schema is a fixed child"
     );
 
     // DELETE child → 204, gone.
-    assert_eq!(rt.handle(req(Method::DELETE, "/data/orders/o1")).await.status, Some(StatusCode::NO_CONTENT));
+    assert_eq!(
+        rt.handle(req(Method::DELETE, "/data/orders/o1"))
+            .await
+            .status,
+        Some(StatusCode::NO_CONTENT)
+    );
     assert_eq!(
         rt.handle(req(Method::GET, "/data/orders/o1")).await.status,
         Some(StatusCode::NOT_FOUND),
@@ -1293,14 +1602,20 @@ async fn guest_backed_mongo_data_store_satisfies_the_store_contract() {
         "non-empty container delete is 409 without confirm"
     );
     assert_eq!(
-        rt.handle(req(Method::DELETE, "/data/orders/?confirm=orders")).await.status,
+        rt.handle(req(Method::DELETE, "/data/orders/?confirm=orders"))
+            .await
+            .status,
         Some(StatusCode::NO_CONTENT),
         "confirmed delete drops the collection"
     );
     let mut resp = rt.handle(req(Method::GET, "/data/")).await;
     let root = body_json(&mut resp).await;
     assert!(
-        !root["entries"].as_array().unwrap().iter().any(|e| e["name"] == "orders/"),
+        !root["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == "orders/"),
         "dropped collection left the root listing: {root}"
     );
 }

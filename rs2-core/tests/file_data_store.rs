@@ -28,8 +28,14 @@ const NOT_FOUND: &str = "not_found";
 /// list empty, listings, and delete semantics.
 async fn assert_datastore_contract(store: &dyn DataStore) {
     // Missing record / missing dataset are not_found.
-    assert_eq!(store.get("t", "ds", "nope").await.unwrap_err().code, NOT_FOUND);
-    assert_eq!(store.list_keys("t", "ds", 100, 0).await.unwrap_err().code, NOT_FOUND);
+    assert_eq!(
+        store.get("t", "ds", "nope").await.unwrap_err().code,
+        NOT_FOUND
+    );
+    assert_eq!(
+        store.list_keys("t", "ds", 100, 0).await.unwrap_err().code,
+        NOT_FOUND
+    );
 
     // put returns created (true) then updated (false); get reads back.
     assert!(store.put("t", "ds", "k1", json!({ "v": 1 })).await.unwrap());
@@ -46,17 +52,38 @@ async fn assert_datastore_contract(store: &dyn DataStore) {
 
     // Schema round-trips; a schema-only dataset lists empty (not not_found).
     assert_eq!(store.get_schema("t", "ds").await.unwrap(), None);
-    store.put_schema("t", "empties", json!({ "type": "object" })).await.unwrap();
-    assert_eq!(store.get_schema("t", "empties").await.unwrap(), Some(json!({ "type": "object" })));
-    assert_eq!(store.list_keys("t", "empties", 100, 0).await.unwrap(), (vec![], 0));
+    store
+        .put_schema("t", "empties", json!({ "type": "object" }))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_schema("t", "empties").await.unwrap(),
+        Some(json!({ "type": "object" }))
+    );
+    assert_eq!(
+        store.list_keys("t", "empties", 100, 0).await.unwrap(),
+        (vec![], 0)
+    );
 
     // Delete record (idempotency: second delete is not_found), then dataset.
     store.delete("t", "ds", "k1").await.unwrap();
-    assert_eq!(store.get("t", "ds", "k1").await.unwrap_err().code, NOT_FOUND);
-    assert_eq!(store.delete("t", "ds", "k1").await.unwrap_err().code, NOT_FOUND);
+    assert_eq!(
+        store.get("t", "ds", "k1").await.unwrap_err().code,
+        NOT_FOUND
+    );
+    assert_eq!(
+        store.delete("t", "ds", "k1").await.unwrap_err().code,
+        NOT_FOUND
+    );
     store.delete_dataset("t", "ds").await.unwrap();
-    assert_eq!(store.list_keys("t", "ds", 100, 0).await.unwrap_err().code, NOT_FOUND);
-    assert_eq!(store.delete_dataset("t", "nope").await.unwrap_err().code, NOT_FOUND);
+    assert_eq!(
+        store.list_keys("t", "ds", 100, 0).await.unwrap_err().code,
+        NOT_FOUND
+    );
+    assert_eq!(
+        store.delete_dataset("t", "nope").await.unwrap_err().code,
+        NOT_FOUND
+    );
 }
 
 #[tokio::test]
@@ -73,11 +100,17 @@ async fn records_survive_a_dropped_file_store_handle() {
     let key = "user@example.com"; // exercises key encoding on disk
     {
         let file: Arc<dyn FileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
-        FileDataStore::new(file).put("t", "users", key, json!({ "role": "A" })).await.unwrap();
+        FileDataStore::new(file)
+            .put("t", "users", key, json!({ "role": "A" }))
+            .await
+            .unwrap();
     }
     // A fresh adapter over the same root still sees the record — unlike mem.
     let file: Arc<dyn FileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
-    let got = FileDataStore::new(file).get("t", "users", key).await.unwrap();
+    let got = FileDataStore::new(file)
+        .get("t", "users", key)
+        .await
+        .unwrap();
     assert_eq!(got, json!({ "role": "A" }));
 }
 
@@ -95,19 +128,30 @@ impl ConfigLoader for StaticLoader {
 /// A runtime with a `data` mount selecting `builtin:file` over `data_root`.
 /// Re-call with the same `data_root` to simulate a node restart.
 fn runtime(file_root: &std::path::Path, data_root: &std::path::Path) -> Arc<Runtime> {
-    let mut adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(file_root)), Arc::new(MemDataStore::new()));
+    let mut adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(file_root)),
+        Arc::new(MemDataStore::new()),
+    );
     let data_fs: Arc<dyn FileStore> = Arc::new(LocalFsFileStore::new(data_root));
     adapters.builtins.register_data(
         "file",
-        Arc::new(move |_cfg| Ok(Arc::new(FileDataStore::new(data_fs.clone())) as Arc<dyn DataStore>)),
+        Arc::new(move |_cfg| {
+            Ok(Arc::new(FileDataStore::new(data_fs.clone())) as Arc<dyn DataStore>)
+        }),
     );
     let loader = Arc::new(StaticLoader(json!({
         "mounts": [
-            { "path": "/data", "service": "data", "config": { "store": { "adapter": "builtin:file" } } }
+            { "path": "/data", "service": "data", "config": { "access": "open", "store": { "adapter": "builtin:file" } } }
         ]
     })));
-    Runtime::new(Tenancy::Single { tenant: "t1".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 fn req(method: Method, path: &str) -> Message {
@@ -122,11 +166,15 @@ async fn data_service_store_contract_over_builtin_file() {
 
     // PUT creates → 201; re-PUT overwrites → 200.
     assert_eq!(
-        rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "total": 5 }))).await.status,
+        rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "total": 5 })))
+            .await
+            .status,
         Some(StatusCode::CREATED)
     );
     assert_eq!(
-        rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "total": 7 }))).await.status,
+        rt.handle(req(Method::PUT, "/data/orders/o1").with_json(&json!({ "total": 7 })))
+            .await
+            .status,
         Some(StatusCode::OK)
     );
 
@@ -134,10 +182,14 @@ async fn data_service_store_contract_over_builtin_file() {
     let mut resp = rt.handle(req(Method::GET, "/data/orders/o1")).await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     assert!(resp.header("etag").is_some());
-    assert_eq!(resp.body.as_mut().unwrap().as_json(65536).await.unwrap()["total"], 7);
+    assert_eq!(
+        resp.body.as_mut().unwrap().as_json(65536).await.unwrap()["total"],
+        7
+    );
 
     // Dataset listing (dir+json) and the root dataset enumeration.
-    rt.handle(req(Method::PUT, "/data/orders/o2").with_json(&json!({ "total": 9 }))).await;
+    rt.handle(req(Method::PUT, "/data/orders/o2").with_json(&json!({ "total": 9 })))
+        .await;
     let mut resp = rt.handle(req(Method::GET, "/data/orders/")).await;
     let listing = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     assert_eq!(listing["total"], 2);
@@ -147,7 +199,9 @@ async fn data_service_store_contract_over_builtin_file() {
 
     // DELETE a record → 204; the dataset delete needs the confirm token.
     assert_eq!(
-        rt.handle(req(Method::DELETE, "/data/orders/o2")).await.status,
+        rt.handle(req(Method::DELETE, "/data/orders/o2"))
+            .await
+            .status,
         Some(StatusCode::NO_CONTENT)
     );
     assert_eq!(
@@ -164,7 +218,9 @@ async fn records_persist_across_restart() {
     // First "boot": write a record.
     let rt = runtime(files.path(), data.path());
     assert_eq!(
-        rt.handle(req(Method::PUT, "/data/users/ada").with_json(&json!({ "role": "A" }))).await.status,
+        rt.handle(req(Method::PUT, "/data/users/ada").with_json(&json!({ "role": "A" })))
+            .await
+            .status,
         Some(StatusCode::CREATED)
     );
     drop(rt);
@@ -173,5 +229,8 @@ async fn records_persist_across_restart() {
     let rt = runtime(files.path(), data.path());
     let mut resp = rt.handle(req(Method::GET, "/data/users/ada")).await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.body.as_mut().unwrap().as_json(65536).await.unwrap()["role"], "A");
+    assert_eq!(
+        resp.body.as_mut().unwrap().as_json(65536).await.unwrap()["role"],
+        "A"
+    );
 }

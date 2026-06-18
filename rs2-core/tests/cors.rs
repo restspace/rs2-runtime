@@ -40,11 +40,16 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
             "allowedOrigins": ["https://reader.example"]
         },
         "mounts": [
-            { "path": "/data", "service": "data" },
-            { "path": "/auth", "service": "auth" }
+            { "path": "/data", "service": "data", "config": { "access": "open" } },
+            { "path": "/auth", "service": "auth", "config": { "access": "open" } }
         ]
     })));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 const HOST: &str = "api.acme.test";
@@ -75,26 +80,50 @@ async fn preflights_answer_before_routing() {
     let rt = rt(dir.path());
 
     // Trusted origin: 204 with credentialed CORS, never reaching a service.
-    let mut preflight = req(Method::OPTIONS, "/data/things", Some("https://app.acme.test"));
+    let mut preflight = req(
+        Method::OPTIONS,
+        "/data/things",
+        Some("https://app.acme.test"),
+    );
     preflight.set_header("access-control-request-method", "PUT");
     preflight.set_header("access-control-request-headers", "content-type, if-match");
     let resp = rt.handle(preflight).await;
     assert_eq!(resp.status, Some(StatusCode::NO_CONTENT));
-    assert_eq!(resp.header("access-control-allow-origin"), Some("https://app.acme.test"));
-    assert_eq!(resp.header("access-control-allow-credentials"), Some("true"));
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.acme.test")
+    );
+    assert_eq!(
+        resp.header("access-control-allow-credentials"),
+        Some("true")
+    );
     assert_eq!(resp.header("access-control-allow-methods"), Some("PUT"));
-    assert_eq!(resp.header("access-control-allow-headers"), Some("content-type, if-match"));
+    assert_eq!(
+        resp.header("access-control-allow-headers"),
+        Some("content-type, if-match")
+    );
 
     // Allowed (non-trusted) origin: CORS yes, credentials no.
-    let mut preflight = req(Method::OPTIONS, "/data/things", Some("https://reader.example"));
+    let mut preflight = req(
+        Method::OPTIONS,
+        "/data/things",
+        Some("https://reader.example"),
+    );
     preflight.set_header("access-control-request-method", "GET");
     let resp = rt.handle(preflight).await;
     assert_eq!(resp.status, Some(StatusCode::NO_CONTENT));
-    assert_eq!(resp.header("access-control-allow-origin"), Some("https://reader.example"));
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://reader.example")
+    );
     assert_eq!(resp.header("access-control-allow-credentials"), None);
 
     // Unlisted origin: not answered as a preflight, no CORS headers.
-    let mut preflight = req(Method::OPTIONS, "/data/things", Some("https://evil.example"));
+    let mut preflight = req(
+        Method::OPTIONS,
+        "/data/things",
+        Some("https://evil.example"),
+    );
     preflight.set_header("access-control-request-method", "GET");
     let resp = rt.handle(preflight).await;
     assert_eq!(resp.header("access-control-allow-origin"), None);
@@ -109,25 +138,60 @@ async fn responses_and_errors_carry_cors_for_permitted_origins() {
     // Success path, allowed origin: origin echo + exposed headers, no credentials.
     let put = req(Method::PUT, "/data/things/x", None).with_json(&json!({ "n": 1 }));
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
-    let resp = rt.handle(req(Method::GET, "/data/things/x", Some("https://reader.example"))).await;
+    let resp = rt
+        .handle(req(
+            Method::GET,
+            "/data/things/x",
+            Some("https://reader.example"),
+        ))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.header("access-control-allow-origin"), Some("https://reader.example"));
-    assert!(resp.header("access-control-expose-headers").unwrap().contains("x-total-count"));
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://reader.example")
+    );
+    assert!(resp
+        .header("access-control-expose-headers")
+        .unwrap()
+        .contains("x-total-count"));
     assert_eq!(resp.header("access-control-allow-credentials"), None);
 
     // Error responses are decorated too (browsers can't read undecorated errors).
-    let resp = rt.handle(req(Method::GET, "/data/things/nope", Some("https://x.acme.dev"))).await;
+    let resp = rt
+        .handle(req(
+            Method::GET,
+            "/data/things/nope",
+            Some("https://x.acme.dev"),
+        ))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::NOT_FOUND));
-    assert_eq!(resp.header("access-control-allow-origin"), Some("https://x.acme.dev"));
-    assert_eq!(resp.header("access-control-allow-credentials"), Some("true"));
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://x.acme.dev")
+    );
+    assert_eq!(
+        resp.header("access-control-allow-credentials"),
+        Some("true")
+    );
 
     // Unlisted origin: no CORS headers at all.
-    let resp = rt.handle(req(Method::GET, "/data/things/x", Some("https://evil.example"))).await;
+    let resp = rt
+        .handle(req(
+            Method::GET,
+            "/data/things/x",
+            Some("https://evil.example"),
+        ))
+        .await;
     assert_eq!(resp.header("access-control-allow-origin"), None);
 
     // Same-origin browser request: CORS not involved.
-    let resp =
-        rt.handle(req(Method::GET, "/data/things/x", Some(&format!("https://{HOST}")))).await;
+    let resp = rt
+        .handle(req(
+            Method::GET,
+            "/data/things/x",
+            Some(&format!("https://{HOST}")),
+        ))
+        .await;
     assert_eq!(resp.header("access-control-allow-origin"), None);
 }
 
@@ -149,7 +213,11 @@ async fn csrf_guard_blocks_untrusted_cookie_writes() {
         .with_json(&json!({ "n": 1 }));
     bearer.set_header("authorization", "Bearer junk");
     let resp = rt.handle(bearer).await;
-    assert_eq!(resp.status, Some(StatusCode::UNAUTHORIZED), "fails on the bad token, not CSRF");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::UNAUTHORIZED),
+        "fails on the bad token, not CSRF"
+    );
 
     // Trusted origin with a cookie is allowed through the guard.
     let mut trusted = req(Method::PUT, "/data/things/x", Some("https://app.acme.test"))
@@ -165,7 +233,9 @@ async fn auth_cookie_attributes_follow_origin_trust() {
     seed_user(&rt).await;
 
     // Non-browser (no Origin): SameSite=Strict cookie.
-    let resp = rt.handle(req(Method::POST, "/auth/login", None).with_json(&login_body())).await;
+    let resp = rt
+        .handle(req(Method::POST, "/auth/login", None).with_json(&login_body()))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     let cookie = resp.header("set-cookie").unwrap();
     assert!(cookie.contains("SameSite=Strict"), "{cookie}");
@@ -173,11 +243,18 @@ async fn auth_cookie_attributes_follow_origin_trust() {
     // Same-origin browser: SameSite=Strict.
     let resp = rt
         .handle(
-            req(Method::POST, "/auth/login", Some(&format!("https://{HOST}")))
-                .with_json(&login_body()),
+            req(
+                Method::POST,
+                "/auth/login",
+                Some(&format!("https://{HOST}")),
+            )
+            .with_json(&login_body()),
         )
         .await;
-    assert!(resp.header("set-cookie").unwrap().contains("SameSite=Strict"));
+    assert!(resp
+        .header("set-cookie")
+        .unwrap()
+        .contains("SameSite=Strict"));
 
     // Trusted cross-origin: SameSite=None; Secure (required for cross-site).
     let resp = rt
@@ -187,7 +264,10 @@ async fn auth_cookie_attributes_follow_origin_trust() {
         )
         .await;
     let cookie = resp.header("set-cookie").unwrap();
-    assert!(cookie.contains("SameSite=None") && cookie.contains("Secure"), "{cookie}");
+    assert!(
+        cookie.contains("SameSite=None") && cookie.contains("Secure"),
+        "{cookie}"
+    );
 
     // An origin outside allowedLoginOrigins may not log in at all (v1's
     // `allowedLoginDomains`); the untrusted-but-allowed no-cookie path is
@@ -216,8 +296,8 @@ async fn untrusted_origin_login_is_bearer_only() {
         "auth": { "jwtSecret": "cors-secret" },   // no allowedLoginOrigins
         "cors": { "allowedOrigins": ["*"] },      // CORS-readable from anywhere
         "mounts": [
-            { "path": "/data", "service": "data" },
-            { "path": "/auth", "service": "auth" }
+            { "path": "/data", "service": "data", "config": { "access": "open" } },
+            { "path": "/auth", "service": "auth", "config": { "access": "open" } }
         ]
     })));
     let rt = Runtime::new(
@@ -230,14 +310,25 @@ async fn untrusted_origin_login_is_bearer_only() {
 
     let mut resp = rt
         .handle(
-            req(Method::POST, "/auth/login", Some("https://anywhere.example"))
-                .with_json(&login_body()),
+            req(
+                Method::POST,
+                "/auth/login",
+                Some("https://anywhere.example"),
+            )
+            .with_json(&login_body()),
         )
         .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.header("set-cookie"), None, "no cookie for untrusted origins");
+    assert_eq!(
+        resp.header("set-cookie"),
+        None,
+        "no cookie for untrusted origins"
+    );
     let body = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
-    assert!(body["token"].as_str().is_some(), "body token is the credential");
+    assert!(
+        body["token"].as_str().is_some(),
+        "body token is the credential"
+    );
     assert_eq!(
         resp.header("access-control-allow-origin"),
         Some("https://anywhere.example"),

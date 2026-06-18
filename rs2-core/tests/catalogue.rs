@@ -80,16 +80,20 @@ fn build(
     responses: HashMap<String, (u16, Vec<u8>, String)>,
 ) -> Arc<Runtime> {
     let http: Arc<dyn HttpOut> = Arc::new(MockHttpOut { responses });
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(file_root)), Arc::new(MemDataStore::new()))
-            .with_http(http)
-            .with_catalogue(allowlist);
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(file_root)),
+        Arc::new(MemDataStore::new()),
+    )
+    .with_http(http)
+    .with_catalogue(allowlist);
     let config = json!({
-        "mounts": [{ "path": "/admin", "service": "services" }],
+        "mounts": [{ "path": "/admin", "service": "services", "config": { "access": "open" } }],
         "catalogues": catalogues,
     });
     Runtime::new(
-        Tenancy::Single { tenant: "t1".into() },
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
         adapters,
         Arc::new(Loader(config)),
         LimitTable::default(),
@@ -118,7 +122,12 @@ async fn list_available_and_install_from_catalogue() {
         (200, BUNDLE.to_vec(), "application/javascript".into()),
     );
     let catalogues = json!([{ "name": "main", "url": format!("https://{CAT_HOST}/cat.json") }]);
-    let rt = build(dir.path(), catalogues, vec![CAT_HOST.to_string()], responses);
+    let rt = build(
+        dir.path(),
+        catalogues,
+        vec![CAT_HOST.to_string()],
+        responses,
+    );
 
     // Registered catalogues, allowlist-annotated.
     let mut resp = rt.handle(req(Method::GET, "/admin/catalogues")).await;
@@ -128,10 +137,19 @@ async fn list_available_and_install_from_catalogue() {
     assert_eq!(cats["catalogues"][0]["allowlisted"], true);
 
     // Aggregated available: built-in services + built-in adapters + remote item.
-    let mut resp = rt.handle(req(Method::GET, "/admin/catalogue/available")).await;
-    let items = body_json(&mut resp).await["items"].as_array().unwrap().clone();
-    assert!(items.iter().any(|i| i["source"] == "builtin" && i["kind"] == "service"));
-    assert!(items.iter().any(|i| i["kind"] == "adapter" && i["ref"] == "builtin:mem"));
+    let mut resp = rt
+        .handle(req(Method::GET, "/admin/catalogue/available"))
+        .await;
+    let items = body_json(&mut resp).await["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(items
+        .iter()
+        .any(|i| i["source"] == "builtin" && i["kind"] == "service"));
+    assert!(items
+        .iter()
+        .any(|i| i["kind"] == "adapter" && i["ref"] == "builtin:mem"));
     let greeter = items.iter().find(|i| i["name"] == "greeter").unwrap();
     assert_eq!(greeter["source"], "catalogue");
     assert_eq!(greeter["installed"], false);
@@ -139,9 +157,11 @@ async fn list_available_and_install_from_catalogue() {
 
     // Install: fetch → hash-pin → compile-check → store.
     let mut resp = rt
-        .handle(req(Method::POST, "/admin/catalogue/install").with_json(&json!({
-            "catalogue": "main", "name": "greeter", "version": version,
-        })))
+        .handle(
+            req(Method::POST, "/admin/catalogue/install").with_json(&json!({
+                "catalogue": "main", "name": "greeter", "version": version,
+            })),
+        )
         .await;
     let status = resp.status;
     let installed = body_json(&mut resp).await;
@@ -149,15 +169,28 @@ async fn list_available_and_install_from_catalogue() {
     assert_eq!(installed["ref"], format!("code:greeter@{version}"));
 
     // available now reports it installed.
-    let mut resp = rt.handle(req(Method::GET, "/admin/catalogue/available")).await;
-    let items = body_json(&mut resp).await["items"].as_array().unwrap().clone();
+    let mut resp = rt
+        .handle(req(Method::GET, "/admin/catalogue/available"))
+        .await;
+    let items = body_json(&mut resp).await["items"]
+        .as_array()
+        .unwrap()
+        .clone();
     let greeter = items.iter().find(|i| i["name"] == "greeter").unwrap();
     assert_eq!(greeter["installed"], true);
 
     // The bundle is readable from the code store at its content ref.
-    let mut resp = rt.handle(req(Method::GET, &format!("/admin/code/greeter/{version}"))).await;
+    let mut resp = rt
+        .handle(req(Method::GET, &format!("/admin/code/greeter/{version}")))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    let bytes = resp.body.as_mut().unwrap().materialize(1 << 20).await.unwrap();
+    let bytes = resp
+        .body
+        .as_mut()
+        .unwrap()
+        .materialize(1 << 20)
+        .await
+        .unwrap();
     assert_eq!(&bytes[..], BUNDLE);
 }
 
@@ -166,12 +199,19 @@ async fn install_rejects_non_allowlisted_host() {
     let dir = tempfile::tempdir().unwrap();
     // Catalogue registered on a host the operator did NOT allowlist.
     let catalogues = json!([{ "name": "evil", "url": "https://evil.test/cat.json" }]);
-    let rt = build(dir.path(), catalogues, vec![CAT_HOST.to_string()], HashMap::new());
+    let rt = build(
+        dir.path(),
+        catalogues,
+        vec![CAT_HOST.to_string()],
+        HashMap::new(),
+    );
 
     let resp = rt
-        .handle(req(Method::POST, "/admin/catalogue/install").with_json(&json!({
-            "catalogue": "evil", "name": "x", "version": "y",
-        })))
+        .handle(
+            req(Method::POST, "/admin/catalogue/install").with_json(&json!({
+                "catalogue": "evil", "name": "x", "version": "y",
+            })),
+        )
         .await;
     assert_eq!(resp.status, Some(StatusCode::FORBIDDEN)); // capability_denied
 }
@@ -190,12 +230,19 @@ async fn install_rejects_content_hash_mismatch() {
         (200, BUNDLE.to_vec(), "application/javascript".into()),
     );
     let catalogues = json!([{ "name": "main", "url": format!("https://{CAT_HOST}/cat.json") }]);
-    let rt = build(dir.path(), catalogues, vec![CAT_HOST.to_string()], responses);
+    let rt = build(
+        dir.path(),
+        catalogues,
+        vec![CAT_HOST.to_string()],
+        responses,
+    );
 
     let resp = rt
-        .handle(req(Method::POST, "/admin/catalogue/install").with_json(&json!({
-            "catalogue": "main", "name": "greeter", "version": wrong,
-        })))
+        .handle(
+            req(Method::POST, "/admin/catalogue/install").with_json(&json!({
+                "catalogue": "main", "name": "greeter", "version": wrong,
+            })),
+        )
         .await;
     assert_eq!(resp.status, Some(StatusCode::BAD_REQUEST)); // hash pin refuses
 }
@@ -208,8 +255,13 @@ async fn catalogue_feature_dormant_without_allowlist() {
     let rt = build(dir.path(), catalogues, vec![], HashMap::new());
 
     // available still lists built-ins only.
-    let mut resp = rt.handle(req(Method::GET, "/admin/catalogue/available")).await;
-    let items = body_json(&mut resp).await["items"].as_array().unwrap().clone();
+    let mut resp = rt
+        .handle(req(Method::GET, "/admin/catalogue/available"))
+        .await;
+    let items = body_json(&mut resp).await["items"]
+        .as_array()
+        .unwrap()
+        .clone();
     assert!(!items.is_empty());
     assert!(items.iter().all(|i| i["source"] == "builtin"));
 
@@ -219,9 +271,11 @@ async fn catalogue_feature_dormant_without_allowlist() {
 
     // install is unavailable.
     let resp = rt
-        .handle(req(Method::POST, "/admin/catalogue/install").with_json(&json!({
-            "catalogue": "main", "name": "greeter", "version": "x",
-        })))
+        .handle(
+            req(Method::POST, "/admin/catalogue/install").with_json(&json!({
+                "catalogue": "main", "name": "greeter", "version": "x",
+            })),
+        )
         .await;
     assert_eq!(resp.status, Some(StatusCode::NOT_IMPLEMENTED)); // engine_unavailable
 }

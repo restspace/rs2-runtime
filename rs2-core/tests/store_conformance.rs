@@ -48,12 +48,17 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
         Arc::new(MemDataStore::new()),
     );
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
-        { "path": "/files", "service": "file" },
-        { "path": "/data", "service": "data" },
-        { "path": "/q", "service": "query" },
-        { "path": "/pipes", "service": "pipeline" }
+        { "path": "/files", "service": "file", "config": { "access": "open" } },
+        { "path": "/data", "service": "data", "config": { "access": "open" } },
+        { "path": "/q", "service": "query", "config": { "access": "open" } },
+        { "path": "/pipes", "service": "pipeline", "config": { "access": "open" } }
     ]})));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 fn req(method: Method, path: &str) -> Message {
@@ -61,7 +66,12 @@ fn req(method: Method, path: &str) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 /// The parameterized contract. `make_body` produces a valid child body for
@@ -76,70 +86,126 @@ async fn assert_store_contract(
     let container_path = format!("{mount}{container}/");
 
     // PUT child: 201 create, 200 overwrite, empty body, ETag.
-    let resp = rt.handle(req(Method::PUT, &child("alpha")).with_body(make_body(1))).await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "[{mount}] PUT create");
+    let resp = rt
+        .handle(req(Method::PUT, &child("alpha")).with_body(make_body(1)))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "[{mount}] PUT create"
+    );
     assert!(resp.body.is_none(), "[{mount}] PUT returns no body");
-    let resp = rt.handle(req(Method::PUT, &child("alpha")).with_body(make_body(2))).await;
+    let resp = rt
+        .handle(req(Method::PUT, &child("alpha")).with_body(make_body(2)))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] PUT overwrite");
 
     // GET child: the resource, with a version ETag.
     let resp = rt.handle(req(Method::GET, &child("alpha"))).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] GET child");
-    assert!(resp.header("etag").is_some(), "[{mount}] child GET carries ETag");
+    assert!(
+        resp.header("etag").is_some(),
+        "[{mount}] child GET carries ETag"
+    );
 
     // POST container: keyless create with Location; the child is fetchable.
-    let resp = rt.handle(req(Method::POST, &container_path).with_body(make_body(3))).await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "[{mount}] keyless POST: {:?}", resp.body);
+    let resp = rt
+        .handle(req(Method::POST, &container_path).with_body(make_body(3)))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "[{mount}] keyless POST: {:?}",
+        resp.body
+    );
     let location = resp
         .header("location")
         .unwrap_or_else(|| panic!("[{mount}] keyless POST returns Location"))
         .to_string();
-    assert!(location.starts_with(&container_path), "[{mount}] Location under container");
+    assert!(
+        location.starts_with(&container_path),
+        "[{mount}] Location under container"
+    );
     let resp = rt.handle(req(Method::GET, &location)).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] created child fetchable");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "[{mount}] created child fetchable"
+    );
 
     // Container listing: one shape, one media type, paginated.
     let mut resp = rt.handle(req(Method::GET, &container_path)).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] container GET");
     let ct = resp.body.as_ref().unwrap().media_type.essence().to_string();
-    assert_eq!(ct, "application/vnd.rs2.dir+json", "[{mount}] listing media type");
+    assert_eq!(
+        ct, "application/vnd.rs2.dir+json",
+        "[{mount}] listing media type"
+    );
     let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
     assert!(total >= 2, "[{mount}] X-Total-Count counts both children");
     let listing = body_json(&mut resp).await;
     assert!(listing["path"].is_string(), "[{mount}] listing.path");
-    assert_eq!(listing["total"].as_u64(), Some(total), "[{mount}] listing.total");
+    assert_eq!(
+        listing["total"].as_u64(),
+        Some(total),
+        "[{mount}] listing.total"
+    );
     let entries = listing["entries"].as_array().unwrap();
     assert!(
-        entries.iter().any(|e| e["name"] == "alpha" && e["dir"] == false),
+        entries
+            .iter()
+            .any(|e| e["name"] == "alpha" && e["dir"] == false),
         "[{mount}] child appears as an entry: {listing}"
     );
 
     // Pagination narrows entries, not the reported total.
-    let mut resp = rt.handle(req(Method::GET, &format!("{container_path}?$take=1"))).await;
+    let mut resp = rt
+        .handle(req(Method::GET, &format!("{container_path}?$take=1")))
+        .await;
     let page = body_json(&mut resp).await;
-    assert_eq!(page["entries"].as_array().unwrap().len(), 1, "[{mount}] $take pages");
-    assert_eq!(page["total"].as_u64(), Some(total), "[{mount}] paged total is the full count");
+    assert_eq!(
+        page["entries"].as_array().unwrap().len(),
+        1,
+        "[{mount}] $take pages"
+    );
+    assert_eq!(
+        page["total"].as_u64(),
+        Some(total),
+        "[{mount}] paged total is the full count"
+    );
 
     // Mount root also lists, and shows the container as a directory entry.
     let mut resp = rt.handle(req(Method::GET, &format!("{mount}/"))).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] mount root lists");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "[{mount}] mount root lists"
+    );
     let root = body_json(&mut resp).await;
     let leaf = container.trim_start_matches('/');
     assert!(
-        root["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["name"].as_str().unwrap_or("").trim_end_matches('/') == leaf
-                && e["dir"] == true),
+        root["entries"].as_array().unwrap().iter().any(|e| e["name"]
+            .as_str()
+            .unwrap_or("")
+            .trim_end_matches('/')
+            == leaf
+            && e["dir"] == true),
         "[{mount}] container is a dir entry at the root: {root}"
     );
 
     // DELETE child: 204, then gone.
     let resp = rt.handle(req(Method::DELETE, &child("alpha"))).await;
-    assert_eq!(resp.status, Some(StatusCode::NO_CONTENT), "[{mount}] DELETE child");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::NO_CONTENT),
+        "[{mount}] DELETE child"
+    );
     let resp = rt.handle(req(Method::GET, &child("alpha"))).await;
-    assert_eq!(resp.status, Some(StatusCode::NOT_FOUND), "[{mount}] deleted child is gone");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::NOT_FOUND),
+        "[{mount}] deleted child is gone"
+    );
 
     // Container guard: non-empty delete refuses with 409; confirm succeeds.
     let resp = rt.handle(req(Method::DELETE, &container_path)).await;
@@ -149,17 +215,24 @@ async fn assert_store_contract(
         "[{mount}] non-empty container delete is 409 without confirm"
     );
     let resp = rt
-        .handle(req(Method::DELETE, &format!("{container_path}?confirm={leaf}")))
+        .handle(req(
+            Method::DELETE,
+            &format!("{container_path}?confirm={leaf}"),
+        ))
         .await;
-    assert_eq!(resp.status, Some(StatusCode::NO_CONTENT), "[{mount}] confirmed delete");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::NO_CONTENT),
+        "[{mount}] confirmed delete"
+    );
     let mut resp = rt.handle(req(Method::GET, &format!("{mount}/"))).await;
     let root = body_json(&mut resp).await;
     assert!(
-        !root["entries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["name"].as_str().unwrap_or("").trim_end_matches('/') == leaf),
+        !root["entries"].as_array().unwrap().iter().any(|e| e["name"]
+            .as_str()
+            .unwrap_or("")
+            .trim_end_matches('/')
+            == leaf),
         "[{mount}] deleted container left the root listing: {root}"
     );
 }
@@ -229,12 +302,18 @@ async fn facets_extend_without_forking_the_shape() {
     let mut listing = rt.handle(req(Method::GET, "/data/things/")).await;
     let listing = body_json(&mut listing).await;
     assert!(
-        listing["entries"].as_array().unwrap().iter().any(|e| e["name"] == ".schema.json"),
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == ".schema.json"),
         "{listing}"
     );
 
     // The discovery surface declares pattern + facets per mount.
-    let mut services = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
+    let mut services = rt
+        .handle(req(Method::GET, "/.well-known/rs2/services"))
+        .await;
     let doc = body_json(&mut services).await;
     let by_path = |p: &str| {
         doc["services"]
@@ -247,6 +326,14 @@ async fn facets_extend_without_forking_the_shape() {
     };
     assert_eq!(by_path("/files")["pattern"], "store");
     assert_eq!(by_path("/data")["pattern"], "store");
-    assert!(by_path("/data")["facets"].as_array().unwrap().iter().any(|f| f == "schema"));
-    assert!(by_path("/files")["facets"].as_array().unwrap().iter().any(|f| f == "range"));
+    assert!(by_path("/data")["facets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "schema"));
+    assert!(by_path("/files")["facets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f == "range"));
 }
