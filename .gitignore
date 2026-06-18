@@ -5,3 +5,4 @@
 conformance/echo-guest/target
 conformance/echo-guest/Cargo.lock
 bash.exe.stackdump
+/.cargo/config.toml
