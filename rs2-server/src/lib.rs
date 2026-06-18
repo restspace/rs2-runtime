@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -445,12 +445,37 @@ async fn seed_bootstrap_admin(
     Ok(())
 }
 
+/// Resolve a config-relative path against `base` (the config file's directory),
+/// so paths in `serverConfig.json` are interpreted relative to the config file
+/// — never the process CWD, which a long-running `rs2 dev` can't control and
+/// which silently pointed `tenantsDir` at the wrong place. Absolute paths pass
+/// through unchanged.
+fn resolve_against(base: &Path, path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        path.to_string()
+    } else {
+        base.join(p).to_string_lossy().into_owned()
+    }
+}
+
 /// Run the server from a config file path. Also the `rs2 dev` entry point.
 pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_text = std::fs::read_to_string(config_path)
         .map_err(|e| format!("cannot read server config '{config_path}': {e}"))?;
-    let config: ServerConfig = serde_json::from_str(&config_text)
+    let mut config: ServerConfig = serde_json::from_str(&config_text)
         .map_err(|e| format!("invalid server config '{config_path}': {e}"))?;
+
+    // Anchor relative paths to the config file's directory, not the CWD. We
+    // canonicalize the config path (it exists — we just read it) to get an
+    // absolute base, then rewrite the path-bearing fields in place.
+    let config_abs = std::fs::canonicalize(config_path)
+        .map_err(|e| format!("cannot resolve server config path '{config_path}': {e}"))?;
+    let base_dir = config_abs.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    config.tenants_dir = resolve_against(&base_dir, &config.tenants_dir);
+    config.file_root = resolve_against(&base_dir, &config.file_root);
+    config.data_root = resolve_against(&base_dir, &config.data_root);
+    config.logging.file.path = resolve_against(&base_dir, &config.logging.file.path);
 
     let tenancy = match config.tenancy {
         TenancyConfig::Single { tenant } => Tenancy::Single { tenant },
