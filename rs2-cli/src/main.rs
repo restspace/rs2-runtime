@@ -104,6 +104,11 @@ enum Command {
         #[command(subcommand)]
         action: ServiceCommand,
     },
+    /// Bootstrap and manage authentication on a node.
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommand,
+    },
     /// Run a script of `rs2` commands (one per line; aborts on first failure).
     Run {
         /// Path to the script file.
@@ -120,6 +125,90 @@ enum ServiceCommand {
         /// Override / supply the mount path (e.g. `/notes`).
         #[arg(long)]
         path: Option<String>,
+    },
+    /// Set the `access` policy (and optional `--set k=v` config keys) on an
+    /// existing mount — used to tighten an open bootstrap mount.
+    SetAccess {
+        /// Mount path to update, e.g. `/services`.
+        path: String,
+        /// Access policy as JSON, e.g. `{"read":"A","write":"A"}`.
+        #[arg(long)]
+        access: String,
+        /// Extra `config` keys as `key=value` (value parsed as JSON; repeatable).
+        #[arg(long = "set")]
+        set: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// One-shot: enable auth, create the first admin, log in, lock down.
+    Init {
+        /// Email of the first operator/admin to create.
+        #[arg(long)]
+        admin_email: String,
+        /// Admin password (else RS2_ADMIN_PASSWORD / RS2_PASSWORD / login.password).
+        #[arg(long)]
+        admin_password: Option<String>,
+        /// Operator role(s), space-separated.
+        #[arg(long, default_value = "A")]
+        operator_roles: String,
+        /// User dataset name (default `users`).
+        #[arg(long)]
+        user_dataset: Option<String>,
+        /// User-store mount path (default `/data`).
+        #[arg(long)]
+        data_mount: Option<String>,
+        /// Server base URL (else `host` from rsconfig.json).
+        #[arg(long)]
+        host: Option<String>,
+        /// Print the generated jwtSecret.
+        #[arg(long)]
+        show_secret: bool,
+    },
+    /// Enable auth on an open node: ensure jwtSecret, operatorRoles, /auth, and
+    /// a temporarily write-open user-store mount.
+    Enable {
+        /// Operator role(s), space-separated.
+        #[arg(long, default_value = "A")]
+        operator_roles: String,
+        /// User dataset name (default `users`).
+        #[arg(long)]
+        user_dataset: Option<String>,
+        /// Session length in minutes.
+        #[arg(long)]
+        session_minutes: Option<u32>,
+        /// User-store mount path (default `/data`).
+        #[arg(long)]
+        data_mount: Option<String>,
+        /// Server base URL (else `host` from rsconfig.json).
+        #[arg(long)]
+        host: Option<String>,
+        /// Print the generated jwtSecret.
+        #[arg(long)]
+        show_secret: bool,
+    },
+    /// Seed the first admin by writing a hashed record to the user dataset.
+    /// Run before installing a field-authz schema and before lockdown.
+    CreateAdmin {
+        /// Admin email (the record key).
+        #[arg(long)]
+        email: String,
+        /// Admin password (else RS2_ADMIN_PASSWORD / RS2_PASSWORD / login.password).
+        #[arg(long)]
+        password: Option<String>,
+        /// Role(s) to grant, space-separated.
+        #[arg(long, default_value = "A")]
+        roles: String,
+        /// User-store mount path (default `/data`).
+        #[arg(long)]
+        data_mount: Option<String>,
+        /// User dataset name (default `users`).
+        #[arg(long)]
+        user_dataset: Option<String>,
+        /// Server base URL (else `host` from rsconfig.json).
+        #[arg(long)]
+        host: Option<String>,
     },
 }
 
@@ -171,6 +260,58 @@ fn dispatch(command: Command) -> Result<(), String> {
         }
         Command::Service { action } => match action {
             ServiceCommand::Add { file, path } => commands::service_add(&file, path.as_deref()),
+            ServiceCommand::SetAccess { path, access, set } => {
+                commands::service_set_access(&path, &access, &set)
+            }
+        },
+        Command::Auth { action } => match action {
+            AuthCommand::Init {
+                admin_email,
+                admin_password,
+                operator_roles,
+                user_dataset,
+                data_mount,
+                host,
+                show_secret,
+            } => commands::auth_init(
+                host.as_deref(),
+                &admin_email,
+                admin_password.as_deref(),
+                &operator_roles,
+                user_dataset.as_deref(),
+                data_mount.as_deref(),
+                show_secret,
+            ),
+            AuthCommand::Enable {
+                operator_roles,
+                user_dataset,
+                session_minutes,
+                data_mount,
+                host,
+                show_secret,
+            } => commands::auth_enable(
+                host.as_deref(),
+                &operator_roles,
+                user_dataset.as_deref(),
+                session_minutes,
+                data_mount.as_deref(),
+                show_secret,
+            ),
+            AuthCommand::CreateAdmin {
+                email,
+                password,
+                roles,
+                data_mount,
+                user_dataset,
+                host,
+            } => commands::auth_create_admin(
+                host.as_deref(),
+                &email,
+                password.as_deref(),
+                &roles,
+                data_mount.as_deref(),
+                user_dataset.as_deref(),
+            ),
         },
         Command::Run { script } => run_script(&script),
     }

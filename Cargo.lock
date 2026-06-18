@@ -2564,6 +2564,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "mime_guess",
+ "rand 0.8.5",
  "rs2-core",
  "rs2-server",
  "serde",

@@ -1,19 +1,24 @@
-# Seed user auth on a fresh rs2 node — see README.md.
+# Seed user auth on a FRESH, no-auth rs2 node — entirely over HTTP. See README.md.
 #
 # First start the node (from this directory):  rs2 dev serverConfig.json
 # Then run this script (from this directory):   rs2 run seed-auth.rs2
 #
 # Each line below is an `rs2` command with the leading `rs2` omitted; they run
-# in order and the script aborts on the first failure.
+# in order and the script aborts on the first failure. The node starts with no
+# auth at all — just an open `/services` mount — and this script turns it into a
+# locked-down node with a working login and a password-hashing user pipeline.
 
-# 1. Mount the auth service so /auth/login works.
-service add auth.mount.json
+# 1. Enable auth: generate a jwtSecret, set operatorRoles, mount /auth, and open
+#    a temporary user-store /data mount (write-open, schema-free) for step 2.
+auth enable --operator-roles A
 
-# 2. Authenticate as the bootstrap admin (host + creds come from rsconfig.json).
+# 2. Create the first admin (role A). The CLI hashes the password locally and
+#    writes the record straight to the user store while it's still open. Password
+#    comes from rsconfig.json's login.password (or RS2_ADMIN_PASSWORD).
+auth create-admin --email admin@demo.local
+
+# 3. Authenticate as that admin — everything after this is operator-gated.
 login
-
-# 3. Mount the user store: schema-enforced, with field-level authorization.
-service add userstore.mount.json
 
 # 4. Install the users schema. passwordHash is operator-only to read AND write;
 #    roles is operator-only to write (so a user can never self-promote).
@@ -24,3 +29,8 @@ service add users.pipeline.mount.json
 
 # 6. Install its .root spec: GET reads, PUT hashes `password` then writes.
 send /users/.pipelines/.root --file users.root.pipeline.json
+
+# 7. Lock down: the user store becomes operator-write + schema/field-authz
+#    enforced, and /services becomes operator-only. Closes the bootstrap window.
+service set-access /data --access '{"read":"authenticated","write":"A"}' --set enforceSchema=true --set fieldLevelAuthz=true
+service set-access /services --access '{"read":"A","write":"A"}'

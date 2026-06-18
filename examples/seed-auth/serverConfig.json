@@ -4,6 +4,5 @@
   "fileRoot": "./data",
   "dataRoot": "./data-store",
   "tenantsDir": "./tenants",
-  "logging": { "sink": "none" },
-  "bootstrapAdmin": { "email": "admin@demo.local", "password": "demo-admin-pw" }
+  "logging": { "sink": "none" }
 }

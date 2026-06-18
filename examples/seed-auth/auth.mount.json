@@ -1,5 +1,0 @@
-{
-  "path": "/auth",
-  "service": "auth",
-  "config": { "access": { "invoke": "all" } }
-}

@@ -18,6 +18,7 @@ clap = { version = "4", features = ["derive"] }
 ureq = "2"
 shlex = "1"
 mime_guess = "2"
+rand = "0.8"
 
 [features]
 # Enables the deployment-time component compile check in `rs2 test`.

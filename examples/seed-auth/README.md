@@ -1,36 +1,52 @@
-# Seed user auth on an rs2 instance
+# Seed user auth on a fresh rs2 instance — over HTTP
 
-A worked example that turns a near-empty rs2 node into one with working
+A worked example that turns a **fresh, no-auth** rs2 node into one with working
 authentication, a schema-enforced user store with field-level authorization,
 and a `/users` management pipeline that **hashes passwords on write** — driven
-entirely by the `rs2` CLI (`login`, `send`, `service add`, `run`).
+entirely by the `rs2` CLI, with no startup-seeded admin and no node restart.
+
+The node starts with *no auth at all* — just an open `/services` mount. The
+script injects the signing secret, creates the first operator over HTTP, stands
+up the user store + login pipeline, then locks everything down.
 
 ## What it builds
 
 Running `rs2 run seed-auth.rs2` performs these steps in order:
 
-1. `service add auth.mount.json` — mounts the `auth` service at `/auth` (login).
-2. `login` — authenticates as the bootstrap admin (creds from `rsconfig.json`).
-3. `service add userstore.mount.json` — mounts the user store at `/data`
-   (`enforceSchema` + `fieldLevelAuthz`).
-4. `send /data/users/.schema.json` — installs the `users` schema.
-5. `service add users.pipeline.mount.json` — mounts the `/users` pipeline.
-6. `send /users/.pipelines/.root` — installs the management pipeline spec.
+1. `auth enable` — generate a `jwtSecret`, set `operatorRoles: A`, mount `/auth`,
+   and open a **temporary** write-open, schema-free user-store `/data` mount.
+2. `auth create-admin` — the CLI hashes the password locally (argon2id) and
+   writes `{ passwordHash, roles: "A", kind: "user" }` straight to the user
+   store while it's still open. (Password from `rsconfig.json`'s `login.password`
+   or `RS2_ADMIN_PASSWORD`.)
+3. `login` — authenticate as the new admin. **Everything after is operator-gated.**
+4. `send /data/users/.schema.json` — install the `users` schema (field authz).
+5. `service add users.pipeline.mount.json` — mount the `/users` pipeline.
+6. `send /users/.pipelines/.root` — install the password-hashing pipeline spec.
+7. `service set-access` — lock down: the user store becomes operator-write with
+   schema + field-authz enforced, and `/services` becomes operator-only.
+
+The equivalent one-liner for the auth core (without the `/users` pipeline) is:
+
+```sh
+rs2 auth init --admin-email admin@demo.local --admin-password demo-admin-pw
+```
 
 ### The pieces
 
 | File | Role |
 | --- | --- |
-| `serverConfig.json` | Demo node config; seeds a bootstrap admin at startup |
-| `tenants/main.json` | Starting tenant: `auth` settings + an (open) `/services` mount |
-| `rsconfig.json` | CLI config: server URL + admin login |
-| `auth.mount.json` | `/auth` mount (login endpoint open to all) |
-| `userstore.mount.json` | `/data` mount — schema-enforced, field-level authz |
+| `serverConfig.json` | Demo node config — **no** bootstrap admin, no auth |
+| `tenants/main.json` | Starting tenant: a single **open** `/services` mount, no auth |
+| `rsconfig.json` | CLI config: server URL + the admin login to create |
 | `users.schema.json` | `users` dataset schema with per-field access rules |
 | `users.pipeline.mount.json` | `/users` pipeline mount |
 | `users.root.pipeline.json` | `.root` spec: GET reads, PUT hashes then writes |
 | `sample-user.json` | Example body for creating a user |
 | `seed-auth.rs2` | The `rs2 run` script tying it together |
+
+The `/auth` and user-store `/data` mounts aren't files here — `auth enable`
+creates them, and the lockdown step tightens `/data`.
 
 ### Field-level authorization (`users.schema.json`)
 
@@ -87,15 +103,19 @@ curl -H "Authorization: Bearer <token-from-rsconfig.json>" \
 As admin you'll see `passwordHash` in the read; a non-admin authenticated reader
 gets it redacted by the field-level rules.
 
-## Demo-only shortcuts (harden for real use)
+To confirm the lockdown took, an **anonymous** `PUT /services/raw` should now be
+rejected (401/403) — the open bootstrap window is closed.
 
-- **`/services` is open** (`write: "all"`) so step 1 can mount `/auth` before any
-  admin exists. After seeding, lock it down — set
-  `"access": { "read": "A", "write": "A" }` on the `/services` mount in
-  `tenants/main.json` and restart the node. (`service add` only *adds* mounts; it
-  can't modify an existing one.)
-- **Credentials are in plain files.** `serverConfig.json` and `rsconfig.json`
-  carry a demo password. In practice put the admin password in
-  `RS2_ADMIN_PASSWORD` (node) and omit `login.password` from `rsconfig.json`,
-  supplying it via `RS2_PASSWORD` or `rs2 login --password`.
-- **`jwtSecret` is a placeholder** — replace it.
+## Security notes (for real use)
+
+- **The bootstrap window.** Between steps 1–3 the user-store `/data` mount is
+  briefly write-open to anonymous callers — unavoidable for a pure-HTTP bootstrap,
+  since the very first operator can't be created by an operator. The example binds
+  to `127.0.0.1` and the script locks down immediately after login. Don't run the
+  bootstrap against a publicly reachable address.
+- **Credentials are in plain files.** `rsconfig.json` carries a demo password. In
+  practice omit `login.password` and supply it via `RS2_ADMIN_PASSWORD` /
+  `RS2_PASSWORD` / `rs2 auth create-admin --password`.
+- **The `jwtSecret` is generated** by `auth enable` and stored in the tenant
+  config (masked on `GET /services/raw`). Re-running `auth enable` keeps the
+  existing secret — it never rotates live sessions.

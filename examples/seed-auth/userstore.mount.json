@@ -1,9 +1,0 @@
-{
-  "path": "/data",
-  "service": "data",
-  "config": {
-    "enforceSchema": true,
-    "fieldLevelAuthz": true,
-    "access": { "read": "authenticated", "write": "A" }
-  }
-}
