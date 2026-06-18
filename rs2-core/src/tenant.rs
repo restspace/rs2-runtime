@@ -236,8 +236,8 @@ impl Tenant {
         let mut instances = HashMap::new();
         for mount in mounts.mounts() {
             let service: Arc<dyn Service> = match mount.service.as_str() {
-                "file" => Arc::new(FileService::new()),
-                "data" => Arc::new(DataService::new()),
+                "file" => Arc::new(FileService::from_config(&mount.config)),
+                "data" => Arc::new(DataService::from_config(&mount.config)),
                 "pipeline" => {
                     // An `elevate` role must not confer operator authority —
                     // otherwise an author on this mount could elevate into
@@ -349,6 +349,8 @@ impl Tenant {
                 data,
                 query,
                 http: adapters.http.clone(),
+                cache_policy: crate::wrapper::CachePolicy::from_config(mount.config.get("caching")),
+                cache_openly_readable: crate::wrapper::CachePolicy::mount_is_openly_readable(&mount.config),
                 cors: Arc::new(crate::wrapper::CorsPolicy::from_config(config.cors.as_ref())),
                 limits: limits.invocation_limits(),
                 requester: requester.clone(),

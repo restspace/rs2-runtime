@@ -22,16 +22,37 @@ const SCHEMA_RESOURCE: &str = ".schema.json";
 /// installed schema in one call (G6).
 const SCHEMAS_RESOURCE: &str = ".schemas";
 
-#[derive(Default)]
 pub struct DataService {
     /// Compiled validators cached per (dataset, schema version) — PRD §10.2:
     /// validator compiled and cached per dataset schema version.
     validators: RwLock<HashMap<(String, u64), Arc<jsonschema::Validator>>>,
+    enforce_schema: bool,
+    field_authz: bool,
+}
+
+impl Default for DataService {
+    fn default() -> Self {
+        DataService {
+            validators: RwLock::new(HashMap::new()),
+            enforce_schema: false,
+            field_authz: false,
+        }
+    }
 }
 
 impl DataService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_config(config: &serde_json::Value) -> Self {
+        let cfg = serde_json::from_value::<crate::config_schema::DataConfig>(config.clone())
+            .unwrap_or_default();
+        DataService {
+            validators: RwLock::new(HashMap::new()),
+            enforce_schema: cfg.enforce_schema,
+            field_authz: cfg.field_level_authz,
+        }
     }
 
     async fn validator_for(&self, dataset: &str, schema: &Value) -> Result<Arc<jsonschema::Validator>, RsError> {
@@ -175,10 +196,8 @@ fn enforce_write_rules(
 impl Service for DataService {
     async fn handle(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
         let data = ctx.data.as_ref().ok_or_else(|| RsError::capability_denied("data"))?;
-        let cfg = serde_json::from_value::<crate::config_schema::DataConfig>(ctx.config.clone())
-            .unwrap_or_default();
-        let enforce_schema = cfg.enforce_schema;
-        let field_authz = cfg.field_level_authz;
+        let enforce_schema = self.enforce_schema;
+        let field_authz = self.field_authz;
         let segments: Vec<String> = msg.url.service_segments().iter().map(|s| s.to_string()).collect();
         let schema_base = format!("{}", msg.url.base_path);
 

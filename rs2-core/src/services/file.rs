@@ -12,11 +12,17 @@ use crate::error::RsError;
 use crate::message::{Body, MediaType, Message, Provenance};
 
 #[derive(Default)]
-pub struct FileService;
+pub struct FileService {
+    site: SiteOptions,
+}
 
 impl FileService {
     pub fn new() -> Self {
-        FileService
+        Self::default()
+    }
+
+    pub fn from_config(config: &serde_json::Value) -> Self {
+        FileService { site: SiteOptions::from_config(config) }
     }
 
     /// Serve one stored file with Range/ETag/304 semantics. Takes owned
@@ -73,6 +79,7 @@ impl FileService {
 
 /// Static-site options on a file mount (v1's static-site manifest variant,
 /// expressed as config — the same module, the same store underneath).
+#[derive(Clone)]
 struct SiteOptions {
     /// Directory GETs serve this file instead of a listing.
     default_resource: Option<String>,
@@ -82,6 +89,12 @@ struct SiteOptions {
     spa_fallback: bool,
     /// Suppress dir+json listings (a public site shouldn't be browsable).
     listings: bool,
+}
+
+impl Default for SiteOptions {
+    fn default() -> Self {
+        SiteOptions { default_resource: None, spa_fallback: false, listings: true }
+    }
 }
 
 impl SiteOptions {
@@ -141,7 +154,7 @@ impl Service for FileService {
             .ok_or_else(|| RsError::capability_denied("files"))?;
         let path = msg.url.service_path.clone();
 
-        let site = SiteOptions::from_config(&ctx.config);
+        let site = &self.site;
         let range = msg.header("range").and_then(parse_range);
         let if_none_match = msg.header("if-none-match").map(String::from);
 

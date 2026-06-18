@@ -47,6 +47,9 @@ pub struct ServiceContext {
     pub query: Option<ScopedQueryStore>,
     /// Outbound HTTP adapter; grants scope it per mount (PRD §9.2).
     pub http: Option<Arc<dyn crate::capabilities::HttpOut>>,
+    /// Host-applied response caching policy, parsed once at tenant build.
+    pub cache_policy: crate::wrapper::CachePolicy,
+    pub cache_openly_readable: bool,
     pub limits: InvocationLimits,
     /// Internal dispatch capability (pipelines and composition).
     pub requester: Option<Arc<dyn Requester>>,

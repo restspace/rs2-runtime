@@ -394,10 +394,8 @@ impl Runtime {
 
         // Caching policy (v1's universal `caching` config, host-applied):
         // resolved per mount, applied to successful responses below.
-        let cache_policy =
-            crate::wrapper::CachePolicy::from_config(mount.config.get("caching"));
-        let openly_readable =
-            crate::wrapper::CachePolicy::mount_is_openly_readable(&mount.config);
+        let cache_policy = ctx.cache_policy.clone();
+        let openly_readable = ctx.cache_openly_readable;
 
         // Idempotency-Key handling (PRD §7.2): dedupe + replay around the
         // service invocation, scoped tenant + mount + method + path.
