@@ -190,8 +190,27 @@ fn authoring_of(mount: &Mount) -> Option<Value> {
 /// Restspace v1): `pattern` names the conversation shape so one client
 /// codepath can drive every mount sharing it; `facets` declare optional
 /// capabilities within the shape (feature-detect, don't special-case).
-fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
-    match mount.service.as_str() {
+fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
+    // A `wrapper` mount fronts another mount, so it *declares* the shape it
+    // presents (e.g. `store`) — the one service whose advertised contract comes
+    // from config rather than its service type. Validated against the known set
+    // at `Tenant::build`; defaults to `store-transform` (it is a pipeline).
+    if mount.service == "wrapper" {
+        let pattern = mount
+            .config
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("store-transform")
+            .to_string();
+        let facets = mount
+            .config
+            .get("facets")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        return (pattern, facets);
+    }
+    let (pattern, facets): (&str, Vec<&str>) = match mount.service.as_str() {
         "file" => {
             let mut facets = vec!["range", "confirm-delete", "move"];
             if mount.config.get("defaultResource").is_some()
@@ -211,7 +230,8 @@ fn pattern_of(mount: &Mount) -> (&'static str, Vec<&'static str>) {
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),
-    }
+    };
+    (pattern.to_string(), facets.into_iter().map(str::to_string).collect())
 }
 
 fn with_pattern(mut entry: Value, mount: &Mount) -> Value {
@@ -246,8 +266,9 @@ pub fn describe_mount(mount: &Mount) -> Value {
 /// since their verbs are service-defined.
 pub fn allowed_methods(mount: &Mount) -> Vec<&'static str> {
     let (pattern, facets) = pattern_of(mount);
-    let mut methods = match pattern {
-        "store" if facets.contains(&"patch") => {
+    let has = |f: &str| facets.iter().any(|x| x == f);
+    let mut methods = match pattern.as_str() {
+        "store" if has("patch") => {
             vec!["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"]
         }
         "store" => vec!["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS"],
@@ -257,7 +278,7 @@ pub fn allowed_methods(mount: &Mount) -> Vec<&'static str> {
         "view" => vec!["GET", "HEAD", "OPTIONS"],
         _ => vec!["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
     };
-    if facets.contains(&"move") {
+    if has("move") {
         methods.push("MOVE");
     }
     methods

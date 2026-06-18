@@ -212,51 +212,85 @@ impl Service for PipelineService {
             }
         }
 
-        let requester = ctx
-            .requester
-            .clone()
-            .ok_or_else(|| RsError::internal("pipeline service has no requester capability"))?;
-        let to_step = msg
-            .url
-            .query_param("$to-step")
-            .and_then(|v| v.parse::<usize>().ok());
-
-        let limits = PipelineLimits {
-            wall_clock: ctx.pipeline_wall_clock,
-            materialize_cap: ctx.limits.materialized_body_bytes,
-            ..PipelineLimits::default()
-        };
-        // Retry resolution: envelope → mount config → tenant default.
+        // Retry resolution begins with the envelope's own policy; `run_inline`
+        // layers mount + tenant defaults below it.
         let envelope_retry = doc.get("retry").and_then(RetryPolicy::from_config);
-        let mount_retry = RetryPolicy::from_config(ctx.config.get("retry").unwrap_or(&Value::Null));
-        let retry = RetryPolicy::resolve(&[
-            envelope_retry.as_ref(),
-            mount_retry.as_ref(),
-            ctx.tenant_retry.as_ref(),
-        ]);
-        let mut executor = Executor::new(requester, limits.clone(), retry)
-            // The role an `elevate` step adds, from operator-controlled mount
-            // config (`"elevate": "<role>"`). Authority lives here, not in the
-            // authored spec.
-            .with_elevate_role(
-                ctx.config
-                    .get("elevate")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-            )
-            .with_url(peeled, base_segs, url_name, url_query);
-        // Bind the mount's granted secrets as `$<name>` variables (host-side),
-        // so a transform can `$hmacVerify('sha256', $<name>, $_rawBody, $sig)`.
-        if let Some(secrets) = &ctx.secrets {
-            executor = executor.with_vars(secrets.clone());
-        }
-
-        let result = match tokio::time::timeout(
-            limits.wall_clock,
-            executor.run(&spec, msg, to_step),
+        // `${url.rest}` for a stored pipeline is the peeled remainder rebuilt
+        // with a leading slash (and a trailing slash for a directory request),
+        // so a `.root` spec can forward the sub-path it matched.
+        let rest = rebuild_rest(&peeled, msg.url.is_directory());
+        run_inline(
+            &spec,
+            msg,
+            ctx,
+            ExecInputs { peeled, base_segs, url_name, url_query, rest, envelope_retry },
         )
         .await
-        {
+    }
+}
+
+/// URL-plane inputs for [`run_inline`] — the incoming request's path, peeled to
+/// the plane a pipeline addresses (`${url.…}`), plus the verbatim `rest`.
+pub(crate) struct ExecInputs {
+    pub peeled: Vec<String>,
+    pub base_segs: Vec<String>,
+    pub url_name: Option<String>,
+    pub url_query: String,
+    pub rest: String,
+    pub envelope_retry: Option<RetryPolicy>,
+}
+
+/// Build the executor with the request's URL plane, run `spec` under the
+/// wall-clock budget, and shape a failure into a structured problem with
+/// per-step statuses (PRD §12). Shared by the `pipeline` service (stored
+/// specs) and the `wrapper` service (one inline spec) — only the spec source
+/// and the URL inputs differ; access is enforced by the caller (per-spec for
+/// `pipeline`, host mount-access for `wrapper`).
+pub(crate) async fn run_inline(
+    spec: &PipelineSpec,
+    msg: Message,
+    ctx: &ServiceContext,
+    inputs: ExecInputs,
+) -> Result<Message, RsError> {
+    let requester = ctx
+        .requester
+        .clone()
+        .ok_or_else(|| RsError::internal("pipeline service has no requester capability"))?;
+    let to_step = msg
+        .url
+        .query_param("$to-step")
+        .and_then(|v| v.parse::<usize>().ok());
+
+    let limits = PipelineLimits {
+        wall_clock: ctx.pipeline_wall_clock,
+        materialize_cap: ctx.limits.materialized_body_bytes,
+        ..PipelineLimits::default()
+    };
+    // Retry resolution: envelope → mount config → tenant default.
+    let mount_retry = RetryPolicy::from_config(ctx.config.get("retry").unwrap_or(&Value::Null));
+    let retry = RetryPolicy::resolve(&[
+        inputs.envelope_retry.as_ref(),
+        mount_retry.as_ref(),
+        ctx.tenant_retry.as_ref(),
+    ]);
+    let mut executor = Executor::new(requester, limits.clone(), retry)
+        // The role an `elevate` step adds, from operator-controlled mount
+        // config (`"elevate": "<role>"`). Authority lives here, not in the spec.
+        .with_elevate_role(
+            ctx.config
+                .get("elevate")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        )
+        .with_url(inputs.peeled, inputs.base_segs, inputs.url_name, inputs.url_query, inputs.rest);
+    // Bind the mount's granted secrets as `$<name>` variables (host-side),
+    // so a transform can `$hmacVerify('sha256', $<name>, $_rawBody, $sig)`.
+    if let Some(secrets) = &ctx.secrets {
+        executor = executor.with_vars(secrets.clone());
+    }
+
+    let result =
+        match tokio::time::timeout(limits.wall_clock, executor.run(spec, msg, to_step)).await {
             Ok(result) => result,
             Err(_) => Err(RsError::limit_exceeded(
                 "pipeline_wall_clock_ms",
@@ -265,41 +299,52 @@ impl Service for PipelineService {
             )),
         };
 
-        // Pipeline failures include the failing step and per-step statuses
-        // (PRD §12) so agents can recover instead of guessing.
-        match result {
-            Ok(mut resp) if !resp.is_ok() => {
-                let steps = executor.report();
-                let failed = steps
-                    .iter()
-                    .rev()
-                    .find(|s| s["status"].as_u64().unwrap_or(0) >= 400)
-                    .cloned();
-                if let Some(body) = &mut resp.body {
-                    if body.media_type.is_json() {
-                        if let Ok(mut problem) =
-                            body.as_json(ctx.limits.materialized_body_bytes).await
-                        {
-                            if let Some(obj) = problem.as_object_mut() {
-                                obj.insert(
-                                    "pipeline".to_string(),
-                                    serde_json::json!({
-                                        "failedStep": failed.as_ref().and_then(|f| f.get("step")),
-                                        "steps": steps,
-                                    }),
-                                );
-                                let media_type = body.media_type.clone();
-                                resp.body = Some(crate::message::Body::from_string(
-                                    problem.to_string(),
-                                    media_type,
-                                ));
-                            }
+    // Pipeline failures include the failing step and per-step statuses
+    // (PRD §12) so agents can recover instead of guessing.
+    match result {
+        Ok(mut resp) if !resp.is_ok() => {
+            let steps = executor.report();
+            let failed = steps
+                .iter()
+                .rev()
+                .find(|s| s["status"].as_u64().unwrap_or(0) >= 400)
+                .cloned();
+            if let Some(body) = &mut resp.body {
+                if body.media_type.is_json() {
+                    if let Ok(mut problem) = body.as_json(ctx.limits.materialized_body_bytes).await {
+                        if let Some(obj) = problem.as_object_mut() {
+                            obj.insert(
+                                "pipeline".to_string(),
+                                serde_json::json!({
+                                    "failedStep": failed.as_ref().and_then(|f| f.get("step")),
+                                    "steps": steps,
+                                }),
+                            );
+                            let media_type = body.media_type.clone();
+                            resp.body = Some(crate::message::Body::from_string(
+                                problem.to_string(),
+                                media_type,
+                            ));
                         }
                     }
                 }
-                Ok(resp)
             }
-            other => other,
+            Ok(resp)
         }
+        other => other,
     }
+}
+
+/// Rebuild the `${url.rest}` value from peeled segments: a leading slash, the
+/// segments `/`-joined, and a trailing slash for a directory request. Empty
+/// peeled (the matched prefix consumed everything) ⇒ `/`.
+pub(crate) fn rebuild_rest(peeled: &[String], is_directory: bool) -> String {
+    if peeled.is_empty() {
+        return "/".to_string();
+    }
+    let mut r = format!("/{}", peeled.join("/"));
+    if is_directory {
+        r.push('/');
+    }
+    r
 }

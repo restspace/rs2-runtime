@@ -93,6 +93,9 @@ pub struct Executor {
     url_base: Vec<String>,
     url_name: Option<String>,
     url_query: String,
+    /// Verbatim service-path remainder for `${url.rest}` (byte-exact, leading
+    /// slash) — the wrapper service forwards this for transparent passthrough.
+    url_rest: String,
 }
 
 /// What a step did with the in-flight message.
@@ -120,6 +123,7 @@ impl Executor {
             url_base: Vec::new(),
             url_name: None,
             url_query: String::new(),
+            url_rest: String::new(),
         }
     }
 
@@ -132,11 +136,13 @@ impl Executor {
         base: Vec<String>,
         name: Option<String>,
         query: String,
+        rest: String,
     ) -> Self {
         self.url_path = path;
         self.url_base = base;
         self.url_name = name;
         self.url_query = query;
+        self.url_rest = rest;
         self
     }
 
@@ -613,6 +619,7 @@ impl Executor {
             base: &base_refs,
             name: self.url_name.as_deref(),
             query: &self.url_query,
+            rest: &self.url_rest,
         };
         let url = path_pattern::resolve(&call.url, &url_view, &interp_ctx)?;
 
@@ -1030,7 +1037,13 @@ mod tests {
             PipelineLimits::default(),
             RetryPolicy::no_retry(),
         )
-        .with_url(vec!["ada@example.com".to_string()], vec![], Some("ada@example.com".to_string()), String::new());
+        .with_url(
+            vec!["ada@example.com".to_string()],
+            vec![],
+            Some("ada@example.com".to_string()),
+            String::new(),
+            "/ada@example.com".to_string(),
+        );
         let spec = PipelineSpec {
             mode: Mode::Serial,
             steps: vec![Step::call("GET", "/data/users/${url.path[0]}")],

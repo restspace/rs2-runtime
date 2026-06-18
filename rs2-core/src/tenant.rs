@@ -239,21 +239,7 @@ impl Tenant {
                 "file" => Arc::new(FileService::from_config(&mount.config)),
                 "data" => Arc::new(DataService::from_config(&mount.config)),
                 "pipeline" => {
-                    // An `elevate` role must not confer operator authority —
-                    // otherwise an author on this mount could elevate into
-                    // permission-changing power.
-                    if let (Some(elevate), Some(ops)) = (
-                        mount.config.get("elevate").and_then(|v| v.as_str()),
-                        config.operator_roles.as_deref(),
-                    ) {
-                        if ops.split_whitespace().any(|r| r == elevate) {
-                            return Err(RsError::bad_request(format!(
-                                "mount '{}' sets elevate role '{elevate}', which is an \
-                                 operator role; elevation must not confer operator authority",
-                                if mount.base_path.is_empty() { "/" } else { &mount.base_path }
-                            )));
-                        }
-                    }
+                    check_elevate_not_operator(mount, config.operator_roles.as_deref())?;
                     let root = crate::services::spec_store::store_root(
                         crate::services::PIPELINE_PREFIX,
                         &mount.base_path,
@@ -316,6 +302,22 @@ impl Tenant {
                             if mount.base_path.is_empty() { "/" } else { &mount.base_path }
                         )));
                     }
+                }
+                "wrapper" => {
+                    // One inline pipeline fronting another mount: same elevate
+                    // guard as `pipeline`, plus a config-declared discovery
+                    // `pattern` validated here so a bad value is a 400 at PUT.
+                    check_elevate_not_operator(mount, config.operator_roles.as_deref())?;
+                    if let Some(p) = mount.config.get("pattern").and_then(|v| v.as_str()) {
+                        if !KNOWN_PATTERNS.contains(&p) {
+                            return Err(RsError::bad_request(format!(
+                                "wrapper mount '{}' declares unknown pattern '{p}' (one of: {})",
+                                if mount.base_path.is_empty() { "/" } else { &mount.base_path },
+                                KNOWN_PATTERNS.join(", ")
+                            )));
+                        }
+                    }
+                    Arc::new(crate::services::WrapperService::from_config(&mount.config)?)
                 }
                 "auth" => Arc::new(crate::services::AuthService::from_config(
                     &mount.config,
@@ -402,6 +404,28 @@ impl Tenant {
     pub fn instance(&self, base_path: &str) -> Option<&(Arc<dyn Service>, Arc<ServiceContext>)> {
         self.instances.get(base_path)
     }
+}
+
+/// Discovery API patterns a `wrapper` mount may declare (it fronts a mount of
+/// one of these shapes). Kept in sync with `discovery::pattern_of`.
+const KNOWN_PATTERNS: &[&str] = &["store", "store-transform", "store-view", "view", "api"];
+
+/// An `elevate` role must not be an operator role — otherwise an author on a
+/// `pipeline`/`wrapper` mount could elevate a call into permission-changing
+/// power. Shared by both service arms.
+fn check_elevate_not_operator(mount: &Mount, operator_roles: Option<&str>) -> Result<(), RsError> {
+    if let (Some(elevate), Some(ops)) =
+        (mount.config.get("elevate").and_then(|v| v.as_str()), operator_roles)
+    {
+        if ops.split_whitespace().any(|r| r == elevate) {
+            return Err(RsError::bad_request(format!(
+                "mount '{}' sets elevate role '{elevate}', which is an operator role; \
+                 elevation must not confer operator authority",
+                if mount.base_path.is_empty() { "/" } else { &mount.base_path }
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// How a mount's `store.adapter` selects its backend. Read only when the mount

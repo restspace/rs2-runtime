@@ -10,7 +10,9 @@
 //! - `${url.path[0]}`   first peeled service-path segment
 //! - `${url.path[-1]}`  last segment
 //! - `${url.path[1:]}`  segments 1..end, `/`-joined (Python-style slice)
-//! - `${url.path}`      whole service path, `/`-joined
+//! - `${url.path}`      whole service path, segments `/`-joined (no leading/trailing slash)
+//! - `${url.rest}`      verbatim service-path remainder (leading slash, exact
+//!                      trailing slash) — for transparent path forwarding
 //! - `${url.base[0]}`   mount-prefix segments; `${url.full}` = base+path
 //! - `${url.name}`      last service segment (resource name)
 //! - `${url.query.id}`  one query param; `${url.query}` the whole query string
@@ -36,12 +38,16 @@ pub struct UrlView<'a> {
     pub base: &'a [&'a str],
     pub name: Option<&'a str>,
     pub query: &'a str,
+    /// The verbatim service-path remainder (`MsgUrl::service_path`): leading
+    /// slash, exact trailing slash, mount root normalized to `/`. Unlike
+    /// `path` (segment-joined) this is byte-exact, for transparent forwarding.
+    pub rest: &'a str,
 }
 
 impl<'a> UrlView<'a> {
     /// An empty view — for resolving data-only patterns (no URL plane).
     pub const EMPTY: UrlView<'static> =
-        UrlView { path: &[], base: &[], name: None, query: "" };
+        UrlView { path: &[], base: &[], name: None, query: "", rest: "" };
 }
 
 /// Resolve all `${…}` placeholders in `pattern`.
@@ -114,6 +120,7 @@ enum Expr<'a> {
 enum UrlSel<'a> {
     Segments { section: Section, index: Option<Index> },
     Name,
+    Rest,
     QueryAll,
     QueryKey(&'a str),
 }
@@ -173,6 +180,10 @@ fn parse_url_sel(s: &str) -> Result<UrlSel<'_>, String> {
         "name" => {
             require_empty(tail, "url.name")?;
             Ok(UrlSel::Name)
+        }
+        "rest" => {
+            require_empty(tail, "url.rest")?;
+            Ok(UrlSel::Rest)
         }
         "query" => {
             if tail.is_empty() {
@@ -259,6 +270,7 @@ fn eval_expr(expr: &Expr, url: &UrlView, data: &Map<String, Value>) -> Result<Op
 fn eval_url(sel: &UrlSel, url: &UrlView) -> Option<String> {
     match sel {
         UrlSel::Name => url.name.filter(|s| !s.is_empty()).map(str::to_string),
+        UrlSel::Rest => (!url.rest.is_empty()).then(|| url.rest.to_string()),
         UrlSel::QueryAll => (!url.query.is_empty()).then(|| url.query.to_string()),
         UrlSel::QueryKey(key) => query_get(url.query, key),
         UrlSel::Segments { section, index } => {
@@ -340,7 +352,7 @@ mod tests {
     use serde_json::json;
 
     fn url<'a>(path: &'a [&'a str], base: &'a [&'a str], query: &'a str) -> UrlView<'a> {
-        UrlView { path, base, name: path.last().copied(), query }
+        UrlView { path, base, name: path.last().copied(), query, rest: "" }
     }
 
     fn r(pattern: &str, u: &UrlView) -> Result<String, RsError> {
@@ -379,6 +391,28 @@ mod tests {
             r("/data/users/${url.path[0]}", &u).unwrap(),
             "/data/users/ada@example.com"
         );
+    }
+
+    #[test]
+    fn rest_forwards_verbatim_remainder() {
+        // `${url.rest}` is the byte-exact service-path suffix, for transparent
+        // forwarding: `/wrapped${url.rest}` reproduces the path beyond the mount.
+        let rest = |s: &'static str| UrlView { path: &[], base: &[], name: None, query: "", rest: s };
+        assert_eq!(r("/wrapped${url.rest}", &rest("/")).unwrap(), "/wrapped/");
+        assert_eq!(r("/wrapped${url.rest}", &rest("/x")).unwrap(), "/wrapped/x");
+        assert_eq!(r("/wrapped${url.rest}", &rest("/a/b")).unwrap(), "/wrapped/a/b");
+        // Trailing slash within a sub-path is preserved.
+        assert_eq!(r("/wrapped${url.rest}", &rest("/a/b/")).unwrap(), "/wrapped/a/b/");
+        // Combined with the query (forwarded separately, as documented).
+        let u = UrlView { path: &[], base: &[], name: None, query: "p=1", rest: "/a" };
+        assert_eq!(r("/wrapped${url.rest}?${url.query}", &u).unwrap(), "/wrapped/a?p=1");
+    }
+
+    #[test]
+    fn rest_takes_no_index() {
+        assert!(validate("${url.rest}").is_ok());
+        assert!(validate("${url.rest[0]}").is_err());
+        assert!(validate("${url.rest.x}").is_err());
     }
 
     #[test]

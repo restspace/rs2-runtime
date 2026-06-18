@@ -16,6 +16,7 @@ mod services_config;
 pub mod spec_store;
 #[cfg(feature = "js")]
 mod template;
+mod wrapper_service;
 
 pub use auth::AuthService;
 pub use code::CodeService;
@@ -27,6 +28,7 @@ pub use query::{QueryService, QUERY_PREFIX, QUERY_SUBTREE};
 pub use services_config::ServicesService;
 #[cfg(feature = "js")]
 pub use template::{TemplateService, TEMPLATE_PREFIX, TEMPLATE_SUBTREE};
+pub use wrapper_service::WrapperService;
 
 use std::sync::Arc;
 

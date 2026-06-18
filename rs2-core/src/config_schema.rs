@@ -197,6 +197,25 @@ pub struct QueryConfig {
     pub store: Option<StoreConfig>,
 }
 
+/// `wrapper` service config: one inline pipeline fronting another mount.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WrapperConfig {
+    /// The inline pipeline spec (typed object or string-DSL array) run for
+    /// every verb and sub-path. A step forwards the exact remaining path with
+    /// `${url.rest}` (e.g. `/wrapped${url.rest}`).
+    pub pipeline: Option<Value>,
+    /// Discovery pattern this mount advertises — it fronts a mount of that
+    /// shape (e.g. `"store"`). One of store / store-transform / store-view /
+    /// view / api. Defaults to `store-transform`.
+    pub pattern: Option<String>,
+    /// Optional discovery facets advertised alongside the pattern.
+    pub facets: Option<Vec<String>>,
+    /// Role an `elevate` step adds to sub-calls (operator-controlled).
+    pub elevate: Option<String>,
+    pub retry: Option<RetryPolicy>,
+}
+
 /// `template` service config (beyond the base envelope).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -229,6 +248,9 @@ pub fn catalogue() -> Value {
             { "name": "query",
               "description": "Stored parameterized queries (PRD §10.4): PUT envelopes {language?, query, params?, output?} to /<mount>/.queries/<name>; any verb elsewhere executes the longest-prefix match",
               "configSchema": schema_of::<QueryConfig>() },
+            { "name": "wrapper",
+              "description": "One inline pipeline fronting another mount: runs config.pipeline for every verb/sub-path. Declares its discovery pattern/facets and forwards the exact remaining path via ${url.rest}",
+              "configSchema": schema_of::<WrapperConfig>() },
             { "name": "template",
               "description": "JSX templates rendered to HTML: PUT compiled bundles (from `rs2 template build`) to /<mount>/.templates/<name> (.root governs the mount root); any verb elsewhere renders the longest-prefix match with the request body as props",
               "configSchema": schema_of::<TemplateConfig>() },
