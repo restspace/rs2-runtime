@@ -9,3 +9,5 @@ bash.exe.stackdump
 # Runtime state created by running an example node (file/data stores).
 examples/*/data/
 examples/*/data-store/
+# Local persistent dev nodes started by scripts/node-*.ps1
+/.run/
