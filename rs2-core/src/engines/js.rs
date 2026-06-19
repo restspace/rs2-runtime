@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -36,7 +36,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::contract::{Engine, HostApi, InvocationLimits, LogLevel, ServiceCode};
 use crate::error::{codes, RsError};
-use crate::message::{Body, MediaType, Message, Principal, Source};
+use crate::message::{Body, ByteStream, MediaType, Message, Principal, Provenance, Source};
+use bytes::Bytes;
+use futures::StreamExt;
 
 /// Bootstrap: capture the host ops into closures, install the native hooks
 /// the compat prelude expects (`__rs2_native_*`, `__rs2_sleep`), and define
@@ -88,6 +90,39 @@ const BOOTSTRAP: &str = r#"
         get: (k) => ops.op_rs2_state_get(String(k)),
         put: (k, v) => ops.op_rs2_state_put(String(k), String(v)),
       },
+      // Request streaming (`"requestStreaming": true`): pull the body
+      // chunk-by-chunk instead of receiving it materialized in `msg.body`.
+      // `readBody()` returns the next chunk as a Uint8Array, or null at EOF.
+      readBody: () => {
+        const r = rethrow(ops.op_rs2_body_read());
+        if (r === null) return null; // EOF (the op is the sole EOF authority)
+        return Uint8Array.from(r.data || []);
+      },
+      // Async-iterable sugar over `readBody`: `for await (const c of ctx.body())`.
+      body: () => ({
+        async *[Symbol.asyncIterator]() {
+          for (;;) {
+            const chunk = ctx.readBody();
+            if (chunk === null) return;
+            yield chunk;
+          }
+        },
+      }),
+      // Response streaming (`"responseStreaming": true`): declare the status +
+      // headers, then push the body incrementally. The host returns the response
+      // to the client as soon as `beginStream` is called; `write` applies
+      // backpressure (it blocks when the consumer is behind). The stream ends
+      // when the handler returns.
+      beginStream: (envelope) => {
+        rethrow(ops.op_rs2_stream_begin(envelope ?? {}));
+        return {
+          write: (data) => {
+            const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+            rethrow(ops.op_rs2_body_write(bytes));
+          },
+          end: () => {}, // the stream closes when the handler returns
+        };
+      },
     };
     const handle = typeof userDefault === "function"
       ? userDefault
@@ -131,6 +166,33 @@ pub(crate) struct InvocationState {
     socket_seq: AtomicU32,
     /// Allowed `host:port` patterns, from the mount's `socket` grants.
     socket_allowlist: Vec<String>,
+    /// The request body as a pull stream, present only under request streaming
+    /// (`"requestStreaming": true`): the guest drains it chunk-by-chunk via
+    /// `op_rs2_body_read` instead of receiving it materialized. `tokio::Mutex`
+    /// so the read op can poll it from the main runtime (like `sockets`).
+    request_body: Mutex<Option<Arc<tokio::sync::Mutex<ByteStream>>>>,
+    /// Cumulative bytes pulled from `request_body`, bounded by `materialize_cap`
+    /// (streaming bypasses the one-shot materialization cap, so it needs its own
+    /// running bound).
+    streamed_in: AtomicU64,
+    /// The response sink, present only under response streaming
+    /// (`"responseStreaming": true`): the guest emits the response incrementally
+    /// via `ctx.beginStream()` + `write()`, which feed this sink. The host
+    /// returns the response (headers + a `ByteStream`) the moment the guest
+    /// begins, then keeps the isolate running to drain chunks under backpressure.
+    response_sink: Mutex<Option<Arc<StreamSink>>>,
+}
+
+/// The destination for a streamed response body. `headers` carries the status +
+/// headers envelope to the host exactly once (on `beginStream`); `chunks` is the
+/// bounded byte channel feeding the response `ByteStream` (its capacity is the
+/// backpressure). `sent`/`cap` bound the cumulative response size.
+pub(crate) struct StreamSink {
+    headers: Mutex<Option<tokio::sync::oneshot::Sender<Value>>>,
+    chunks: tokio::sync::mpsc::Sender<Bytes>,
+    sent: AtomicU64,
+    cap: u64,
+    began: AtomicBool,
 }
 
 impl InvocationState {
@@ -157,7 +219,22 @@ impl InvocationState {
             sockets: Mutex::new(HashMap::new()),
             socket_seq: AtomicU32::new(1),
             socket_allowlist,
+            request_body: Mutex::new(None),
+            streamed_in: AtomicU64::new(0),
+            response_sink: Mutex::new(None),
         })
+    }
+
+    /// Install the request body as a pull stream for `op_rs2_body_read`. Called
+    /// before dispatch when the mount opts into request streaming.
+    pub(crate) fn set_request_body(&self, stream: ByteStream) {
+        *self.request_body.lock().unwrap() = Some(Arc::new(tokio::sync::Mutex::new(stream)));
+    }
+
+    /// Install the response sink for `op_rs2_stream_begin`/`op_rs2_body_write`.
+    /// Called before dispatch when the mount opts into response streaming.
+    pub(crate) fn set_response_sink(&self, sink: Arc<StreamSink>) {
+        *self.response_sink.lock().unwrap() = Some(sink);
     }
 
     fn socket_allowed(&self, host: &str, port: u16) -> bool {
@@ -582,6 +659,100 @@ fn op_rs2_sock_close(state: &mut OpState, #[smi] id: u32) {
     inv.sockets.lock().unwrap().remove(&id);
 }
 
+/// Pull the next chunk of the request body, or `null` at end of stream. Present
+/// only under request streaming (`"requestStreaming": true`); without it (or
+/// once drained) it returns `null`. Chunks arrive as the source yields them;
+/// the cumulative size is bounded by the materialization cap. Synchronous from
+/// the guest's view, like the socket read op.
+#[op2]
+#[serde]
+fn op_rs2_body_read(state: &mut OpState) -> serde_json::Value {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let Some(stream) = inv.request_body.lock().unwrap().clone() else {
+        return Value::Null; // no streaming body (or never opted in)
+    };
+    let chunk = block_on_main(&inv.main, async move {
+        let mut guard = stream.lock().await;
+        guard.next().await
+    });
+    match chunk {
+        Ok(Some(Ok(bytes))) => {
+            let total = inv.streamed_in.fetch_add(bytes.len() as u64, Ordering::SeqCst)
+                + bytes.len() as u64;
+            if total > inv.materialize_cap {
+                return fail_body(
+                    &inv,
+                    RsError::limit_exceeded("materialized_body_bytes", total, inv.materialize_cap),
+                );
+            }
+            json!({ "data": bytes.to_vec() })
+        }
+        Ok(None) => Value::Null, // EOF
+        Ok(Some(Err(e))) => fail_body(
+            &inv,
+            RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("request body stream error: {e}")),
+        ),
+        Err(_) => fail_body(&inv, RsError::internal("body read task dropped")),
+    }
+}
+
+/// Record a structured request-body error (so an uncaught one keeps its identity
+/// out of the engine, invariant 2) and return the marker the bootstrap rethrows.
+fn fail_body(inv: &InvocationState, e: RsError) -> Value {
+    let marker = error_marker(&e);
+    *inv.host_error.lock().unwrap() = Some(e);
+    marker
+}
+
+/// Begin a streamed response: hand the status/headers envelope to the host
+/// (which builds the response and returns it while this isolate keeps running)
+/// and arm the body writer. Present only under response streaming. Calling it
+/// twice, or without the mount opting in, is a contract violation.
+#[op2]
+#[serde]
+fn op_rs2_stream_begin(state: &mut OpState, #[serde] envelope: serde_json::Value) -> serde_json::Value {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let Some(sink) = inv.response_sink.lock().unwrap().clone() else {
+        return fail_body(&inv, RsError::internal("response streaming is not enabled for this mount"));
+    };
+    let Some(tx) = sink.headers.lock().unwrap().take() else {
+        return fail_body(&inv, RsError::contract_violation("beginStream called more than once"));
+    };
+    sink.began.store(true, Ordering::SeqCst);
+    let _ = tx.send(envelope);
+    Value::Null
+}
+
+/// Write one chunk of the streamed response body. Blocks (from the guest's view)
+/// when the bounded channel is full — that backpressure is the consumer pacing
+/// the producer. A gone consumer (client disconnect) surfaces as an error the
+/// guest can catch. Bounded cumulatively by the materialization cap.
+#[op2]
+#[serde]
+fn op_rs2_body_write(state: &mut OpState, #[buffer] data: &[u8]) -> serde_json::Value {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let Some(sink) = inv.response_sink.lock().unwrap().clone() else {
+        return fail_body(&inv, RsError::internal("response streaming is not enabled for this mount"));
+    };
+    if !sink.began.load(Ordering::SeqCst) {
+        return fail_body(&inv, RsError::contract_violation("body write before beginStream"));
+    }
+    let total = sink.sent.fetch_add(data.len() as u64, Ordering::SeqCst) + data.len() as u64;
+    if total > sink.cap {
+        return fail_body(&inv, RsError::limit_exceeded("materialized_body_bytes", total, sink.cap));
+    }
+    let bytes = Bytes::copy_from_slice(data);
+    let chunks = sink.chunks.clone();
+    match block_on_main(&inv.main, async move { chunks.send(bytes).await }) {
+        Ok(Ok(())) => Value::Null,
+        Ok(Err(_)) => fail_body(
+            &inv,
+            RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", "response stream consumer is gone"),
+        ),
+        Err(_) => fail_body(&inv, RsError::internal("stream write task dropped")),
+    }
+}
+
 extension!(
     rs2_host,
     ops = [
@@ -594,7 +765,10 @@ extension!(
         op_rs2_sock_connect,
         op_rs2_sock_write,
         op_rs2_sock_read,
-        op_rs2_sock_close
+        op_rs2_sock_close,
+        op_rs2_body_read,
+        op_rs2_stream_begin,
+        op_rs2_body_write
     ]
 );
 
@@ -663,20 +837,73 @@ impl Engine for JsEngine {
         };
         let template = msg.response(http::StatusCode::OK, None);
 
-        // Bodies materialize at the engine boundary, capped (invariant 1).
-        let body_json = match &mut msg.body {
-            None => Value::Null,
-            Some(body) => {
-                let media_type = body.media_type.to_string();
-                let is_json = body.media_type.is_json();
-                let bytes = body.materialize(limits.materialized_body_bytes).await?;
-                let text = String::from_utf8_lossy(bytes).into_owned();
-                let payload = if is_json {
-                    serde_json::from_str(&text).unwrap_or(Value::String(text))
-                } else {
-                    Value::String(text)
-                };
-                json!({ "payload": payload, "mediaType": media_type })
+        // Body passthrough (`"bodyPassthrough": true` on the mount): the guest
+        // sees the request body's *metadata* but not its bytes — the body is
+        // carried past the isolate untouched and, unless the guest replaces it,
+        // forwarded as the response body. A large upload/download proxied this
+        // way never materializes (its `Payload::Stream` crosses by reference).
+        let passthrough = config
+            .get("bodyPassthrough")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Request streaming (`"requestStreaming": true`): the guest pulls the
+        // body chunk-by-chunk via `ctx.readBody()` rather than receiving it
+        // materialized. Takes precedence over passthrough (the guest consumes
+        // the body, so there is nothing left to forward).
+        let request_streaming = config
+            .get("requestStreaming")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Response streaming (`"responseStreaming": true`): the guest emits the
+        // body incrementally via `ctx.beginStream()` + `write()`; the host
+        // returns the response the moment the guest begins and keeps the isolate
+        // running (backpressured) until the handler finishes.
+        let response_streaming = config
+            .get("responseStreaming")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut carried_body: Option<Body> = None;
+        let mut request_stream: Option<ByteStream> = None;
+
+        // Bodies materialize at the engine boundary, capped (invariant 1) —
+        // except under streaming/passthrough, where they cross by reference.
+        let body_json = if request_streaming {
+            match msg.body.take() {
+                None => json!({ "payload": Value::Null, "mediaType": Value::Null }),
+                Some(body) => {
+                    let media_type = body.media_type.to_string();
+                    let size = body.size;
+                    // `into_stream` adapts a materialized body too, so the guest
+                    // sees a uniform pull API regardless of the source.
+                    request_stream = Some(body.into_stream());
+                    json!({ "payload": Value::Null, "mediaType": media_type, "size": size })
+                }
+            }
+        } else if passthrough {
+            match msg.body.take() {
+                None => json!({ "payload": Value::Null, "mediaType": Value::Null }),
+                Some(body) => {
+                    let media_type = body.media_type.to_string();
+                    let size = body.size;
+                    carried_body = Some(body);
+                    json!({ "payload": Value::Null, "mediaType": media_type, "size": size })
+                }
+            }
+        } else {
+            match &mut msg.body {
+                None => Value::Null,
+                Some(body) => {
+                    let media_type = body.media_type.to_string();
+                    let is_json = body.media_type.is_json();
+                    let bytes = body.materialize(limits.materialized_body_bytes).await?;
+                    let text = String::from_utf8_lossy(bytes).into_owned();
+                    let payload = if is_json {
+                        serde_json::from_str(&text).unwrap_or(Value::String(text))
+                    } else {
+                        Value::String(text)
+                    };
+                    json!({ "payload": payload, "mediaType": media_type })
+                }
             }
         };
         let headers: serde_json::Map<String, Value> = msg
@@ -695,6 +922,13 @@ impl Engine for JsEngine {
             "headers": headers,
             "body": body_json.get("payload").cloned().unwrap_or(Value::Null),
             "mediaType": body_json.get("mediaType").cloned().unwrap_or(Value::Null),
+            // Streaming surface: the guest can branch on these without ever
+            // touching the bytes (`body` is null under either mode — pull it via
+            // `ctx.readBody()` when `requestStreaming` holds).
+            "bodyPassthrough": passthrough,
+            "requestStreaming": request_streaming,
+            "responseStreaming": response_streaming,
+            "bodySize": body_json.get("size").cloned().unwrap_or(Value::Null),
         });
 
         let config = config.clone();
@@ -705,6 +939,19 @@ impl Engine for JsEngine {
         // the guest's own `fetch`/`request` calls.
         let principal = msg.principal.clone();
         let limits = limits.clone();
+
+        // Response streaming: spawn the isolate, but return as soon as the guest
+        // calls `beginStream` — the handler keeps running on its thread, feeding
+        // the response `ByteStream` under backpressure. If the handler finishes
+        // without ever streaming, fall back to its envelope.
+        if response_streaming {
+            return invoke_streaming(
+                source, input, config, host, main, tenant, depth, principal, limits, template,
+                request_stream, carried_body,
+            )
+            .await;
+        }
+
         let outcome = tokio::task::spawn_blocking(move || {
             let inv = InvocationState::new(
                 host,
@@ -715,6 +962,10 @@ impl Engine for JsEngine {
                 limits.materialized_body_bytes,
                 socket_allowlist_from_config(&config),
             );
+            // Hand the request body to the read op (request streaming only).
+            if let Some(stream) = request_stream {
+                inv.set_request_body(stream);
+            }
             let local = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -724,41 +975,147 @@ impl Engine for JsEngine {
         .await
         .map_err(|e| RsError::internal(format!("isolate thread failed: {e}")))??;
 
-        // Map the guest's response envelope to a Message.
-        let status = outcome
-            .get("status")
-            .and_then(|s| s.as_u64())
-            .and_then(|s| http::StatusCode::from_u16(s as u16).ok())
-            .unwrap_or(http::StatusCode::OK);
-        let media_type = outcome.get("mediaType").and_then(|m| m.as_str()).map(MediaType::parse);
-        let body = match outcome.get("body") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(text)) => Some(Body::from_string(
-                text.clone(),
-                media_type.clone().unwrap_or_else(|| MediaType::new("text/plain")),
-            )),
-            Some(other) => {
-                let mut b = Body::from_json(other);
-                if let Some(mt) = media_type.clone() {
-                    b.media_type = mt;
-                }
-                Some(b)
+        Ok(envelope_to_message(&template, &outcome, carried_body))
+    }
+}
+
+/// Map a guest response envelope (`{ status?, headers?, body?, mediaType? }`) to
+/// a `Message`, using `template` for identity. `fallback_body` is used when the
+/// envelope carries no `body` — the passthrough request body, or a streamed
+/// response body.
+fn envelope_to_message(template: &Message, outcome: &Value, fallback_body: Option<Body>) -> Message {
+    let status = outcome
+        .get("status")
+        .and_then(|s| s.as_u64())
+        .and_then(|s| http::StatusCode::from_u16(s as u16).ok())
+        .unwrap_or(http::StatusCode::OK);
+    let media_type = outcome.get("mediaType").and_then(|m| m.as_str()).map(MediaType::parse);
+    let body = match outcome.get("body") {
+        // No body in the envelope → use the fallback (a passthrough or streamed
+        // body); otherwise an absent body simply means no body.
+        None | Some(Value::Null) => fallback_body,
+        Some(Value::String(text)) => Some(Body::from_string(
+            text.clone(),
+            media_type.clone().unwrap_or_else(|| MediaType::new("text/plain")),
+        )),
+        Some(other) => {
+            let mut b = Body::from_json(other);
+            if let Some(mt) = media_type.clone() {
+                b.media_type = mt;
             }
-        };
-        let mut resp = template.response(status, body);
-        if let Some(headers) = outcome.get("headers").and_then(|h| h.as_object()) {
-            for (k, v) in headers {
-                if let Some(v) = v.as_str() {
-                    if let (Ok(name), Ok(value)) = (
-                        http::header::HeaderName::try_from(k.as_str()),
-                        http::HeaderValue::from_str(v),
-                    ) {
-                        resp.headers.insert(name, value);
-                    }
+            Some(b)
+        }
+    };
+    let mut resp = template.response(status, body);
+    if let Some(headers) = outcome.get("headers").and_then(|h| h.as_object()) {
+        for (k, v) in headers {
+            if let Some(v) = v.as_str() {
+                if let (Ok(name), Ok(value)) = (
+                    http::header::HeaderName::try_from(k.as_str()),
+                    http::HeaderValue::from_str(v),
+                ) {
+                    resp.headers.insert(name, value);
                 }
             }
         }
-        Ok(resp)
+    }
+    resp
+}
+
+/// Response-streaming dispatch. Spawns the isolate on a blocking thread and
+/// returns the moment the guest calls `beginStream` — the handler keeps running
+/// on that thread, feeding the bounded chunk channel under backpressure, and the
+/// returned `ByteStream` drains it. If the handler finishes without ever
+/// streaming, its envelope is mapped as usual. The wall-clock watchdog inside
+/// `dispatch_once` bounds the whole handler run, so it doubles as the stream's
+/// total time budget (backpressure waits count against it).
+#[allow(clippy::too_many_arguments)]
+async fn invoke_streaming(
+    source: Arc<String>,
+    input: Value,
+    config: Value,
+    host: Arc<dyn HostApi>,
+    main: tokio::runtime::Handle,
+    tenant: String,
+    depth: u16,
+    principal: Option<Principal>,
+    limits: InvocationLimits,
+    template: Message,
+    request_stream: Option<ByteStream>,
+    carried_body: Option<Body>,
+) -> Result<Message, RsError> {
+    // How many chunks the producer may run ahead of the consumer (backpressure).
+    const CHANNEL_CAP: usize = 4;
+
+    let (hdr_tx, hdr_rx) = tokio::sync::oneshot::channel::<Value>();
+    let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Bytes>(CHANNEL_CAP);
+    let sink = Arc::new(StreamSink {
+        headers: Mutex::new(Some(hdr_tx)),
+        chunks: chunk_tx,
+        sent: AtomicU64::new(0),
+        cap: limits.materialized_body_bytes,
+        began: AtomicBool::new(false),
+    });
+
+    let mut join = tokio::task::spawn_blocking(move || {
+        let inv = InvocationState::new(
+            host,
+            main,
+            tenant,
+            depth,
+            principal,
+            limits.materialized_body_bytes,
+            socket_allowlist_from_config(&config),
+        );
+        if let Some(stream) = request_stream {
+            inv.set_request_body(stream);
+        }
+        // The isolate thread is now the sole owner of the chunk sender (via the
+        // sink): when the handler ends and `inv` drops, the sender drops and the
+        // response stream sees EOF.
+        inv.set_response_sink(sink);
+        let local = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| RsError::internal(format!("runtime build failed: {e}")))?;
+        local.block_on(run_invocation(&source, input, config, inv, &limits))
+    });
+
+    let mut hdr_rx = hdr_rx;
+    tokio::select! {
+        biased;
+        hdr = &mut hdr_rx => match hdr {
+            Ok(envelope) => {
+                // The guest began streaming; build the response over the channel
+                // and leave the handler running (the join handle detaches on
+                // return — a blocking task keeps running, feeding the stream).
+                let media_type = envelope
+                    .get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .map(MediaType::parse)
+                    .unwrap_or_else(MediaType::octet_stream);
+                let stream = futures::stream::unfold(chunk_rx, |mut rx| async move {
+                    rx.recv().await.map(|bytes| (Ok(bytes), rx))
+                })
+                .boxed();
+                let body = Body::from_stream(stream, media_type, None, Provenance::Ephemeral);
+                Ok(envelope_to_message(&template, &envelope, Some(body)))
+            }
+            Err(_) => {
+                // The sender dropped without beginning a stream → the handler
+                // ended; take its envelope (or error) from the join handle.
+                let outcome = join
+                    .await
+                    .map_err(|e| RsError::internal(format!("isolate thread failed: {e}")))??;
+                Ok(envelope_to_message(&template, &outcome, carried_body))
+            }
+        },
+        res = &mut join => {
+            // The handler finished before ever calling `beginStream`.
+            let outcome =
+                res.map_err(|e| RsError::internal(format!("isolate thread failed: {e}")))??;
+            Ok(envelope_to_message(&template, &outcome, carried_body))
+        }
     }
 }
 
@@ -1213,5 +1570,266 @@ mod socket_tests {
         // No socket grant → the connect is capability-denied.
         let err = run(&code, json!({})).await.unwrap_err();
         assert_eq!(err.code, crate::error::codes::CAPABILITY_DENIED);
+    }
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::JsEngine;
+    use crate::contract::{Engine, GrantedHost, HostApi, InvocationLimits, ServiceCode};
+    use crate::message::{Body, MediaType, Message, Provenance};
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// A request carrying a two-chunk streaming body of the given media type.
+    fn streaming_request(media_type: MediaType) -> Message {
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from_static(b"chunk1")), Ok(Bytes::from_static(b"chunk2"))];
+        let stream = futures::stream::iter(chunks).boxed();
+        let mut msg = Message::request(http::Method::POST, "/x", "t1");
+        msg.body = Some(Body::from_stream(stream, media_type, Some(12), Provenance::Ephemeral));
+        msg
+    }
+
+    async fn run(msg: Message, config: serde_json::Value, code: &str) -> Message {
+        let engine = JsEngine::new();
+        let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all("passthrough-test"));
+        engine
+            .invoke(
+                &ServiceCode::JsBundle(Arc::new(code.to_string())),
+                msg,
+                &config,
+                host,
+                &InvocationLimits::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn forwards_request_stream_without_materializing() {
+        // The guest returns no body, so the carried request stream is forwarded
+        // as the response body — still a stream (never materialized).
+        let code = r#"
+            export default async (msg, ctx) => {
+                return { status: 200, headers: {
+                    "x-passthrough": String(msg.bodyPassthrough),
+                    "x-size": String(msg.bodySize),
+                    "x-body-null": String(msg.body === null),
+                } };
+            };
+        "#;
+        let config = json!({ "bodyPassthrough": true });
+        let mut resp = run(streaming_request(MediaType::octet_stream()), config, code).await;
+
+        // The guest saw metadata, not bytes.
+        assert_eq!(resp.headers.get("x-passthrough").unwrap(), "true");
+        assert_eq!(resp.headers.get("x-size").unwrap(), "12");
+        assert_eq!(resp.headers.get("x-body-null").unwrap(), "true");
+
+        // The forwarded body is still a stream (proof it never materialized).
+        let body = resp.body.as_mut().unwrap();
+        assert!(body.is_stream(), "passthrough must forward the stream by reference");
+        let bytes = body.materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"chunk1chunk2");
+    }
+
+    #[tokio::test]
+    async fn guest_body_replaces_the_carried_stream() {
+        // When the guest returns its own body under passthrough, that wins and
+        // the carried request stream is dropped.
+        let code = r#"
+            export default async (msg, ctx) => {
+                return { status: 200, body: "replaced" };
+            };
+        "#;
+        let config = json!({ "bodyPassthrough": true });
+        let mut resp = run(streaming_request(MediaType::octet_stream()), config, code).await;
+        let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"replaced");
+    }
+
+    #[tokio::test]
+    async fn without_passthrough_body_materializes_for_the_guest() {
+        // Control: no passthrough flag → the guest sees the body bytes as usual.
+        let code = r#"
+            export default async (msg, ctx) => {
+                return { status: 200, body: msg.body, mediaType: "text/plain" };
+            };
+        "#;
+        let mut resp =
+            run(streaming_request(MediaType::new("text/plain")), json!({}), code).await;
+        let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"chunk1chunk2");
+    }
+
+    /// Like [`run`] but with explicit limits, surfacing the error path.
+    async fn run_limited(
+        msg: Message,
+        config: serde_json::Value,
+        code: &str,
+        limits: InvocationLimits,
+    ) -> Result<Message, crate::error::RsError> {
+        let engine = JsEngine::new();
+        let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all("streaming-test"));
+        engine
+            .invoke(
+                &ServiceCode::JsBundle(Arc::new(code.to_string())),
+                msg,
+                &config,
+                host,
+                &limits,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn request_streaming_reads_chunks_incrementally() {
+        // The guest pulls the body chunk-by-chunk; `msg.body` stays null.
+        let code = r#"
+            export default async (msg, ctx) => {
+                if (!msg.requestStreaming || msg.body !== null) {
+                    return { status: 500, body: "not streaming" };
+                }
+                let chunks = 0; const parts = [];
+                for (;;) {
+                    const c = ctx.readBody();
+                    if (c === null) break;
+                    chunks++; parts.push(new TextDecoder().decode(c));
+                }
+                return { status: 200, headers: { "x-chunks": String(chunks) }, body: parts.join("") };
+            };
+        "#;
+        let config = json!({ "requestStreaming": true });
+        let mut resp = run(streaming_request(MediaType::octet_stream()), config, code).await;
+        assert_eq!(resp.headers.get("x-chunks").unwrap(), "2");
+        let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"chunk1chunk2");
+    }
+
+    #[tokio::test]
+    async fn request_streaming_async_iterator() {
+        // The `for await (… of ctx.body())` sugar drains the same stream.
+        let code = r#"
+            export default async (msg, ctx) => {
+                const parts = [];
+                for await (const c of ctx.body()) { parts.push(new TextDecoder().decode(c)); }
+                return { status: 200, body: parts.join("") };
+            };
+        "#;
+        let config = json!({ "requestStreaming": true });
+        let mut resp = run(streaming_request(MediaType::octet_stream()), config, code).await;
+        let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"chunk1chunk2");
+    }
+
+    #[tokio::test]
+    async fn request_streaming_enforces_cumulative_cap() {
+        // A cap below the body size aborts mid-stream with LIMIT_EXCEEDED, even
+        // though no single chunk exceeds it (the bound is cumulative).
+        let code = r#"
+            export default async (msg, ctx) => {
+                for (;;) { if (ctx.readBody() === null) break; }
+                return { status: 200 };
+            };
+        "#;
+        let mut limits = InvocationLimits::default();
+        limits.materialized_body_bytes = 8; // body is 12 bytes across two chunks
+        let config = json!({ "requestStreaming": true });
+        let err = run_limited(streaming_request(MediaType::octet_stream()), config, code, limits)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, crate::error::codes::LIMIT_EXCEEDED);
+    }
+
+    /// Drain a streamed response body into its discrete chunks (asserting it is
+    /// actually a stream, not a buffer).
+    async fn collect_chunks(mut msg: Message) -> Vec<Vec<u8>> {
+        let body = msg.body.take().expect("response has a body");
+        assert!(body.is_stream(), "expected a streamed response body");
+        body.into_stream().map(|r| r.unwrap().to_vec()).collect().await
+    }
+
+    #[tokio::test]
+    async fn response_streaming_emits_chunks_progressively() {
+        // The guest declares headers, then pushes the body chunk-by-chunk; the
+        // chunks arrive as discrete stream items (not one buffered body).
+        let code = r#"
+            export default async (msg, ctx) => {
+                if (!msg.responseStreaming) throw new Error("expected responseStreaming");
+                const w = ctx.beginStream({ status: 200, mediaType: "text/event-stream" });
+                w.write("data: 1\n\n");
+                w.write("data: 2\n\n");
+                w.write("data: 3\n\n");
+            };
+        "#;
+        let config = json!({ "responseStreaming": true });
+        let resp = run(Message::request(http::Method::GET, "/sse", "t1"), config, code).await;
+        assert_eq!(resp.status.unwrap(), http::StatusCode::OK);
+        let chunks = collect_chunks(resp).await;
+        assert_eq!(chunks.len(), 3, "each write should surface as its own chunk");
+        let joined: Vec<u8> = chunks.concat();
+        assert_eq!(&joined[..], b"data: 1\n\ndata: 2\n\ndata: 3\n\n");
+    }
+
+    #[tokio::test]
+    async fn response_streaming_carries_media_type_and_headers() {
+        let code = r#"
+            export default async (msg, ctx) => {
+                const w = ctx.beginStream({
+                    status: 201,
+                    mediaType: "application/x-ndjson",
+                    headers: { "x-stream": "yes" },
+                });
+                w.write("{}\n");
+            };
+        "#;
+        let config = json!({ "responseStreaming": true });
+        let mut resp = run(Message::request(http::Method::GET, "/x", "t1"), config, code).await;
+        assert_eq!(resp.status.unwrap(), http::StatusCode::CREATED);
+        assert_eq!(resp.headers.get("x-stream").unwrap(), "yes");
+        let body = resp.body.as_mut().unwrap();
+        assert_eq!(body.media_type.essence(), "application/x-ndjson");
+    }
+
+    #[tokio::test]
+    async fn response_streaming_handler_without_stream_falls_back() {
+        // responseStreaming is enabled but the guest returns a normal envelope
+        // (never calls beginStream) → the envelope maps as usual.
+        let code = r#"
+            export default async (msg, ctx) => {
+                return { status: 200, body: "plain" };
+            };
+        "#;
+        let config = json!({ "responseStreaming": true });
+        let mut resp = run(Message::request(http::Method::GET, "/x", "t1"), config, code).await;
+        let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+        assert_eq!(&bytes[..], b"plain");
+    }
+
+    #[tokio::test]
+    async fn response_streaming_enforces_cumulative_cap() {
+        // With a cap of 8 bytes, the first two 4-byte writes pass and the third
+        // is rejected mid-stream — so the consumer sees exactly the first 8 bytes
+        // then EOF (the over-cap chunk never lands).
+        let code = r#"
+            export default async (msg, ctx) => {
+                const w = ctx.beginStream({ status: 200 });
+                w.write("aaaa");
+                w.write("bbbb");
+                try { w.write("cccc"); } catch (e) { /* cap exceeded → stop */ }
+            };
+        "#;
+        let mut limits = InvocationLimits::default();
+        limits.materialized_body_bytes = 8;
+        let config = json!({ "responseStreaming": true });
+        let resp = run_limited(Message::request(http::Method::GET, "/x", "t1"), config, code, limits)
+            .await
+            .unwrap();
+        let chunks = collect_chunks(resp).await;
+        let joined: Vec<u8> = chunks.concat();
+        assert_eq!(&joined[..], b"aaaabbbb", "the over-cap chunk must not be delivered");
     }
 }
