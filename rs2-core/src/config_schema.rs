@@ -58,6 +58,19 @@ pub fn json_object_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars
     schemars::schema::Schema::Object(obj)
 }
 
+/// Schema for a wrapper's inline `pipeline`: a JSON value edited as raw JSON,
+/// but either an object (the typed spec) or an array (the string DSL) —
+/// `{ "type": ["object", "array"], "editor": "json" }`.
+pub fn pipeline_value_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    use schemars::schema::{InstanceType, SingleOrVec};
+    let mut obj = schemars::schema::SchemaObject {
+        instance_type: Some(SingleOrVec::Vec(vec![InstanceType::Object, InstanceType::Array])),
+        ..Default::default()
+    };
+    obj.extensions.insert("editor".to_string(), serde_json::json!("json"));
+    schemars::schema::Schema::Object(obj)
+}
+
 /// Per-mount access control (the `access` field). Either a string shorthand
 /// (`"open"` / `"authenticated"`) or an object of space-separated role specs.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -217,8 +230,9 @@ pub struct QueryConfig {
 pub struct WrapperConfig {
     /// The inline pipeline spec (typed object or string-DSL array) run for
     /// every verb and sub-path. A step forwards the exact remaining path with
-    /// `${url.rest}` (e.g. `/wrapped${url.rest}`). Advertised as a JSON editor.
-    #[schemars(schema_with = "json_object_schema")]
+    /// `${url.rest}` (e.g. `/wrapped${url.rest}`). Advertised as a JSON editor
+    /// over an object (typed spec) or array (string DSL).
+    #[schemars(schema_with = "pipeline_value_schema")]
     pub pipeline: Option<Value>,
     /// Discovery pattern this mount advertises — it fronts a mount of that
     /// shape (e.g. `"store"`). One of store / store-transform / store-view /
@@ -315,10 +329,19 @@ mod tests {
     fn wrapper_schema_fields_carry_json_editor_hint() {
         let schema = schema_of::<WrapperConfig>();
         let props = &schema["properties"];
-        for field in ["pipeline", "inputSchema", "outputSchema"] {
+        // inputSchema/outputSchema are always objects.
+        for field in ["inputSchema", "outputSchema"] {
             assert_eq!(props[field]["type"], "object", "{field} type: {}", props[field]);
             assert_eq!(props[field]["editor"], "json", "{field} editor: {}", props[field]);
         }
+        // pipeline is an object (typed spec) or an array (string DSL).
+        assert_eq!(props["pipeline"]["editor"], "json", "{}", props["pipeline"]);
+        assert_eq!(
+            props["pipeline"]["type"],
+            serde_json::json!(["object", "array"]),
+            "{}",
+            props["pipeline"]
+        );
     }
 
     /// A schema and its deserializer come from the same type, so a config
