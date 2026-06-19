@@ -217,7 +217,8 @@ pub struct QueryConfig {
 pub struct WrapperConfig {
     /// The inline pipeline spec (typed object or string-DSL array) run for
     /// every verb and sub-path. A step forwards the exact remaining path with
-    /// `${url.rest}` (e.g. `/wrapped${url.rest}`).
+    /// `${url.rest}` (e.g. `/wrapped${url.rest}`). Advertised as a JSON editor.
+    #[schemars(schema_with = "json_object_schema")]
     pub pipeline: Option<Value>,
     /// Discovery pattern this mount advertises — it fronts a mount of that
     /// shape (e.g. `"store"`). One of store / store-transform / store-view /
@@ -314,7 +315,7 @@ mod tests {
     fn wrapper_schema_fields_carry_json_editor_hint() {
         let schema = schema_of::<WrapperConfig>();
         let props = &schema["properties"];
-        for field in ["inputSchema", "outputSchema"] {
+        for field in ["pipeline", "inputSchema", "outputSchema"] {
             assert_eq!(props[field]["type"], "object", "{field} type: {}", props[field]);
             assert_eq!(props[field]["editor"], "json", "{field} editor: {}", props[field]);
         }
