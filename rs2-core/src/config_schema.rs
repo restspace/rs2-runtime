@@ -44,6 +44,20 @@ pub fn secret_string_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemar
     schemars::schema::Schema::Object(obj)
 }
 
+/// Schema for a field that holds a free-form JSON Schema value (e.g. a
+/// wrapper's `inputSchema`/`outputSchema`). A bare `serde_json::Value` derives
+/// an untyped schema; this emits `{ "type": "object", "editor": "json" }` so a
+/// config UI knows to render a JSON editor. Referenced via `#[schemars(
+/// schema_with = "json_object_schema")]`.
+pub fn json_object_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    let mut obj = schemars::schema::SchemaObject {
+        instance_type: Some(schemars::schema::InstanceType::Object.into()),
+        ..Default::default()
+    };
+    obj.extensions.insert("editor".to_string(), serde_json::json!("json"));
+    schemars::schema::Schema::Object(obj)
+}
+
 /// Per-mount access control (the `access` field). Either a string shorthand
 /// (`"open"` / `"authenticated"`) or an object of space-separated role specs.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -215,11 +229,13 @@ pub struct WrapperConfig {
     /// body that fails it is rejected with 422 before the pipeline runs (only
     /// on verbs that carry a body — PUT/POST/PATCH). Surfaced in discovery,
     /// OpenAPI (`requestBody`), and the agent surface.
+    #[schemars(schema_with = "json_object_schema")]
     pub input_schema: Option<Value>,
     /// JSON Schema describing the wrapper's success response. **Advisory** —
     /// surfaced in discovery, OpenAPI (`200`), and the agent surface, but not
     /// enforced at runtime (a facade's responses vary: a keyed record vs a
     /// store listing, and field-authz may redact fields).
+    #[schemars(schema_with = "json_object_schema")]
     pub output_schema: Option<Value>,
     /// Role an `elevate` step adds to sub-calls (operator-controlled).
     pub elevate: Option<String>,
@@ -289,6 +305,18 @@ mod tests {
             let name = svc["name"].as_str().unwrap();
             jsonschema::validator_for(&svc["configSchema"])
                 .unwrap_or_else(|e| panic!("{name} configSchema compiles: {e}"));
+        }
+    }
+
+    /// The wrapper's free-form schema fields advertise `{type:object,
+    /// editor:json}` (a JSON-editor hint) rather than an untyped schema.
+    #[test]
+    fn wrapper_schema_fields_carry_json_editor_hint() {
+        let schema = schema_of::<WrapperConfig>();
+        let props = &schema["properties"];
+        for field in ["inputSchema", "outputSchema"] {
+            assert_eq!(props[field]["type"], "object", "{field} type: {}", props[field]);
+            assert_eq!(props[field]["editor"], "json", "{field} editor: {}", props[field]);
         }
     }
 
