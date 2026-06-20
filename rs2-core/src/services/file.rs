@@ -272,30 +272,40 @@ impl Service for FileService {
                 );
                 let child_path = format!("{path}{name}");
                 files.write(&child_path, body).await?;
+                let etag = files.current_etag(&child_path).await?;
                 let location = format!("{}{}", msg.url.base_path, child_path);
                 let template = Message::request(msg.method.clone(), &msg.url.path, &msg.tenant);
                 let mut resp = template.response(StatusCode::CREATED, None);
                 resp.trace = msg.trace.clone();
                 resp.set_header("location", &location);
+                if let Some(etag) = &etag {
+                    resp.set_header("etag", etag);
+                }
                 Ok(resp)
             }
             Method::PUT | Method::POST => {
                 if msg.url.is_directory() {
                     return Err(RsError::bad_request("cannot PUT to a directory path"));
                 }
+                let precondition = super::write_precondition(&msg);
                 let body = match msg.body {
                     Some(b) => b,
                     None => return Err(RsError::bad_request("write requires a body")),
                 };
                 // Fully streamed: the body flows to the store without
-                // materializing (G7 holds for the single-step case).
-                let created = files.write(&path, body).await?;
+                // materializing (G7 holds for the single-step case). With a
+                // conditional header the store does a best-effort (or atomic)
+                // check-then-write; an empty precondition is a plain upsert.
+                let outcome = files.write_cond(&path, body, precondition).await?;
                 let template = Message::request(msg.method.clone(), &msg.url.path, &msg.tenant);
                 let mut resp = template.response(
-                    if created { StatusCode::CREATED } else { StatusCode::OK },
+                    if outcome.created { StatusCode::CREATED } else { StatusCode::OK },
                     None,
                 );
                 resp.trace = msg.trace.clone();
+                if let Some(etag) = &outcome.etag {
+                    resp.set_header("etag", etag);
+                }
                 Ok(resp)
             }
             Method::DELETE => {

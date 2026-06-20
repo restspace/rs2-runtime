@@ -95,17 +95,52 @@ async fn assert_store_contract(
         "[{mount}] PUT create"
     );
     assert!(resp.body.is_none(), "[{mount}] PUT returns no body");
+    assert!(
+        resp.header("etag").is_some(),
+        "[{mount}] PUT create carries ETag"
+    );
     let resp = rt
         .handle(req(Method::PUT, &child("alpha")).with_body(make_body(2)))
         .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] PUT overwrite");
+    assert!(
+        resp.header("etag").is_some(),
+        "[{mount}] PUT overwrite carries ETag"
+    );
 
     // GET child: the resource, with a version ETag.
     let resp = rt.handle(req(Method::GET, &child("alpha"))).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] GET child");
-    assert!(
-        resp.header("etag").is_some(),
-        "[{mount}] child GET carries ETag"
+    let etag = resp
+        .header("etag")
+        .unwrap_or_else(|| panic!("[{mount}] child GET carries ETag"))
+        .to_string();
+
+    // Conditional write (the `conditional-write` facet): a matching If-Match
+    // succeeds; a stale one is 412; If-None-Match: * refuses to clobber.
+    let mut stale = req(Method::PUT, &child("alpha")).with_body(make_body(4));
+    stale.set_header("if-match", "\"definitely-not-the-current-etag\"");
+    let resp = rt.handle(stale).await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::PRECONDITION_FAILED),
+        "[{mount}] stale If-Match is 412"
+    );
+    let mut matched = req(Method::PUT, &child("alpha")).with_body(make_body(5));
+    matched.set_header("if-match", &etag);
+    let resp = rt.handle(matched).await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "[{mount}] matching If-Match writes"
+    );
+    let mut create_only = req(Method::PUT, &child("alpha")).with_body(make_body(6));
+    create_only.set_header("if-none-match", "*");
+    let resp = rt.handle(create_only).await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::PRECONDITION_FAILED),
+        "[{mount}] If-None-Match: * refuses an existing child"
     );
 
     // POST container: keyless create with Location; the child is fetchable.

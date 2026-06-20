@@ -12,6 +12,7 @@ pub mod codes {
     pub const FORBIDDEN: &str = "forbidden";
     pub const NOT_FOUND: &str = "not_found";
     pub const CONFLICT: &str = "conflict";
+    pub const PRECONDITION_FAILED: &str = "precondition_failed";
     pub const PAYLOAD_TOO_LARGE: &str = "payload_too_large";
     pub const VALIDATION_FAILED: &str = "validation_failed";
     pub const IDEMPOTENCY_KEY_REUSE: &str = "idempotency_key_reuse";
@@ -71,6 +72,13 @@ impl RsError {
 
     pub fn conflict(detail: impl Into<String>) -> Self {
         Self::new(409, codes::CONFLICT, "Conflict", detail)
+    }
+
+    /// An `If-Match`/`If-None-Match` precondition on a store write was not met
+    /// (the resource changed, is missing, or already exists). The standard
+    /// optimistic-concurrency signal: re-read and reapply.
+    pub fn precondition_failed(detail: impl Into<String>) -> Self {
+        Self::new(412, codes::PRECONDITION_FAILED, "Precondition Failed", detail)
     }
 
     pub fn payload_too_large(detail: impl Into<String>) -> Self {

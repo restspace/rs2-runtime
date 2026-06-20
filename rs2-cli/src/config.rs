@@ -51,24 +51,40 @@ pub struct Loaded {
 
 const FILE_NAME: &str = "rsconfig.json";
 
+/// Walk up from the current directory looking for a file named `file_name`,
+/// returning the first match. The shared discovery rule for repo/project-scoped
+/// state (`rsconfig.json`, the mirror marker), so a nested working directory
+/// inherits its enclosing repo's identity.
+pub fn find_up(file_name: &str) -> Result<Option<PathBuf>, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read current dir: {e}"))?;
+    let mut dir: Option<&Path> = Some(cwd.as_path());
+    while let Some(d) = dir {
+        let candidate = d.join(file_name);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+        dir = d.parent();
+    }
+    Ok(None)
+}
+
 /// Walk up from the current directory looking for `rsconfig.json`. Returns the
 /// parsed config and where to save it; if none is found, an empty config whose
 /// save target is `./rsconfig.json`.
 pub fn load() -> Result<Loaded, String> {
-    let cwd = std::env::current_dir().map_err(|e| format!("cannot read current dir: {e}"))?;
-    let mut dir: Option<&Path> = Some(cwd.as_path());
-    while let Some(d) = dir {
-        let candidate = d.join(FILE_NAME);
-        if candidate.is_file() {
+    match find_up(FILE_NAME)? {
+        Some(candidate) => {
             let text = std::fs::read_to_string(&candidate)
                 .map_err(|e| format!("cannot read {}: {e}", candidate.display()))?;
             let config: RsConfig = serde_json::from_str(text.trim_start_matches('\u{feff}'))
                 .map_err(|e| format!("{} is not valid JSON: {e}", candidate.display()))?;
-            return Ok(Loaded { config, path: candidate });
+            Ok(Loaded { config, path: candidate })
         }
-        dir = d.parent();
+        None => {
+            let cwd = std::env::current_dir().map_err(|e| format!("cannot read current dir: {e}"))?;
+            Ok(Loaded { config: RsConfig::default(), path: cwd.join(FILE_NAME) })
+        }
     }
-    Ok(Loaded { config: RsConfig::default(), path: cwd.join(FILE_NAME) })
 }
 
 /// Persist a config as pretty JSON to the given path.

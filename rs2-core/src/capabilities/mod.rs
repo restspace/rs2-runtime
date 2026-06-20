@@ -9,7 +9,39 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 
 use crate::error::RsError;
-use crate::message::{Body, Message};
+use crate::message::{Body, Message, Provenance};
+
+/// A parsed write precondition (the store equivalent of HTTP conditional
+/// headers), supplied by a service after parsing `If-Match`/`If-None-Match`.
+#[derive(Debug, Clone)]
+pub enum WritePrecondition {
+    /// No precondition — an unconditional upsert.
+    None,
+    /// `If-Match`: write only if the current ETag matches (comma list; `*`
+    /// requires the resource to exist). Mismatch ⇒ `412`.
+    IfMatch(String),
+    /// `If-None-Match: *`: write only if the resource does **not** exist
+    /// (atomic create-only where the adapter supports it). Exists ⇒ `412`.
+    IfNoneMatchStar,
+}
+
+/// The result of a (conditional) write: whether it created the resource, and
+/// the new content-version ETag (quoted) so the caller can return it without a
+/// follow-up read.
+#[derive(Debug, Clone)]
+pub struct WriteOutcome {
+    pub created: bool,
+    pub etag: Option<String>,
+}
+
+/// Whether an `If-Match` header value (comma list, weak-aware; `*` matches any
+/// existing resource) matches the resource's current quoted ETag.
+pub(crate) fn if_match_hits(if_match: &str, etag: &str) -> bool {
+    if_match
+        .split(',')
+        .map(str::trim)
+        .any(|c| c == "*" || c.trim_start_matches("W/") == etag)
+}
 
 /// Inclusive byte range for partial reads (`Range: bytes=start-end`).
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +81,69 @@ pub trait FileStore: Send + Sync {
     async fn read(&self, tenant: &str, path: &str, range: Option<ByteRange>) -> Result<Body, RsError>;
     /// Returns `true` if the resource was created (vs. overwritten).
     async fn write(&self, tenant: &str, path: &str, body: Body) -> Result<bool, RsError>;
+
+    /// The current content-version ETag (quoted) of a stored file, or `None`
+    /// if it does not exist / the adapter has no validator. The default reads
+    /// the resource's `Replayable` provenance — cheap, since `read` exposes
+    /// provenance without consuming the body stream.
+    async fn current_etag(&self, tenant: &str, path: &str) -> Result<Option<String>, RsError> {
+        match self.read(tenant, path, None).await {
+            Ok(body) => Ok(match body.provenance {
+                Provenance::Replayable { version, .. } => Some(format!("\"{version}\"")),
+                _ => None,
+            }),
+            Err(e) if e.status == 404 => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Conditional upsert honouring a [`WritePrecondition`]. The default is a
+    /// **best-effort** check-then-write (`current_etag` → compare → `write`):
+    /// a narrower race window than any client GET-then-PUT, but not atomic.
+    /// Adapters whose backing store has compare-and-swap should override this
+    /// and report [`FileStore::conditional_write_atomic`] `== true`.
+    async fn write_cond(
+        &self,
+        tenant: &str,
+        path: &str,
+        body: Body,
+        precondition: WritePrecondition,
+    ) -> Result<WriteOutcome, RsError> {
+        match &precondition {
+            WritePrecondition::None => {}
+            WritePrecondition::IfMatch(want) => match self.current_etag(tenant, path).await? {
+                Some(cur) if if_match_hits(want, &cur) => {}
+                Some(_) => {
+                    return Err(RsError::precondition_failed(
+                        "If-Match does not match the current ETag — re-read and retry",
+                    ))
+                }
+                None => {
+                    return Err(RsError::precondition_failed(
+                        "If-Match given but the resource does not exist",
+                    ))
+                }
+            },
+            WritePrecondition::IfNoneMatchStar => {
+                if self.current_etag(tenant, path).await?.is_some() {
+                    return Err(RsError::precondition_failed(
+                        "If-None-Match: * given but the resource already exists",
+                    ));
+                }
+            }
+        }
+        let created = self.write(tenant, path, body).await?;
+        let etag = self.current_etag(tenant, path).await?;
+        Ok(WriteOutcome { created, etag })
+    }
+
+    /// Whether [`FileStore::write_cond`] is atomic (backed by a real
+    /// compare-and-swap) rather than the best-effort default. Drives the
+    /// `conditional-write` discovery facet's strength.
+    fn conditional_write_atomic(&self) -> bool {
+        false
+    }
+
     async fn delete(&self, tenant: &str, path: &str) -> Result<(), RsError>;
     /// Move/rename a file. Returns `true` if the destination was created
     /// (vs. overwritten). Fails if the source is missing or a directory.
@@ -175,6 +270,24 @@ impl FileStore for PrefixedFileStore {
         self.inner.write(tenant, &self.join(path), body).await
     }
 
+    async fn current_etag(&self, tenant: &str, path: &str) -> Result<Option<String>, RsError> {
+        self.inner.current_etag(tenant, &self.join(path)).await
+    }
+
+    async fn write_cond(
+        &self,
+        tenant: &str,
+        path: &str,
+        body: Body,
+        precondition: WritePrecondition,
+    ) -> Result<WriteOutcome, RsError> {
+        self.inner.write_cond(tenant, &self.join(path), body, precondition).await
+    }
+
+    fn conditional_write_atomic(&self) -> bool {
+        self.inner.conditional_write_atomic()
+    }
+
     async fn delete(&self, tenant: &str, path: &str) -> Result<(), RsError> {
         self.inner.delete(tenant, &self.join(path)).await
     }
@@ -227,6 +340,23 @@ impl ScopedFileStore {
 
     pub async fn write(&self, path: &str, body: Body) -> Result<bool, RsError> {
         self.inner.write(&self.tenant, path, body).await
+    }
+
+    pub async fn current_etag(&self, path: &str) -> Result<Option<String>, RsError> {
+        self.inner.current_etag(&self.tenant, path).await
+    }
+
+    pub async fn write_cond(
+        &self,
+        path: &str,
+        body: Body,
+        precondition: WritePrecondition,
+    ) -> Result<WriteOutcome, RsError> {
+        self.inner.write_cond(&self.tenant, path, body, precondition).await
+    }
+
+    pub fn conditional_write_atomic(&self) -> bool {
+        self.inner.conditional_write_atomic()
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), RsError> {

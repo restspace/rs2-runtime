@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use super::{pagination, Service, ServiceContext};
+use crate::capabilities::WritePrecondition;
 use crate::error::RsError;
 use crate::message::{Body, MediaType, Message};
 
@@ -410,6 +411,34 @@ impl Service for DataService {
                     // Store contract: PUT upserts (empty body); POST upserts
                     // and returns the stored representation.
                     Method::PUT | Method::POST => {
+                        // Optimistic concurrency: honour a conditional header
+                        // against the stored record's ETag. Best-effort — the
+                        // data ETag is a content hash computed here, not an
+                        // adapter compare-and-swap (the `conditional-write`
+                        // facet reflects that).
+                        match super::write_precondition(&msg) {
+                            WritePrecondition::None => {}
+                            WritePrecondition::IfMatch(want) => {
+                                let cur = get_or_null(data, &dataset, &key).await?;
+                                if cur.is_null() {
+                                    return Err(RsError::precondition_failed(
+                                        "If-Match given but the record does not exist",
+                                    ));
+                                }
+                                if !crate::capabilities::if_match_hits(&want, &record_etag(&cur)) {
+                                    return Err(RsError::precondition_failed(
+                                        "If-Match does not match the current ETag — re-read and retry",
+                                    ));
+                                }
+                            }
+                            WritePrecondition::IfNoneMatchStar => {
+                                if !get_or_null(data, &dataset, &key).await?.is_null() {
+                                    return Err(RsError::precondition_failed(
+                                        "If-None-Match: * given but the record already exists",
+                                    ));
+                                }
+                            }
+                        }
                         let echo = msg.method == Method::POST;
                         let body = msg
                             .body

@@ -244,7 +244,17 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),
     };
-    (pattern.to_string(), facets.into_iter().map(str::to_string).collect())
+    let mut facets: Vec<String> = facets.into_iter().map(str::to_string).collect();
+    // Every store-shaped mount honours `If-Match`/`If-None-Match` on writes
+    // (412 on mismatch) and returns an `ETag` on PUT — the host does an atomic
+    // or best-effort check depending on the adapter. A future atomic adapter
+    // can add a `conditional-write-atomic` marker; today the guarantee is
+    // best-effort and the client behaviour (send If-Match, handle 412) is the
+    // same either way.
+    if pattern.starts_with("store") {
+        facets.push("conditional-write".to_string());
+    }
+    (pattern.to_string(), facets)
 }
 
 fn with_pattern(mut entry: Value, mount: &Mount) -> Value {

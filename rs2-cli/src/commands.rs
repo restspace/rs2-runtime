@@ -499,7 +499,7 @@ fn resolve_admin_password(flag: Option<&str>, stored: Option<&str>) -> Result<St
 
 /// Appended to an auth-ish failure when no token was sent, nudging the user to
 /// authenticate (the server enforces access; the CLI just hints).
-fn login_hint(status: u16, had_token: bool) -> String {
+pub(crate) fn login_hint(status: u16, had_token: bool) -> String {
     if !had_token && (status == 401 || status == 403) {
         " — you may need to `rs2 login` first".to_string()
     } else {

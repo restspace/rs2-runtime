@@ -6,8 +6,10 @@
 
 mod client;
 mod commands;
+mod commands_mirror;
 mod config;
 mod migrate;
+mod mirror;
 mod scaffold;
 
 use clap::{Parser, Subcommand};
@@ -108,6 +110,29 @@ enum Command {
     Auth {
         #[command(subcommand)]
         action: AuthCommand,
+    },
+    /// Mirror a tenant's instruction plane (config + spec stores) into a local
+    /// `rs2/` directory for git-based editing.
+    Pull {
+        /// Server base URL (else `host` from rsconfig.json).
+        #[arg(long)]
+        host: Option<String>,
+        /// Mirror directory (default: the nearest `rs2/`, else `./rs2`).
+        #[arg(long)]
+        dir: Option<String>,
+    },
+    /// Push local instruction-plane edits back to the tenant.
+    Push {
+        /// Mirror directory (else the nearest `rs2/mirror.json` walking up).
+        #[arg(long)]
+        dir: Option<String>,
+        /// Show the diff and planned requests without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Permit pushing a real secret value where the `<secret>` marker is
+        /// expected (an intentional rotation).
+        #[arg(long)]
+        allow_secret_rotation: bool,
     },
     /// Run a script of `rs2` commands (one per line; aborts on first failure).
     Run {
@@ -313,6 +338,10 @@ fn dispatch(command: Command) -> Result<(), String> {
                 user_dataset.as_deref(),
             ),
         },
+        Command::Pull { host, dir } => commands_mirror::pull(host.as_deref(), dir.as_deref()),
+        Command::Push { dir, dry_run, allow_secret_rotation } => {
+            commands_mirror::push(dir.as_deref(), dry_run, allow_secret_rotation)
+        }
         Command::Run { script } => run_script(&script),
     }
 }

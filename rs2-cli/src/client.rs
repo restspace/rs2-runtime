@@ -59,10 +59,31 @@ impl Client {
         finish(req.send_bytes(bytes))
     }
 
+    /// PUT raw bytes with `If-None-Match: *` — atomic create-only where the
+    /// store supports it (the `conditional-write` facet); an existing resource
+    /// is rejected with `412`.
+    pub fn put_create(
+        &self,
+        path: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<Response, String> {
+        let req = self
+            .auth(ureq::put(&self.url(path)))
+            .set("content-type", content_type)
+            .set("if-none-match", "*");
+        finish(req.send_bytes(bytes))
+    }
+
     pub fn post_json(&self, path: &str, value: &serde_json::Value) -> Result<Response, String> {
         let body = serde_json::to_vec(value).map_err(|e| format!("cannot serialize body: {e}"))?;
         let req = self.auth(ureq::post(&self.url(path))).set("content-type", "application/json");
         finish(req.send_bytes(&body))
+    }
+
+    pub fn delete(&self, path: &str) -> Result<Response, String> {
+        let req = self.auth(ureq::delete(&self.url(path)));
+        finish(req.call())
     }
 }
 

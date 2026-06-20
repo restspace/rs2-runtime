@@ -13,6 +13,8 @@ It is **not** an API client; you call tenants over plain HTTP (Appendix C / Part
 | `rs2 test [projectDir] [--component <path>]` | Validate `manifest.json` and the built component (wasm header; engine compile-check when built `--features wasm`) |
 | `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Upload to `PUT <server>/code/<n>`. `.js`/`.mjs` → JS bundle; `\0asm` → component. `--bundle` runs `npx esbuild … --bundle --format=esm --platform=browser` first |
 | `rs2 migrate <services.json> [-o tenant.json]` | Convert a v1 Restspace config to an RS2 tenant config (Part 11) |
+| `rs2 pull [--host <url>] [--dir <d>]` | Mirror the tenant's instruction plane (config + every `specSubtree` store + code pins) into a local `rs2/` directory for git-based editing; records baseline ETags in `rs2/mirror.json` (§3.6) |
+| `rs2 push [--dir <d>] [--dry-run] [--allow-secret-rotation]` | Push local instruction-plane edits back through the validated APIs (config `If-Match`, spec `If-Match`/412); aborts on a remote change rather than clobbering. `--dry-run` shows the diff; refuses a real secret value in a `"<secret>"` slot without `--allow-secret-rotation` |
 
 ## `rs2 deploy` flags
 

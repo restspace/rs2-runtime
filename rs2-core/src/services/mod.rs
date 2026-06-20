@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::capabilities::{ScopedDataStore, ScopedFileStore, ScopedQueryStore};
+use crate::capabilities::{ScopedDataStore, ScopedFileStore, ScopedQueryStore, WritePrecondition};
 use crate::contract::InvocationLimits;
 use crate::error::RsError;
 use crate::message::Message;
@@ -104,6 +104,20 @@ pub(crate) fn if_none_match_hits(if_none_match: Option<&str>, etag: &str) -> boo
     inm.split(',').map(str::trim).any(|candidate| {
         candidate == "*" || candidate.trim_start_matches("W/") == etag
     })
+}
+
+/// Parse a store write's conditional headers into a [`WritePrecondition`].
+/// `If-None-Match: *` (create-only) takes precedence over `If-Match`.
+pub(crate) fn write_precondition(msg: &Message) -> WritePrecondition {
+    if let Some(inm) = msg.header("if-none-match") {
+        if inm.split(',').map(str::trim).any(|c| c == "*") {
+            return WritePrecondition::IfNoneMatchStar;
+        }
+    }
+    match msg.header("if-match") {
+        Some(im) => WritePrecondition::IfMatch(im.to_string()),
+        None => WritePrecondition::None,
+    }
 }
 
 /// Parse `$take`/`$skip` pagination query params with bounded defaults.
