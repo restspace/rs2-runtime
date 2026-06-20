@@ -47,6 +47,17 @@ telemetry that may be discarded.
 - Sandbox `console.*` and the WIT `log()` both route to `HostApi::log`; the JS
   prelude (`engines/js_prelude.js`) maps `console.log/info→info`, `warn→warn`,
   `error→error`, `debug→debug`.
+- **Editing the bootstrap or `js_prelude.js` means regenerating the prelude
+  snapshot.** `build_runtime` boots each per-request isolate from a committed V8
+  startup snapshot (`engines/js_prelude.snapshot.bin`) so it skips recompiling
+  ~500 lines of prelude (~4× faster per invocation). The blob is a pure
+  optimization — an empty blob falls back to running the prelude from source —
+  but a stale blob bakes the *old* prelude and silently ignores your edit.
+  `tests/prelude_snapshot.rs` fails on drift; fix with
+  `cargo run -p rs2-core --example gen-js-snapshot --features js`, then commit
+  the regenerated `.bin` + `.hash`. The snapshot can't be built in the serving
+  process (V8 inits in snapshot *or* normal mode per process, not both), which is
+  why generation is a separate example, not automatic.
 
 ## Smaller traps
 

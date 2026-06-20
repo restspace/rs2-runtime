@@ -140,6 +140,46 @@ const BOOTSTRAP: &str = r#"
 /// timers/etc. Proven against `tests/npm_compat.rs`.
 const COMPAT_PRELUDE: &str = include_str!("js_prelude.js");
 
+/// A V8 startup snapshot with [`BOOTSTRAP`] + [`COMPAT_PRELUDE`] already
+/// evaluated, so a per-request isolate skips parsing/compiling ~500 lines of
+/// prelude on every invocation. Generated out of band by the `gen-js-snapshot`
+/// example (V8 can only init in snapshot *or* normal mode per process, so it
+/// can't be built in the serving process) and committed alongside the source.
+///
+/// **Pure optimization with a fallback:** when the blob is empty (not yet
+/// generated, or intentionally cleared), [`build_runtime`] runs the scripts the
+/// old way, so behaviour is identical either way. `tests/prelude_snapshot.rs`
+/// fails if the committed blob is stale relative to the prelude source.
+static PRELUDE_SNAPSHOT: &[u8] = include_bytes!("js_prelude.snapshot.bin");
+
+/// Build the prelude startup snapshot. Called only by the `gen-js-snapshot`
+/// example — **never** from the serving process, which inits V8 in normal mode
+/// (deno_core asserts a single V8 init mode per process). Returns the raw blob
+/// to commit as `js_prelude.snapshot.bin`.
+pub fn generate_prelude_snapshot() -> Vec<u8> {
+    let mut runtime = deno_core::JsRuntimeForSnapshot::new(RuntimeOptions {
+        extensions: vec![rs2_host::init()],
+        module_loader: Some(Rc::new(deno_core::NoopModuleLoader)),
+        ..Default::default()
+    });
+    runtime.execute_script("rs2:bootstrap", BOOTSTRAP).expect("bootstrap snapshot");
+    runtime.execute_script("rs2:prelude", COMPAT_PRELUDE).expect("prelude snapshot");
+    runtime.snapshot().to_vec()
+}
+
+/// Stable FNV-1a hash of the bootstrap + prelude source. The generator commits
+/// this next to the blob; `tests/prelude_snapshot.rs` recomputes it and fails if
+/// the source drifted without regenerating the snapshot.
+#[doc(hidden)]
+pub fn prelude_snapshot_source_hash() -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in BOOTSTRAP.bytes().chain(COMPAT_PRELUDE.bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// Per-invocation state, stored in the runtime's `OpState` and read by the
 /// host-bridge ops. `host_error` preserves a structured host error's identity
 /// across the JS boundary (an op records it before throwing).
@@ -1171,11 +1211,16 @@ pub(crate) async fn build_runtime(
     limits: &InvocationLimits,
     oom: Arc<AtomicBool>,
 ) -> Result<(JsRuntime, v8::Global<v8::Value>), RsError> {
+    // When the committed snapshot is present, the bootstrap + prelude globals
+    // are already baked into the isolate's heap; otherwise fall back to running
+    // them from source (identical result, just slower per request).
+    let snapshot = (!PRELUDE_SNAPSHOT.is_empty()).then_some(PRELUDE_SNAPSHOT);
     let create = v8::CreateParams::default().heap_limits(0, limits.memory_bytes as usize);
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![rs2_host::init()],
         module_loader: Some(Rc::new(deno_core::NoopModuleLoader)),
         create_params: Some(create),
+        startup_snapshot: snapshot,
         ..Default::default()
     });
 
@@ -1192,13 +1237,16 @@ pub(crate) async fn build_runtime(
     }
     runtime.op_state().borrow_mut().put(inv.clone());
 
-    // The bootstrap + compat prelude install the guest contract globals.
-    runtime
-        .execute_script("rs2:bootstrap", BOOTSTRAP)
-        .map_err(|e| RsError::contract_violation(format!("bootstrap: {e}")))?;
-    runtime
-        .execute_script("rs2:prelude", COMPAT_PRELUDE)
-        .map_err(|e| RsError::contract_violation(format!("prelude: {e}")))?;
+    // The bootstrap + compat prelude install the guest contract globals — only
+    // needed when they aren't already resident from the snapshot.
+    if snapshot.is_none() {
+        runtime
+            .execute_script("rs2:bootstrap", BOOTSTRAP)
+            .map_err(|e| RsError::contract_violation(format!("bootstrap: {e}")))?;
+        runtime
+            .execute_script("rs2:prelude", COMPAT_PRELUDE)
+            .map_err(|e| RsError::contract_violation(format!("prelude: {e}")))?;
+    }
 
     // Load + evaluate the module under the wall clock (a bundle that loops at
     // top level can't hang the build), then map a kill to the right limit.

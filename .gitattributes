@@ -1,0 +1,3 @@
+# The V8 prelude startup snapshot is a binary blob — never apply text/EOL
+# normalization (autocrlf would corrupt it).
+rs2-core/src/engines/js_prelude.snapshot.bin binary
