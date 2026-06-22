@@ -214,6 +214,10 @@ pub struct StoreConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct PipelineConfig {
     pub store: Option<StoreConfig>,
+    /// Where the authoring specs themselves are physically stored
+    /// (`specStore.adapter` selects an `infra:`/`builtin:`/`code:` file
+    /// backend, `specStore.root` the root). Absent ⇒ the node file store.
+    pub spec_store: Option<StoreConfig>,
     pub retry: Option<RetryPolicy>,
 }
 
@@ -221,7 +225,12 @@ pub struct PipelineConfig {
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct QueryConfig {
+    /// Query *execution* backend (`store.adapter`); `store.root` relocates the
+    /// authoring subtree. See [`StoreConfig`].
     pub store: Option<StoreConfig>,
+    /// Where the authoring specs are physically stored — independent of the
+    /// execution backend in `store`. See [`PipelineConfig::spec_store`].
+    pub spec_store: Option<StoreConfig>,
 }
 
 /// `wrapper` service config: one inline pipeline fronting another mount.
@@ -262,6 +271,9 @@ pub struct WrapperConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct TemplateConfig {
     pub store: Option<StoreConfig>,
+    /// Where the authoring specs are physically stored. See
+    /// [`PipelineConfig::spec_store`].
+    pub spec_store: Option<StoreConfig>,
 }
 
 /// `services` self-config API: no fields beyond the base envelope.

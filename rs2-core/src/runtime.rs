@@ -188,6 +188,29 @@ impl Runtime {
         self.tenants.write().await.remove(name);
     }
 
+    /// Drop every built tenant, so each rebuilds on its next request. Used by
+    /// [`Self::reload_infras`]: infras are node-global, so a change can affect
+    /// any tenant.
+    pub async fn purge_all(&self) {
+        self.tenants.write().await.clear();
+    }
+
+    /// Reload the node's infras from the configured source (PRD §9.1) without
+    /// restarting: re-read `infras.json`, swap the live set, and purge all
+    /// built tenants so the next request per tenant rebuilds against it. A
+    /// malformed source is surfaced as an error and the running set is left
+    /// untouched. Returns the names now in effect.
+    pub async fn reload_infras(&self) -> Result<Vec<String>, RsError> {
+        let loader = self.adapters.infra_loader.as_ref().ok_or_else(|| {
+            RsError::engine_unavailable("this node has no infra source configured")
+        })?;
+        let set = loader.load()?;
+        let names = set.names();
+        self.adapters.swap_infras(Arc::new(set));
+        self.purge_all().await;
+        Ok(names)
+    }
+
     /// Spawn the host scheduler (G1): a detached task that periodically fires a
     /// synthetic internal request at every mount carrying a `config.schedule`.
     /// No-op when nothing is scheduled; the task holds a `Weak` and exits when

@@ -476,6 +476,178 @@ async fn discovery_surface_filters_and_advertises() {
 }
 
 // ---------------------------------------------------------------------------
+// schema + media-type self-containment (discovery == enforcement)
+// ---------------------------------------------------------------------------
+
+/// A data mount inlines each installed dataset schema into OpenAPI: the live
+/// `.schema.json` is registered under components/schemas and a concrete
+/// `{dataset}/{key}` path binds it — self-contained, and the same schema the
+/// data service enforces on write (no drift). Schema-less datasets keep the
+/// generic templated StoreChild shape.
+#[tokio::test]
+async fn data_dataset_schema_inlines_into_openapi() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), surface_config());
+
+    let schema = json!({
+        "type": "object",
+        "required": ["status"],
+        "properties": { "status": { "type": "string" }, "total": { "type": "number" } }
+    });
+    let put = req(Method::PUT, "/data/orders/.schema.json").with_json(&schema);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::OK));
+
+    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let doc = body_json(&mut openapi).await;
+
+    // The generic templated child remains (schema-less datasets).
+    assert_eq!(
+        doc["paths"]["/data/{dataset}/{key}"]["$ref"],
+        "#/components/pathItems/StoreChild"
+    );
+    // The orders dataset gets a concrete, schema-bound child path.
+    let put_op = &doc["paths"]["/data/orders/{key}"]["put"];
+    assert!(put_op.is_object(), "{doc}");
+    let schema_ref = put_op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+        .as_str()
+        .unwrap_or_else(|| panic!("schema-bound request body: {put_op}"));
+    assert!(schema_ref.starts_with("#/components/schemas/"), "{schema_ref}");
+    let key = schema_ref.rsplit('/').next().unwrap();
+    // The inlined schema is the live one — resolvable in-document, no drift.
+    assert_eq!(doc["components"]["schemas"][key]["required"][0], "status");
+}
+
+/// A pipeline spec's optional `input`/`output` schemas surface on both the
+/// agent surface (the action's uniform `inputSchema`/`outputSchema`) and
+/// OpenAPI (the execute path item's request/response), advisory by nature.
+#[tokio::test]
+async fn pipeline_io_schema_surfaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), surface_config());
+
+    let envelope = json!({
+        "pipeline": [ "GET /data/orders/${id}", { "status": "$.status" } ],
+        "input": { "type": "object", "properties": { "id": { "type": "string" } } },
+        "output": { "type": "object", "properties": { "status": { "type": "string" } } }
+    });
+    let put = req(Method::PUT, "/summary/.pipelines/.root").with_json(&envelope);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
+
+    let mut surface = rt
+        .handle(req(Method::GET, "/.well-known/rs2/agent-surface"))
+        .await;
+    let doc = body_json(&mut surface).await;
+    let action = doc["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["path"] == "/summary")
+        .unwrap_or_else(|| panic!("pipeline action missing: {doc}"));
+    assert_eq!(action["inputSchema"]["properties"]["id"]["type"], "string");
+    assert_eq!(action["outputSchema"]["properties"]["status"]["type"], "string");
+
+    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let doc = body_json(&mut openapi).await;
+    let post = &doc["paths"]["/summary/{path}"]["post"];
+    assert_eq!(
+        post["requestBody"]["content"]["application/json"]["schema"]["properties"]["id"]["type"],
+        "string",
+        "{post}"
+    );
+    assert_eq!(
+        post["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["status"]
+            ["type"],
+        "string"
+    );
+}
+
+/// Operations advertise their media types: the log view declares both its
+/// JSON and NDJSON (text/plain) representations on the `200`, rather than a
+/// bare description.
+#[tokio::test]
+async fn operations_advertise_media_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(
+        dir.path(),
+        json!({ "mounts": [
+            { "path": "/logs", "service": "log", "config": { "access": "open" } },
+        ] }),
+    );
+
+    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let doc = body_json(&mut openapi).await;
+    let content = &doc["paths"]["/logs"]["get"]["responses"]["200"]["content"];
+    assert!(content["application/json"].is_object(), "{doc}");
+    assert!(content["text/plain"].is_object(), "NDJSON via Accept: {content}");
+}
+
+/// A deployed `code:` mount with a declared manifest appears on both the agent
+/// surface (as an action carrying its I/O schemas) and OpenAPI (a path item
+/// with the manifest's schemas + media types). Needs the JS engine for the
+/// deploy compile-check and to build the code mount.
+#[cfg(feature = "js")]
+#[tokio::test]
+async fn code_manifest_surfaces_on_discovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), surface_config());
+
+    let bundle = r#"export default async (msg, ctx) => ({ status: 200, body: {} });"#;
+    let manifest = json!({
+        "inputSchema": { "type": "object", "properties": { "q": { "type": "string" } } },
+        "outputSchema": { "type": "object", "properties": { "n": { "type": "number" } } },
+        "effect": "idempotent",
+        "requestMediaType": "application/json",
+        "responseMediaType": "application/json"
+    });
+    let mut deploy = req(Method::POST, "/services/code/lookup/").with_body(Body::from_bytes(
+        bundle.as_bytes().to_vec(),
+        MediaType::new("application/javascript"),
+    ));
+    deploy.set_header("x-rs2-manifest", &manifest.to_string());
+    let mut resp = rt.handle(deploy).await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
+    let code_ref = body_json(&mut resp).await["ref"].as_str().unwrap().to_string();
+
+    let mut config = surface_config();
+    config["mounts"].as_array_mut().unwrap().push(json!({
+        "path": "/lookup", "service": code_ref, "config": { "access": "open", "grants": {} }
+    }));
+    let put = req(Method::PUT, "/services/raw").with_json(&config);
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::NO_CONTENT));
+
+    // Agent surface: the code mount lists as an action with its schemas.
+    let mut surface = rt
+        .handle(req(Method::GET, "/.well-known/rs2/agent-surface"))
+        .await;
+    let doc = body_json(&mut surface).await;
+    let action = doc["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["path"] == "/lookup")
+        .unwrap_or_else(|| panic!("code action missing: {doc}"));
+    assert_eq!(action["effect"], "idempotent");
+    assert_eq!(action["inputSchema"]["properties"]["q"]["type"], "string");
+    assert_eq!(action["outputSchema"]["properties"]["n"]["type"], "number");
+
+    // OpenAPI: a path item carrying the manifest's request/response schemas.
+    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let doc = body_json(&mut openapi).await;
+    let post = &doc["paths"]["/lookup/{path}"]["post"];
+    assert!(post.is_object(), "code path item missing: {doc}");
+    assert_eq!(
+        post["requestBody"]["content"]["application/json"]["schema"]["properties"]["q"]["type"],
+        "string",
+        "{post}"
+    );
+    let get = &doc["paths"]["/lookup/{path}"]["get"];
+    assert_eq!(
+        get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]["n"]["type"],
+        "number"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // structured pipeline failures (PRD §12)
 // ---------------------------------------------------------------------------
 

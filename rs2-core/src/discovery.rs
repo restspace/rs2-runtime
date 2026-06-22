@@ -44,7 +44,10 @@ pub async fn handle(tenant: &Tenant, msg: Message) -> Result<Message, RsError> {
             let surface = msg.url.query_param("surface");
             agent_surface_doc(tenant, mounts, surface, msg.tenant.clone()).await
         }
-        "openapi" => openapi_doc(tenant, &msg),
+        "openapi" => {
+            let mounts = readable_mounts(tenant, &msg);
+            openapi_doc(tenant, mounts, msg.tenant.clone()).await
+        }
         other => {
             return Err(RsError::not_found(format!(
                 "no discovery document '{other}' (have: services, agent-surface, openapi)"
@@ -78,6 +81,26 @@ async fn stored_specs(tenant: &Tenant, mount: &Mount, kind_prefix: &str) -> Vec<
         }
     }
     out
+}
+
+/// Parse a `code:<name>@<version>` service reference into its parts.
+fn code_ref_parts(service: &str) -> Option<(&str, &str)> {
+    service.strip_prefix("code:")?.split_once('@')
+}
+
+/// The optional deploy manifest for a `code:` mount (input/output schema,
+/// effect class, media types, store pattern), read from the sidecar stored
+/// alongside the content-addressed bundle (`.rs2-code/<name>/<version>.
+/// manifest.json`). `None` when the mount declares no manifest — discovery
+/// then surfaces the mount as a bare action with no schemas.
+async fn code_manifest(tenant: &Tenant, mount: &Mount) -> Option<Value> {
+    let (name, version) = code_ref_parts(&mount.service)?;
+    let (_, ctx) = tenant.instance(&mount.base_path)?;
+    let files = ctx.files.as_ref()?;
+    let path = format!("{}/{name}/{version}.manifest.json", crate::services::code::CODE_PREFIX);
+    let mut body = files.read(&path, None).await.ok()?;
+    let bytes = body.materialize(1024 * 1024).await.ok()?;
+    serde_json::from_slice(bytes).ok()
 }
 
 /// Mounts the caller may read, with their agent metadata.
@@ -398,6 +421,15 @@ async fn agent_surface_doc(
                             entry[key] = v.clone();
                         }
                     }
+                    // Optional I/O schemas from the envelope (advisory — the
+                    // pipeline doesn't validate its own body), surfaced as the
+                    // uniform `inputSchema`/`outputSchema` an action carries.
+                    if let Some(v) = doc.get("input") {
+                        entry["inputSchema"] = v.clone();
+                    }
+                    if let Some(v) = doc.get("output") {
+                        entry["outputSchema"] = v.clone();
+                    }
                     actions.push(with_pattern(entry, mount));
                 }
             }
@@ -442,6 +474,47 @@ async fn agent_surface_doc(
                     actions.push(with_pattern(entry, mount));
                 }
             }
+            // A deployed `code:` service appears by its optional manifest: a
+            // `storePattern` makes it an entity (it fronts a store), otherwise
+            // an action. The manifest's input/output schemas (when present) are
+            // surfaced as the uniform `inputSchema`/`outputSchema`; with no
+            // manifest the mount still lists, as a bare action.
+            s if s.starts_with("code:") => {
+                let manifest = code_manifest(tenant, mount).await;
+                let mut entry = json!({
+                    "path": base,
+                    "idempotency": { "header": "Idempotency-Key", "honored": true },
+                });
+                for (k, v) in meta(mount) {
+                    entry[k] = v;
+                }
+                if let Some(m) = &manifest {
+                    for key in ["inputSchema", "outputSchema", "description"] {
+                        if let Some(v) = m.get(key) {
+                            entry[key] = v.clone();
+                        }
+                    }
+                }
+                let store_pattern = manifest
+                    .as_ref()
+                    .and_then(|m| m.get("storePattern"))
+                    .and_then(|v| v.as_str());
+                let mut entry = with_pattern(entry, mount);
+                if let Some(p) = store_pattern {
+                    entry["pattern"] = json!(p);
+                }
+                if store_pattern.map(|p| p.starts_with("store")).unwrap_or(false) {
+                    entry["kind"] = json!("entity");
+                    entities.push(entry);
+                } else {
+                    entry["kind"] = json!("action");
+                    entry["effect"] = manifest
+                        .as_ref()
+                        .and_then(|m| m.get("effect").cloned())
+                        .unwrap_or(json!("unsafe"));
+                    actions.push(entry);
+                }
+            }
             _ => {}
         }
     }
@@ -456,10 +529,15 @@ async fn agent_surface_doc(
 
 const PROBLEM_RESPONSE: &str = "#/components/responses/Problem";
 
-fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
+async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) -> Value {
     let mut paths = Map::new();
+    // Component schemas accumulate here: the always-present `Problem`, plus any
+    // live dataset schemas inlined from `data` mounts (so the document is
+    // self-contained — no second fetch to resolve a `$ref`).
+    let mut schemas = Map::new();
+    schemas.insert("Problem".to_string(), problem_schema());
 
-    for mount in readable_mounts(tenant, msg) {
+    for mount in mounts {
         let base = mount.base_path.clone();
         match mount.service.as_str() {
             // Store-patterned mounts share one pair of path-item shapes —
@@ -494,6 +572,30 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                         "put": op("Install the dataset schema", "idempotent"),
                     }),
                 );
+                // Inline each installed dataset schema: register it under
+                // components/schemas and emit a concrete `{dataset}/{key}` path
+                // bound to it (the same schema the data service enforces on
+                // write — no drift). Datasets with no schema keep the generic
+                // StoreChild shape via the `{dataset}` template above.
+                if let Some((_, ctx)) = tenant.instance(&mount.base_path) {
+                    if let Some(data) = &ctx.data {
+                        if let Ok((names, _)) = data.list_datasets(10_000, 0).await {
+                            for name in names {
+                                let Ok(Some(schema)) = data.get_schema(&name).await else {
+                                    continue;
+                                };
+                                let key = schema_component_name(&base, &name);
+                                schemas.insert(key.clone(), schema);
+                                let schema_ref =
+                                    json!({ "$ref": format!("#/components/schemas/{key}") });
+                                paths.insert(
+                                    format!("{base}/{name}/{{key}}"),
+                                    store_child_for_schema(&schema_ref),
+                                );
+                            }
+                        }
+                    }
+                }
             }
             // Spec-store mounts: authoring under the reserved dot-subtree
             // shares the store shape; everything else executes.
@@ -507,14 +609,25 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     format!("{base}/{subtree}/{{specPath}}"),
                     json!({ "$ref": "#/components/pathItems/SpecChild" }),
                 );
+                // The mount-root spec's optional I/O schemas bind to the
+                // execute path (advisory — pipelines don't validate their body).
+                let root = stored_specs(tenant, mount, crate::services::PIPELINE_PREFIX)
+                    .await
+                    .into_iter()
+                    .find(|(name, _)| name == crate::services::spec_store::ROOT_SPEC)
+                    .map(|(_, doc)| doc);
+                let input = root.as_ref().and_then(|d| d.get("input")).cloned();
+                let output = root.as_ref().and_then(|d| d.get("output")).cloned();
                 paths.insert(
                     format!("{base}/{{path}}"),
                     json!({
                         "description": "Execute the longest-prefix-matched stored pipeline \
                                         (.root governs the mount root). All HTTP verbs pass \
                                         through to the pipeline.",
-                        "get": op("Run the matched stored pipeline", "unsafe"),
-                        "post": op("Run the matched stored pipeline with a body", "unsafe"),
+                        "get": op_with_schemas("Run the matched stored pipeline", "unsafe",
+                                               None, output.as_ref(), JSON, JSON),
+                        "post": op_with_schemas("Run the matched stored pipeline with a body",
+                                                "unsafe", input.as_ref(), output.as_ref(), JSON, JSON),
                     }),
                 );
             }
@@ -588,7 +701,8 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                                         (unix-ms or RFC 3339), q (body substring). JSON array of \
                                         OTLP LogRecords, or text/plain NDJSON via Accept; \
                                         X-Total-Count set.",
-                        "get": op("Query structured logs", "pure"),
+                        "get": op_media("Query structured logs", "pure",
+                                        &["application/json", "text/plain"]),
                     }),
                 );
                 paths.insert(
@@ -624,7 +738,49 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     let req = if is_write { input } else { None };
                     item.insert(
                         key.to_string(),
-                        op_with_schemas("Run the wrapper pipeline", effect, req, output),
+                        op_with_schemas("Run the wrapper pipeline", effect, req, output, JSON, JSON),
+                    );
+                }
+                paths.insert(format!("{base}/{{path}}"), Value::Object(item));
+            }
+            // A deployed `code:` service: emit one path item carrying the
+            // manifest's declared request/response schemas and media types (the
+            // input schema the engine enforces if it validates; the output is
+            // advisory), mirroring the wrapper. With no manifest the path item
+            // is still emitted, schema-free, so the service is discoverable.
+            s if s.starts_with("code:") => {
+                let manifest = code_manifest(tenant, mount).await;
+                let input = manifest.as_ref().and_then(|m| m.get("inputSchema"));
+                let output = manifest.as_ref().and_then(|m| m.get("outputSchema"));
+                let req_media = manifest
+                    .as_ref()
+                    .and_then(|m| m.get("requestMediaType"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(JSON);
+                let resp_media = manifest
+                    .as_ref()
+                    .and_then(|m| m.get("responseMediaType"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(JSON);
+                let mut item = Map::new();
+                item.insert(
+                    "description".to_string(),
+                    json!("Deployed custom-code service; the path beyond the mount is passed \
+                           to the guest. Schemas/media types come from the deploy manifest."),
+                );
+                for method in allowed_methods(mount) {
+                    let (key, is_write, effect) = match method {
+                        "GET" => ("get", false, "pure"),
+                        "PUT" => ("put", true, "idempotent"),
+                        "POST" => ("post", true, "unsafe"),
+                        "DELETE" => ("delete", false, "idempotent"),
+                        _ => continue, // HEAD / OPTIONS: not OpenAPI operations
+                    };
+                    let req = if is_write { input } else { None };
+                    item.insert(
+                        key.to_string(),
+                        op_with_schemas("Invoke the custom-code service", effect, req, output,
+                                        req_media, resp_media),
                     );
                 }
                 paths.insert(format!("{base}/{{path}}"), Value::Object(item));
@@ -636,7 +792,7 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": format!("RS2 tenant '{}'", msg.tenant),
+            "title": format!("RS2 tenant '{tenant_name}'"),
             "version": "0.1.0",
         },
         "paths": Value::Object(paths),
@@ -676,24 +832,58 @@ fn openapi_doc(tenant: &Tenant, msg: &Message) -> Value {
                     }
                 }
             },
-            "schemas": {
-                "Problem": {
-                    "type": "object",
-                    "required": ["type", "title", "status", "code"],
-                    "properties": {
-                        "type": { "type": "string" },
-                        "title": { "type": "string" },
-                        "status": { "type": "integer" },
-                        "code": { "type": "string" },
-                        "detail": { "type": "string" },
-                        "tenant": { "type": "string" },
-                        "traceId": { "type": "string" },
-                        "retryable": { "type": "boolean" },
-                        "retryAfterMs": { "type": "integer" }
-                    }
-                }
-            }
+            "schemas": Value::Object(schemas)
         }
+    })
+}
+
+/// The default operation media type when a manifest/spec doesn't declare one.
+const JSON: &str = "application/json";
+
+/// The RFC 9457 problem document schema (always present in `components`).
+fn problem_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["type", "title", "status", "code"],
+        "properties": {
+            "type": { "type": "string" },
+            "title": { "type": "string" },
+            "status": { "type": "integer" },
+            "code": { "type": "string" },
+            "detail": { "type": "string" },
+            "tenant": { "type": "string" },
+            "traceId": { "type": "string" },
+            "retryable": { "type": "boolean" },
+            "retryAfterMs": { "type": "integer" }
+        }
+    })
+}
+
+/// A stable `components/schemas` key for a dataset's inlined schema, derived
+/// from the mount base and dataset name (OpenAPI keys must match
+/// `^[a-zA-Z0-9._-]+$`; other characters become `_`).
+fn schema_component_name(base: &str, dataset: &str) -> String {
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') { c } else { '_' })
+            .collect::<String>()
+    };
+    format!("Dataset{}_{}", sanitize(base), sanitize(dataset))
+}
+
+/// A `StoreChild` path item bound to a concrete dataset schema (the same
+/// schema the data service enforces on write — no drift). Mirrors the generic
+/// `StoreChild` shape; writes/reads carry the schema, PATCH/DELETE don't.
+fn store_child_for_schema(schema_ref: &Value) -> Value {
+    json!({
+        "get": op_with_schemas("Read the stored resource; ETag carries the version",
+                               "pure", None, Some(schema_ref), JSON, JSON),
+        "put": op_with_schemas("Upsert; 201 created / 200 overwritten, empty body",
+                               "idempotent", Some(schema_ref), None, JSON, JSON),
+        "post": op_with_schemas("Upsert and return the stored representation (echo facet)",
+                                "unsafe", Some(schema_ref), Some(schema_ref), JSON, JSON),
+        "patch": op("JSON merge-patch (stores with the 'patch' facet)", "unsafe"),
+        "delete": op("Delete the resource", "idempotent"),
     })
 }
 
@@ -710,24 +900,39 @@ fn op(summary: &str, effect: &str) -> Value {
     })
 }
 
-/// [`op`] plus an inline JSON `requestBody` (`input`) and/or `200` response
-/// (`output`) schema — used to advertise a `wrapper`'s declared contract.
+/// [`op`] whose `200` advertises content under each given media type (no
+/// schema) — for operations that vary representation by `Accept` (e.g. the
+/// log view's JSON vs NDJSON).
+fn op_media(summary: &str, effect: &str, response_medias: &[&str]) -> Value {
+    let mut op = op(summary, effect);
+    let content: Map<String, Value> =
+        response_medias.iter().map(|m| (m.to_string(), json!({}))).collect();
+    op["responses"]["200"] = json!({ "description": "Success", "content": content });
+    op
+}
+
+/// [`op`] plus an inline `requestBody` (`input`) and/or `200` response
+/// (`output`) schema under the given request/response media types — used to
+/// advertise the declared contract of a wrapper, deployed code, or a
+/// schema-bound dataset child.
 fn op_with_schemas(
     summary: &str,
     effect: &str,
     input: Option<&Value>,
     output: Option<&Value>,
+    req_media: &str,
+    resp_media: &str,
 ) -> Value {
     let mut op = op(summary, effect);
     if let Some(schema) = input {
         op["requestBody"] = json!({
-            "content": { "application/json": { "schema": schema.clone() } }
+            "content": { req_media: { "schema": schema.clone() } }
         });
     }
     if let Some(schema) = output {
         op["responses"]["200"] = json!({
             "description": "Success",
-            "content": { "application/json": { "schema": schema.clone() } }
+            "content": { resp_media: { "schema": schema.clone() } }
         });
     }
     op

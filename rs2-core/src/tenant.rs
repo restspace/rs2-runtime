@@ -91,6 +91,16 @@ pub struct Adapters {
     /// in-memory adapter is single-node; a shared adapter (Redis) makes
     /// scheduled invocation HA-correct.
     pub schedule: Arc<dyn crate::scheduler::ScheduleStore>,
+    /// Operator-defined infras (PRD §9.1): named partial adapter configs a
+    /// tenant references via `store.adapter = "infra:<name>"`. Held behind a
+    /// swappable cell so the operator can reload without restarting
+    /// (`Runtime::reload_infras`); shared across `Adapters` clones. Defaults to
+    /// empty.
+    pub infras: Arc<std::sync::RwLock<Arc<crate::infra::InfraSet>>>,
+    /// Source the infra set is (re)loaded from. The server supplies a
+    /// file-backed loader over `infras.json`; `None` ⇒ infras are fixed at
+    /// startup and `reload_infras` reports no source.
+    pub infra_loader: Option<Arc<dyn crate::infra::InfraLoader>>,
 }
 
 impl Adapters {
@@ -136,7 +146,36 @@ impl Adapters {
             builtins,
             catalogue: None,
             schedule: Arc::new(crate::scheduler::MemScheduleStore::new()),
+            infras: Arc::new(std::sync::RwLock::new(Arc::new(crate::infra::InfraSet::default()))),
+            infra_loader: None,
         }
+    }
+
+    /// Seed the node's infras (the operator's `infras.json`). Replaces the
+    /// empty default; later swapped live by [`Self::swap_infras`].
+    pub fn with_infras(self, infras: crate::infra::InfraSet) -> Self {
+        *self.infras.write().unwrap() = Arc::new(infras);
+        self
+    }
+
+    /// Install the infra reload source. `Runtime::reload_infras` re-reads it,
+    /// swaps the live set, and purges tenants.
+    pub fn with_infra_loader(mut self, loader: Arc<dyn crate::infra::InfraLoader>) -> Self {
+        self.infra_loader = Some(loader);
+        self
+    }
+
+    /// Atomically replace the live infra set (the reload path). Shared across
+    /// `Adapters` clones, so the running `Runtime` sees it; rebuilt tenants
+    /// pick it up on their next build.
+    pub fn swap_infras(&self, infras: Arc<crate::infra::InfraSet>) {
+        *self.infras.write().unwrap() = infras;
+    }
+
+    /// A snapshot of the live infra set — taken once per `Tenant::build`, never
+    /// re-read mid-build (so a concurrent reload can't tear a build).
+    pub fn infras_snapshot(&self) -> Arc<crate::infra::InfraSet> {
+        self.infras.read().unwrap().clone()
     }
 
     /// Swap the scheduler coordination store (e.g. a shared Redis adapter for
@@ -233,6 +272,9 @@ impl Tenant {
                 })
                 .collect(),
         )?;
+        // Snapshot the live infra set once for the whole build — a concurrent
+        // reload swaps the cell but never tears this build.
+        let infras = adapters.infras_snapshot();
         let mut instances = HashMap::new();
         for mount in mounts.mounts() {
             let service: Arc<dyn Service> = match mount.service.as_str() {
@@ -245,8 +287,11 @@ impl Tenant {
                         &mount.base_path,
                         &mount.config,
                     );
+                    let backend = resolve_spec_backend(
+                        mount, adapters, name, limits.invocation_limits(), &infras,
+                    )?;
                     let store = crate::services::spec_store::SpecStore::new(
-                        adapters.files.clone(),
+                        backend,
                         name,
                         &root,
                         crate::services::PIPELINE_SUBTREE,
@@ -262,8 +307,11 @@ impl Tenant {
                         &mount.base_path,
                         &mount.config,
                     );
+                    let backend = resolve_spec_backend(
+                        mount, adapters, name, limits.invocation_limits(), &infras,
+                    )?;
                     let store = crate::services::spec_store::SpecStore::new(
-                        adapters.files.clone(),
+                        backend,
                         name,
                         &root,
                         crate::services::QUERY_SUBTREE,
@@ -283,8 +331,11 @@ impl Tenant {
                             &mount.base_path,
                             &mount.config,
                         );
+                        let backend = resolve_spec_backend(
+                            mount, adapters, name, limits.invocation_limits(), &infras,
+                        )?;
                         let store = crate::services::spec_store::SpecStore::new(
-                            adapters.files.clone(),
+                            backend,
                             name,
                             &root,
                             crate::services::TEMPLATE_SUBTREE,
@@ -339,9 +390,9 @@ impl Tenant {
             // adapters; a `data`/`query` mount may instead name a loadable
             // adapter (`"store": {"adapter":"code:…"}`, G13 Phase 2/3) backed by
             // a resident JS bundle. The stock service runs unchanged on either.
-            let files = file_capability(mount, adapters, name, limits.invocation_limits())?;
-            let data = data_capability(mount, adapters, name, limits.invocation_limits())?;
-            let query = query_capability(mount, adapters, name, limits.invocation_limits())?;
+            let files = file_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
+            let data = data_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
+            let query = query_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
 
             // Capability grants: each instance gets handles pre-scoped to
             // this tenant — host-enforced isolation (PRD §9.2).
@@ -383,6 +434,14 @@ impl Tenant {
                 },
                 builtin_adapters: if mount.service == "services" {
                     Some(adapters.builtins.clone())
+                } else {
+                    None
+                },
+                // The self-config service alone sees the node infra set, to list
+                // what a tenant may consume (secrets redacted); every other mount
+                // sees `None` (default-deny).
+                infras: if mount.service == "services" {
+                    Some(infras.clone())
                 } else {
                     None
                 },
@@ -428,45 +487,107 @@ fn check_elevate_not_operator(mount: &Mount, operator_roles: Option<&str>) -> Re
     Ok(())
 }
 
-/// How a mount's `store.adapter` selects its backend. Read only when the mount
-/// is of the relevant kind; absent ⇒ the node default. `builtin:<name>` picks a
-/// built-in Rust adapter from the registry; `code:<name>@<version>` a JS
-/// loadable adapter; any other string is a config error.
-enum AdapterRef<'a> {
+/// A resolved storage backend selection, after any `infra:<name>` expansion.
+/// `builtin:<name>` picks a built-in Rust adapter from the registry;
+/// `code:<name>@<version>` a JS loadable adapter; absent ⇒ the node default.
+enum StoreKind {
     Default,
-    Builtin(&'a str),
-    Code(&'a str),
+    Builtin(String),
+    Code(String),
 }
 
-/// Classify a mount's `store.adapter` for the given service `kind`. Runs at
-/// `Tenant::build` time, so a malformed scheme is a 400 at config PUT, not at
-/// first use.
-fn classify_adapter<'a>(mount: &'a Mount, kind: &str) -> Result<AdapterRef<'a>, RsError> {
-    if mount.service != kind {
-        return Ok(AdapterRef::Default);
-    }
-    let Some(adapter) = mount
-        .config
-        .get("store")
-        .and_then(|s| s.get("adapter"))
-        .and_then(|a| a.as_str())
-    else {
-        return Ok(AdapterRef::Default);
+/// Classify the `adapter` of an (already infra-expanded) `store`-shaped value.
+/// An `infra:` prefix here means expansion didn't rewrite it (an operator bug);
+/// callers always expand first, so it can't normally occur.
+fn classify_store(store: &serde_json::Value) -> Result<StoreKind, RsError> {
+    let Some(adapter) = store.get("adapter").and_then(|a| a.as_str()) else {
+        return Ok(StoreKind::Default);
     };
     if adapter.starts_with("code:") {
-        Ok(AdapterRef::Code(adapter))
+        Ok(StoreKind::Code(adapter.to_string()))
     } else if let Some(builtin) = adapter.strip_prefix("builtin:") {
-        Ok(AdapterRef::Builtin(builtin))
+        Ok(StoreKind::Builtin(builtin.to_string()))
     } else {
         Err(RsError::bad_request(format!(
-            "{kind} store adapter '{adapter}' must be 'builtin:<name>' or 'code:<name>@<version>'"
+            "store adapter '{adapter}' must be 'builtin:<name>', 'code:<name>@<version>', \
+             or 'infra:<name>'"
         )))
     }
 }
 
-/// The `store` sub-config passed to an adapter factory (`{}` when absent).
-fn store_config(mount: &Mount) -> serde_json::Value {
-    mount.config.get("store").cloned().unwrap_or_else(|| serde_json::json!({}))
+/// Expand a mount's primary `store` for the given service `kind`: returns the
+/// node default unless the mount *is* that kind, in which case it resolves any
+/// `infra:<name>` ref (operator config + secrets merged in, default-deny) and
+/// classifies the result. Runs at `Tenant::build` time, so a bad scheme or a
+/// rejected infra is a 400 at config PUT, not at first use.
+fn expand_store(
+    mount: &Mount,
+    kind: &str,
+    tenant: &str,
+    infras: &crate::infra::InfraSet,
+) -> Result<(StoreKind, serde_json::Value), RsError> {
+    if mount.service != kind {
+        return Ok((StoreKind::Default, serde_json::json!({})));
+    }
+    let raw = mount.config.get("store").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let expanded = crate::infra::expand_infra(&raw, infras, tenant)?.into_owned();
+    Ok((classify_store(&expanded)?, expanded))
+}
+
+/// Resolve a `file` backend from an (already infra-expanded) store value —
+/// shared by `file_capability` and the spec-store backend. Returns the
+/// **unscoped** `Arc<dyn FileStore>`; callers scope it to the tenant. Some
+/// params are only used on one side of the `js` feature split.
+#[allow(unused_variables)]
+fn build_file_backend(
+    kind: StoreKind,
+    store: &serde_json::Value,
+    adapters: &Adapters,
+    label: &str,
+    mount: &Mount,
+    tenant: &str,
+    limits: crate::contract::InvocationLimits,
+) -> Result<Arc<dyn FileStore>, RsError> {
+    match kind {
+        StoreKind::Default => Ok(adapters.files.clone()),
+        StoreKind::Builtin(builtin) => adapters
+            .builtins
+            .build_files(&builtin, store)?
+            .ok_or_else(|| unknown_builtin(label, &builtin, adapters.builtins.files_names())),
+        StoreKind::Code(adapter_ref) => {
+            #[cfg(feature = "js")]
+            {
+                let loader = ScopedFileStore::new(adapters.files.clone(), tenant);
+                let guest = crate::engines::resident::GuestFileStore::from_config(
+                    &adapter_ref, store, loader, tenant, limits,
+                )?;
+                Ok(Arc::new(guest))
+            }
+            #[cfg(not(feature = "js"))]
+            {
+                Err(loadable_without_js(label, mount, &adapter_ref))
+            }
+        }
+    }
+}
+
+/// Resolve the **file backend** for a spec store (pipeline/query/template
+/// authoring subtree) from the mount's `specStore` block: absent ⇒ the node
+/// file store (today's behavior); otherwise an `infra:`/`builtin:`/`code:`
+/// file adapter. Independent of the mount's primary `store.adapter` (which, on
+/// a `query` mount, selects the query *execution* backend). Returns the
+/// unscoped backend; `SpecStore::new` roots + scopes it.
+fn resolve_spec_backend(
+    mount: &Mount,
+    adapters: &Adapters,
+    tenant: &str,
+    limits: crate::contract::InvocationLimits,
+    infras: &crate::infra::InfraSet,
+) -> Result<Arc<dyn FileStore>, RsError> {
+    let raw = mount.config.get("specStore").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let expanded = crate::infra::expand_infra(&raw, infras, tenant)?.into_owned();
+    let kind = classify_store(&expanded)?;
+    build_file_backend(kind, &expanded, adapters, "spec", mount, tenant, limits)
 }
 
 /// Resolve a mount's granted secrets: the names in its `secrets` config, looked
@@ -496,29 +617,31 @@ fn data_capability(
     adapters: &Adapters,
     name: &str,
     limits: crate::contract::InvocationLimits,
+    infras: &crate::infra::InfraSet,
 ) -> Result<Option<ScopedDataStore>, RsError> {
-    match classify_adapter(mount, "data")? {
-        AdapterRef::Default => Ok(Some(ScopedDataStore::new(adapters.data.clone(), name))),
-        AdapterRef::Builtin(builtin) => {
+    let (kind, store) = expand_store(mount, "data", name, infras)?;
+    match kind {
+        StoreKind::Default => Ok(Some(ScopedDataStore::new(adapters.data.clone(), name))),
+        StoreKind::Builtin(builtin) => {
             let inner = adapters
                 .builtins
-                .build_data(builtin, &store_config(mount))?
-                .ok_or_else(|| unknown_builtin("data", builtin, adapters.builtins.data_names()))?;
+                .build_data(&builtin, &store)?
+                .ok_or_else(|| unknown_builtin("data", &builtin, adapters.builtins.data_names()))?;
             Ok(Some(ScopedDataStore::new(inner, name)))
         }
-        AdapterRef::Code(adapter_ref) => {
+        StoreKind::Code(adapter_ref) => {
             #[cfg(feature = "js")]
             {
                 let files = ScopedFileStore::new(adapters.files.clone(), name);
                 let guest = crate::engines::resident::GuestDataStore::from_config(
-                    adapter_ref, &store_config(mount), files, name, limits,
+                    &adapter_ref, &store, files, name, limits,
                 )?;
                 Ok(Some(ScopedDataStore::new(Arc::new(guest), name)))
             }
             #[cfg(not(feature = "js"))]
             {
                 let _ = limits;
-                Err(loadable_without_js("data", mount, adapter_ref))
+                Err(loadable_without_js("data", mount, &adapter_ref))
             }
         }
     }
@@ -526,74 +649,55 @@ fn data_capability(
 
 /// Resolve a mount's `files` capability. Absent `store.adapter` ⇒ the node
 /// built-in; `builtin:<name>` ⇒ a registered Rust adapter; `code:…` ⇒ a
-/// resident JS loadable adapter (G13 Phase 3), whose bundle is still loaded
-/// from the built-in store (no circularity).
+/// resident JS loadable adapter (G13 Phase 3); `infra:<name>` ⇒ an operator
+/// infra resolving to one of those, with its config (and secrets) merged in.
 fn file_capability(
     mount: &Mount,
     adapters: &Adapters,
     name: &str,
     limits: crate::contract::InvocationLimits,
+    infras: &crate::infra::InfraSet,
 ) -> Result<Option<ScopedFileStore>, RsError> {
-    match classify_adapter(mount, "file")? {
-        AdapterRef::Default => Ok(Some(ScopedFileStore::new(adapters.files.clone(), name))),
-        AdapterRef::Builtin(builtin) => {
-            let inner = adapters
-                .builtins
-                .build_files(builtin, &store_config(mount))?
-                .ok_or_else(|| unknown_builtin("file", builtin, adapters.builtins.files_names()))?;
-            Ok(Some(ScopedFileStore::new(inner, name)))
-        }
-        AdapterRef::Code(adapter_ref) => {
-            #[cfg(feature = "js")]
-            {
-                let loader = ScopedFileStore::new(adapters.files.clone(), name);
-                let guest = crate::engines::resident::GuestFileStore::from_config(
-                    adapter_ref, &store_config(mount), loader, name, limits,
-                )?;
-                Ok(Some(ScopedFileStore::new(Arc::new(guest), name)))
-            }
-            #[cfg(not(feature = "js"))]
-            {
-                let _ = limits;
-                Err(loadable_without_js("file", mount, adapter_ref))
-            }
-        }
-    }
+    let (kind, store) = expand_store(mount, "file", name, infras)?;
+    let inner = build_file_backend(kind, &store, adapters, "file", mount, name, limits)?;
+    Ok(Some(ScopedFileStore::new(inner, name)))
 }
 
 /// Resolve a mount's `query` capability. Absent `store.adapter` ⇒ the node
 /// built-in `QueryStore`; `builtin:<name>` ⇒ a registered Rust adapter; `code:…`
 /// ⇒ a resident JS loadable adapter (G13 Phase 3) executing stored queries
-/// against its own backend. (`store.root` still relocates the authoring subtree
-/// — the two `store` keys are independent.)
+/// against its own backend; `infra:<name>` ⇒ an operator infra. (`store.root` /
+/// the `specStore` block relocate the authoring subtree — independent of this.)
 fn query_capability(
     mount: &Mount,
     adapters: &Adapters,
     name: &str,
     limits: crate::contract::InvocationLimits,
+    infras: &crate::infra::InfraSet,
 ) -> Result<Option<ScopedQueryStore>, RsError> {
-    match classify_adapter(mount, "query")? {
-        AdapterRef::Default => Ok(Some(ScopedQueryStore::new(adapters.query.clone(), name))),
-        AdapterRef::Builtin(builtin) => {
+    let (kind, store) = expand_store(mount, "query", name, infras)?;
+    match kind {
+        StoreKind::Default => Ok(Some(ScopedQueryStore::new(adapters.query.clone(), name))),
+        StoreKind::Builtin(builtin) => {
             let inner = adapters
                 .builtins
-                .build_query(builtin, &store_config(mount))?
-                .ok_or_else(|| unknown_builtin("query", builtin, adapters.builtins.query_names()))?;
+                .build_query(&builtin, &store)?
+                .ok_or_else(|| unknown_builtin("query", &builtin, adapters.builtins.query_names()))?;
             Ok(Some(ScopedQueryStore::new(inner, name)))
         }
-        AdapterRef::Code(adapter_ref) => {
+        StoreKind::Code(adapter_ref) => {
             #[cfg(feature = "js")]
             {
                 let files = ScopedFileStore::new(adapters.files.clone(), name);
                 let guest = crate::engines::resident::GuestQueryStore::from_config(
-                    adapter_ref, &store_config(mount), files, name, limits,
+                    &adapter_ref, &store, files, name, limits,
                 )?;
                 Ok(Some(ScopedQueryStore::new(Arc::new(guest), name)))
             }
             #[cfg(not(feature = "js"))]
             {
                 let _ = limits;
-                Err(loadable_without_js("query", mount, adapter_ref))
+                Err(loadable_without_js("query", mount, &adapter_ref))
             }
         }
     }

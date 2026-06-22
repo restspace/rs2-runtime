@@ -28,6 +28,7 @@ pub mod discovery;
 pub mod engines;
 pub mod error;
 pub mod idempotency;
+pub mod infra;
 pub mod logging;
 pub mod message;
 pub mod path_pattern;

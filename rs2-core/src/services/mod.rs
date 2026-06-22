@@ -84,6 +84,9 @@ pub struct ServiceContext {
     /// Snapshot of the node's built-in adapter registry — granted only to the
     /// `services` mount, so it can list selectable built-in adapters.
     pub builtin_adapters: Option<crate::adapters::BuiltinRegistry>,
+    /// Snapshot of the node's infra set — granted only to the `services` mount,
+    /// so it can list the infras a tenant may consume (secrets redacted).
+    pub infras: Option<Arc<crate::infra::InfraSet>>,
     /// Tenant secrets this mount is granted (resolved from the mount's `secrets`
     /// grant against the tenant `secrets` block; default-deny). Host-side only —
     /// never exposed to sandboxed guests. The `pipeline` service binds these as

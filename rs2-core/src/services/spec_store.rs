@@ -49,16 +49,19 @@ pub struct SpecStore {
     operator_roles: String,
 }
 
-/// Resolve the storage root for a spec store: mount config
-/// `"store": {"root": ...}` or the default `.rs2-<kind><mount base>`.
-/// (Also used by discovery, which lists specs through the tenant handle.)
+/// Resolve the storage root for a spec store: the spec-store root override
+/// (`"specStore": {"root": ...}`), else the legacy `"store": {"root": ...}`,
+/// else the default `.rs2-<kind><mount base>`. (Also used by discovery, which
+/// lists specs through the tenant handle.)
 pub fn store_root(default_kind_prefix: &str, base_path: &str, config: &Value) -> String {
-    let store = config
-        .get("store")
-        .and_then(|s| serde_json::from_value::<crate::config_schema::StoreConfig>(s.clone()).ok())
-        .unwrap_or_default();
-    store
-        .root
+    let root_of = |key: &str| {
+        config
+            .get(key)
+            .and_then(|s| serde_json::from_value::<crate::config_schema::StoreConfig>(s.clone()).ok())
+            .and_then(|s| s.root)
+    };
+    root_of("specStore")
+        .or_else(|| root_of("store"))
         .map(|r| r.trim_matches('/').to_string())
         .unwrap_or_else(|| format!("{default_kind_prefix}{base_path}").trim_matches('/').to_string())
 }
@@ -104,6 +107,7 @@ impl SpecStore {
             log_store: None,
             catalogue: None,
             builtin_adapters: None,
+            infras: None,
             secrets: None,
         };
         SpecStore {
@@ -219,5 +223,31 @@ impl SpecStore {
 
     pub fn subtree(&self) -> &'static str {
         self.subtree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_root;
+    use serde_json::json;
+
+    #[test]
+    fn store_root_prefers_spec_store_then_store_then_default() {
+        // Default: `.rs2-<kind><mount>`.
+        assert_eq!(store_root(".rs2-pipelines", "/p", &json!({})), ".rs2-pipelines/p");
+        // Legacy `store.root` still honored.
+        assert_eq!(
+            store_root(".rs2-pipelines", "/p", &json!({ "store": { "root": "legacy" } })),
+            "legacy"
+        );
+        // `specStore.root` wins over `store.root`.
+        assert_eq!(
+            store_root(
+                ".rs2-pipelines",
+                "/p",
+                &json!({ "store": { "root": "legacy" }, "specStore": { "root": "managed" } })
+            ),
+            "managed"
+        );
     }
 }

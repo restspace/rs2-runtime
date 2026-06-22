@@ -279,8 +279,12 @@ impl ServicesService {
                 if name.is_empty() || name.contains(['/', '\\', '.']) {
                     return Err(RsError::bad_request("invalid code bundle name"));
                 }
+                let manifest = msg.header("x-rs2-manifest").map(str::to_string);
                 let (bytes, is_js, validated) = self.validate_bundle(&mut msg, ctx).await?;
                 let (version, child) = Self::store_bundle(&files, &name, bytes, is_js).await?;
+                if let Some(manifest) = manifest {
+                    Self::store_manifest(&files, &name, &version, &manifest).await?;
+                }
                 let mut resp = msg.response(
                     http::StatusCode::CREATED,
                     Some(crate::message::Body::from_json(&serde_json::json!({
@@ -302,6 +306,7 @@ impl ServicesService {
                 let (name, version) = (name.to_string(), version.to_string());
                 let stem =
                     version.trim_end_matches(".wasm").trim_end_matches(".js").to_string();
+                let manifest = msg.header("x-rs2-manifest").map(str::to_string);
                 let (bytes, is_js, _) = self.validate_bundle(&mut msg, ctx).await?;
                 let computed = super::code::version_of(&bytes);
                 if computed != stem {
@@ -310,6 +315,9 @@ impl ServicesService {
                          '{stem}' — POST {}/code/{name}/ to deploy them",
                         msg.url.base_path
                     )));
+                }
+                if let Some(manifest) = manifest {
+                    Self::store_manifest(&files, &name, &stem, &manifest).await?;
                 }
                 let child = if is_js { format!("{stem}.js") } else { format!("{stem}.wasm") };
                 let created = files
@@ -345,6 +353,8 @@ impl ServicesService {
                     format!("/{name}/{stem}.js"),
                 ] {
                     if files.delete(&candidate).await.is_ok() {
+                        // Best-effort: drop the manifest sidecar with the bundle.
+                        let _ = files.delete(&format!("/{name}/{stem}.manifest.json")).await;
                         return Ok(msg.no_content());
                     }
                 }
@@ -439,6 +449,32 @@ impl ServicesService {
             )
             .await?;
         Ok((version, child))
+    }
+
+    /// Store an optional deploy manifest alongside the content-addressed bundle
+    /// (`.rs2-code/<name>/<version>.manifest.json`). The manifest declares the
+    /// service's I/O schemas, effect class, media types, and (optionally) a
+    /// store pattern — surfaced verbatim on the discovery surface. It is
+    /// metadata about the deployment, not part of the content hash, so the
+    /// version is unchanged. Must be a JSON object.
+    async fn store_manifest(
+        files: &crate::capabilities::ScopedFileStore,
+        name: &str,
+        version: &str,
+        manifest: &str,
+    ) -> Result<(), RsError> {
+        let value: serde_json::Value = serde_json::from_str(manifest)
+            .map_err(|e| RsError::bad_request(format!("X-RS2-Manifest is not valid JSON: {e}")))?;
+        if !value.is_object() {
+            return Err(RsError::bad_request("X-RS2-Manifest must be a JSON object"));
+        }
+        files
+            .write(
+                &format!("/{name}/{version}.manifest.json"),
+                crate::message::Body::from_json(&value),
+            )
+            .await?;
+        Ok(())
     }
 
     /// `GET /catalogues` — the tenant's registered catalogues, each annotated
@@ -713,6 +749,34 @@ impl Service for ServicesService {
                 Ok(msg.ok_json(&serde_json::json!({ "mounts": mounts })))
             }
 
+            // Infras this tenant may consume (PRD §9.1): names, descriptions,
+            // and the fields the tenant must supply — never the operator's
+            // baked-in config values (secrets). Filtered by `allowedTenants`.
+            (&http::Method::GET, ["infras"]) => {
+                let infras = ctx
+                    .infras
+                    .as_ref()
+                    .ok_or_else(|| RsError::internal("services service has no infra grant"))?;
+                let items: Vec<serde_json::Value> = infras
+                    .visible_to(&msg.tenant)
+                    .into_iter()
+                    .map(|(name, def)| {
+                        // Provided keys only — values (incl. secrets) stay hidden.
+                        let mut provided: Vec<&str> = def.config.keys().map(|k| k.as_str()).collect();
+                        provided.sort();
+                        serde_json::json!({
+                            "name": name,
+                            "description": def.description,
+                            "adapterKind": def.adapter_kind(),
+                            "providedKeys": provided,
+                            "requires": def.requires,
+                            "infraOnly": def.infra_only,
+                        })
+                    })
+                    .collect();
+                Ok(msg.ok_json(&serde_json::json!({ "infras": items })))
+            }
+
             (&http::Method::GET, ["raw"]) => {
                 let (mut config, version) = control.raw_config(&msg.tenant).await?;
                 // Secrets are write-only through the self-config API
@@ -745,7 +809,7 @@ impl Service for ServicesService {
             }
 
             _ => Err(RsError::not_found(format!(
-                "services endpoint '{}' (have: GET catalogue/services/raw, PUT raw, \
+                "services endpoint '{}' (have: GET catalogue/services/infras/raw, PUT raw, \
                  store-patterned code/ subtree)",
                 msg.url.service_path
             ))),

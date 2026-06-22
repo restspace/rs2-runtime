@@ -55,6 +55,14 @@ struct ServerConfig {
     /// `RS2_ADMIN_EMAIL`/`RS2_ADMIN_PASSWORD` override these on-disk values.
     #[serde(default)]
     bootstrap_admin: Option<BootstrapAdmin>,
+    /// Operator infras (PRD §9.1): named partial adapter configs (with baked-in
+    /// secrets) tenants reference as `infra:<name>`. A missing file ⇒ no infras.
+    #[serde(default = "default_infras_path")]
+    infras_path: String,
+    /// Token gating `POST /admin/reload-infras`. `RS2_ADMIN_TOKEN` overrides
+    /// this; with neither set the admin endpoint is disabled (503).
+    #[serde(default)]
+    admin_token: Option<String>,
 }
 
 /// Bootstrap admin credentials (PRD §10.5). Env vars
@@ -122,6 +130,9 @@ fn default_data_root() -> String {
 fn default_tenants_dir() -> String {
     "./tenants".to_string()
 }
+fn default_infras_path() -> String {
+    "./infras.json".to_string()
+}
 fn default_log_sink() -> String {
     "file".to_string()
 }
@@ -149,6 +160,33 @@ enum TenancyConfig {
         domain_map: HashMap<String, String>,
         main_domain: Option<String>,
     },
+}
+
+/// File-backed infra source: reads the operator's `infras.json` on demand
+/// (so `POST /admin/reload-infras` always picks up edits). A missing file is
+/// an empty set — infras are optional; only malformed JSON is an error.
+struct FileInfraLoader {
+    path: PathBuf,
+}
+
+impl rs2_core::infra::InfraLoader for FileInfraLoader {
+    fn load(&self) -> Result<rs2_core::infra::InfraSet, RsError> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(rs2_core::infra::InfraSet::default())
+            }
+            Err(e) => {
+                return Err(RsError::internal(format!(
+                    "cannot read infras file '{}': {e}",
+                    self.path.display()
+                )))
+            }
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| RsError::bad_request(format!("invalid infras.json: {e}")))?;
+        rs2_core::infra::InfraSet::from_json(value)
+    }
 }
 
 /// File-backed tenant config store: `<tenants_dir>/<tenant>.json`.
@@ -321,7 +359,45 @@ fn message_to_hyper_response(msg: Message) -> Response<OutBody> {
     }
 }
 
-async fn serve_request(runtime: Arc<Runtime>, req: hyper::Request<Incoming>) -> Response<OutBody> {
+/// A small fixed-body ops response (plain text / JSON), outside tenant routing.
+fn ops_response(status: StatusCode, content_type: &'static str, body: String) -> Response<OutBody> {
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .body(http_body_util::Full::new(Bytes::from(body)).map_err(std::io::Error::other).boxed_unsync())
+        .unwrap()
+}
+
+/// Constant-time equality (no `subtle` dep): compares every byte so timing
+/// doesn't leak how much of the token matched. Unequal lengths fail fast — the
+/// length isn't the secret.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// The bearer/token presented for a node admin request: `Authorization: Bearer
+/// <t>` or `X-Admin-Token: <t>`.
+fn presented_admin_token(req: &hyper::Request<Incoming>) -> Option<String> {
+    if let Some(v) = req.headers().get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(tok) = v.strip_prefix("Bearer ") {
+            return Some(tok.trim().to_string());
+        }
+    }
+    req.headers().get("x-admin-token").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+}
+
+async fn serve_request(
+    runtime: Arc<Runtime>,
+    admin_token: Option<Arc<str>>,
+    req: hyper::Request<Incoming>,
+) -> Response<OutBody> {
     let path = req.uri().path();
     // Ops endpoints (PRD 14), outside tenant routing.
     if path == "/healthz" || path == "/readyz" {
@@ -329,6 +405,47 @@ async fn serve_request(runtime: Arc<Runtime>, req: hyper::Request<Incoming>) -> 
             .status(StatusCode::OK)
             .body(http_body_util::Full::new(Bytes::from_static(b"ok")).map_err(std::io::Error::other).boxed_unsync())
             .unwrap();
+    }
+    // Node admin: reload infras without restarting (PRD §9.1). Operator-gated by
+    // the admin token; disabled (503) when no token is configured.
+    if path == "/admin/reload-infras" {
+        if req.method() != http::Method::POST {
+            return ops_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain",
+                "POST only\n".to_string(),
+            );
+        }
+        let Some(expected) = admin_token.as_deref() else {
+            return ops_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "text/plain",
+                "admin endpoint disabled: set RS2_ADMIN_TOKEN or serverConfig.adminToken\n"
+                    .to_string(),
+            );
+        };
+        match presented_admin_token(&req) {
+            Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => {}
+            _ => {
+                return ops_response(
+                    StatusCode::UNAUTHORIZED,
+                    "text/plain",
+                    "missing or invalid admin token\n".to_string(),
+                )
+            }
+        }
+        return match runtime.reload_infras().await {
+            Ok(names) => ops_response(
+                StatusCode::OK,
+                "application/json",
+                serde_json::json!({ "loaded": names.len(), "names": names }).to_string(),
+            ),
+            Err(e) => ops_response(
+                StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_REQUEST),
+                "application/problem+json",
+                e.to_problem_json("-", "-").to_string(),
+            ),
+        };
     }
     let host = req
         .headers()
@@ -476,6 +593,7 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     config.file_root = resolve_against(&base_dir, &config.file_root);
     config.data_root = resolve_against(&base_dir, &config.data_root);
     config.logging.file.path = resolve_against(&base_dir, &config.logging.file.path);
+    config.infras_path = resolve_against(&base_dir, &config.infras_path);
 
     let tenancy = match config.tenancy {
         TenancyConfig::Single { tenant } => Tenancy::Single { tenant },
@@ -521,6 +639,16 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
             }),
         );
     }
+    // Infras (PRD §9.1): seed from `infras.json` and keep the loader so the
+    // admin endpoint can hot-reload it. A malformed file fails startup.
+    let infra_loader = Arc::new(FileInfraLoader { path: PathBuf::from(&config.infras_path) });
+    let infras = rs2_core::infra::InfraLoader::load(infra_loader.as_ref())
+        .map_err(|e| format!("loading infras '{}': {}", config.infras_path, e.detail))?;
+    if !infras.is_empty() {
+        println!("loaded {} infra(s): {}", infras.len(), infras.names().join(", "));
+    }
+    let adapters = adapters.with_infras(infras).with_infra_loader(infra_loader);
+
     let loader = Arc::new(FileConfigLoader { dir: PathBuf::from(&config.tenants_dir) });
 
     // Seed the bootstrap admin (single-tenant) before serving, so a locked
@@ -528,6 +656,15 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     seed_bootstrap_admin(&tenancy, config.bootstrap_admin.as_ref(), &loader, &adapters.data).await?;
 
     let runtime = Runtime::new(tenancy, adapters, loader, LimitTable::default());
+
+    // Admin token for node ops endpoints (`POST /admin/reload-infras`): env
+    // first (preferred — never at rest in the config file), then config. `None`
+    // ⇒ the admin endpoint is disabled.
+    let admin_token: Option<Arc<str>> = std::env::var("RS2_ADMIN_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| config.admin_token.clone())
+        .map(|t| Arc::from(t.as_str()));
 
     // Host scheduler (G1): fires mounts that declare a `schedule`. No-op when
     // none do; single-node by default (swap a shared `ScheduleStore` for HA).
@@ -540,11 +677,17 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let runtime = runtime.clone();
+        let admin_token = admin_token.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let service = service_fn(move |req| {
                 let runtime = runtime.clone();
-                async move { Ok::<_, std::convert::Infallible>(serve_request(runtime, req).await) }
+                let admin_token = admin_token.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        serve_request(runtime, admin_token, req).await,
+                    )
+                }
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
@@ -553,6 +696,20 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("connection error: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_eq_matches_only_equal_bytes() {
+        assert!(constant_time_eq(b"s3cr3t", b"s3cr3t"));
+        assert!(!constant_time_eq(b"s3cr3t", b"s3cr3T"));
+        assert!(!constant_time_eq(b"s3cr3t", b"s3cr3")); // length differs
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
 
