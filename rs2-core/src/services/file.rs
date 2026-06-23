@@ -75,6 +75,28 @@ impl FileService {
         }
         Ok(resp)
     }
+
+    /// Resolve an extension-less request to a stored file by probing the known
+    /// servable extensions in `Accept`-negotiated order (falling back to the
+    /// fixed preference order). Returns the first real path that exists, or
+    /// `None` if no candidate exists. Only call for extension-less paths.
+    async fn resolve_friendly(
+        &self,
+        path: &str,
+        accept: Option<&str>,
+        files: &crate::capabilities::ScopedFileStore,
+        priority: &[String],
+    ) -> Result<Option<String>, RsError> {
+        for ext in negotiate_extensions(accept, priority) {
+            let candidate = format!("{path}.{ext}");
+            match files.head(&candidate).await {
+                Ok(_) => return Ok(Some(candidate)),
+                Err(e) if e.code == crate::error::codes::NOT_FOUND => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Static-site options on a file mount (v1's static-site manifest variant,
@@ -89,11 +111,24 @@ struct SiteOptions {
     spa_fallback: bool,
     /// Suppress dir+json listings (a public site shouldn't be browsable).
     listings: bool,
+    /// Resolve extension-less URLs to a stored file (e.g. `/docs/readme` →
+    /// `docs/readme.md`), choosing among collisions by `Accept` negotiation.
+    friendly_urls: bool,
+    /// Extension preference (no dots) for friendly URLs. `[0]` is the canonical
+    /// slot an extension-less PUT pins to; the list also fronts the GET probe
+    /// order. Empty → extension-less PUTs are rejected (see the PUT arm).
+    extension_priority: Vec<String>,
 }
 
 impl Default for SiteOptions {
     fn default() -> Self {
-        SiteOptions { default_resource: None, spa_fallback: false, listings: true }
+        SiteOptions {
+            default_resource: None,
+            spa_fallback: false,
+            listings: true,
+            friendly_urls: false,
+            extension_priority: Vec::new(),
+        }
     }
 }
 
@@ -108,6 +143,8 @@ impl SiteOptions {
             default_resource,
             spa_fallback: cfg.spa_fallback,
             listings: cfg.listings,
+            friendly_urls: cfg.friendly_urls,
+            extension_priority: cfg.extension_priority,
         }
     }
 }
@@ -131,6 +168,80 @@ fn extension_for(media_type: &MediaType) -> &'static str {
         "application/zip" => ".zip",
         _ => "",
     }
+}
+
+/// Whether `path`'s final segment carries no extension — the precondition for
+/// treating it as a friendly URL (`/docs/readme`, not `/docs/readme.md`).
+fn is_extensionless(path: &str) -> bool {
+    !path.rsplit('/').next().unwrap_or("").contains('.')
+}
+
+/// Quality of `essence` against one parsed `Accept` range `(type, subtype, q)`.
+/// `*/*` and `type/*` match as wildcards; an exact essence match also scores its
+/// `q`. Returns `0.0` when the range doesn't apply.
+fn accept_match_q(essence: &str, range: &(String, String, f32)) -> f32 {
+    let (rtype, rsubtype, q) = range;
+    let (etype, esubtype) = essence.split_once('/').unwrap_or((essence, ""));
+    let matches = (rtype == "*" || rtype == etype)
+        && (rsubtype == "*" || rsubtype == esubtype);
+    if matches {
+        *q
+    } else {
+        0.0
+    }
+}
+
+/// Order the servable extensions for an extension-less request by `Accept`
+/// quality, with a stable preference order as the tiebreak. The base order is
+/// the configured `priority` list first (deduped), then the remaining built-in
+/// known extensions — so a configured list fronts the order (and `priority[0]`
+/// stays first for a no-`Accept`/`*/*` request) without losing resolvability of
+/// other types. With an empty `priority`, the base order is the built-in table.
+fn negotiate_extensions(accept: Option<&str>, priority: &[String]) -> Vec<String> {
+    // Parse `Accept` into `(type, subtype, q)` ranges; ignore malformed parts.
+    let ranges: Vec<(String, String, f32)> = accept
+        .into_iter()
+        .flat_map(|h| h.split(','))
+        .filter_map(|part| {
+            let mut params = part.split(';');
+            let media = params.next()?.trim();
+            let (t, s) = media.split_once('/')?;
+            let q = params
+                .find_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.trim().parse::<f32>().ok()))
+                .unwrap_or(1.0);
+            Some((t.trim().to_ascii_lowercase(), s.trim().to_ascii_lowercase(), q))
+        })
+        .collect();
+
+    // Base candidate order: configured priority first, then the rest of the
+    // built-in table not already listed.
+    let mut base: Vec<String> = Vec::new();
+    for ext in priority {
+        let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+        if !ext.is_empty() && !base.contains(&ext) {
+            base.push(ext);
+        }
+    }
+    for (ext, _) in MediaType::known_extensions() {
+        if !base.iter().any(|e| e == ext) {
+            base.push(ext.to_string());
+        }
+    }
+
+    let mut candidates: Vec<(String, f32)> = base
+        .into_iter()
+        .map(|ext| {
+            let essence = MediaType::from_extension(&ext).unwrap_or_else(MediaType::octet_stream);
+            let q = ranges
+                .iter()
+                .map(|r| accept_match_q(essence.essence(), r))
+                .fold(0.0_f32, f32::max);
+            (ext, q)
+        })
+        .collect();
+    // Stable sort by descending quality; ties keep the base preference order.
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.into_iter().map(|(ext, _)| ext).collect()
 }
 
 fn parse_range(header: &str) -> Option<ByteRange> {
@@ -157,6 +268,7 @@ impl Service for FileService {
         let site = &self.site;
         let range = msg.header("range").and_then(parse_range);
         let if_none_match = msg.header("if-none-match").map(String::from);
+        let accept = msg.header("accept").map(String::from);
 
         // MOVE renames a file within this store (the `move` facet). The
         // `Destination` header is addressed like any path; map it into the
@@ -235,27 +347,97 @@ impl Service for FileService {
                     .await
                 {
                     Ok(resp) => Ok(resp),
-                    // SPA fallback: an extension-less miss is a client-side
-                    // route — serve the root default with 200. Asset misses
-                    // (paths with extensions) stay honest 404s.
                     Err(e)
-                        if e.code == crate::error::codes::NOT_FOUND
-                            && site.spa_fallback
-                            && !path.rsplit('/').next().unwrap_or("").contains('.') =>
+                        if e.code == crate::error::codes::NOT_FOUND && is_extensionless(&path) =>
                     {
-                        let default = site.default_resource.as_deref().unwrap_or("index.html");
-                        self.serve_file(msg.response(StatusCode::OK, None), range, if_none_match, files, &format!("/{default}"))
-                            .await
+                        // Friendly URL: resolve `/docs/readme` to a stored
+                        // `docs/readme.<ext>` (Accept-negotiated). A real file
+                        // beats the SPA shell, so try this first.
+                        if site.friendly_urls {
+                            if let Some(real) = self
+                                .resolve_friendly(
+                                    &path,
+                                    accept.as_deref(),
+                                    files,
+                                    &site.extension_priority,
+                                )
+                                .await?
+                            {
+                                let mut resp = self
+                                    .serve_file(
+                                        msg.response(StatusCode::OK, None),
+                                        range,
+                                        if_none_match,
+                                        files,
+                                        &real,
+                                    )
+                                    .await?;
+                                resp.set_header(
+                                    "content-location",
+                                    &format!("{}{}", msg.url.base_path, real),
+                                );
+                                return Ok(resp);
+                            }
+                        }
+                        // SPA fallback: an extension-less miss is a client-side
+                        // route — serve the root default with 200. Asset misses
+                        // (paths with extensions) stay honest 404s.
+                        if site.spa_fallback {
+                            let default = site.default_resource.as_deref().unwrap_or("index.html");
+                            return self
+                                .serve_file(
+                                    msg.response(StatusCode::OK, None),
+                                    range,
+                                    if_none_match,
+                                    files,
+                                    &format!("/{default}"),
+                                )
+                                .await;
+                        }
+                        Err(e)
                     }
                     Err(e) => Err(e),
                 }
             }
             Method::HEAD => {
-                let meta = files.head(&path).await?;
+                // Resolve the same way GET does: exact match, then (if the path
+                // is extension-less and friendly URLs are on) a negotiated probe.
+                let resolved = match files.head(&path).await {
+                    Ok(meta) => Some((path.clone(), meta)),
+                    Err(e)
+                        if e.code == crate::error::codes::NOT_FOUND
+                            && site.friendly_urls
+                            && is_extensionless(&path) =>
+                    {
+                        match self
+                            .resolve_friendly(
+                                &path,
+                                accept.as_deref(),
+                                files,
+                                &site.extension_priority,
+                            )
+                            .await?
+                        {
+                            Some(real) => {
+                                let meta = files.head(&real).await?;
+                                Some((real, meta))
+                            }
+                            None => None,
+                        }
+                    }
+                    Err(e) => return Err(e),
+                };
+                let (real, meta) = match resolved {
+                    Some(r) => r,
+                    None => return Err(RsError::not_found(format!("'{path}' does not exist"))),
+                };
                 let mut resp = msg.response(StatusCode::OK, None);
                 resp.set_header("content-length", &meta.size.to_string());
                 resp.set_header("accept-ranges", "bytes");
-                resp.set_header("content-type", &MediaType::for_path(&path).to_string());
+                resp.set_header("content-type", &MediaType::for_path(&real).to_string());
+                if real != path {
+                    resp.set_header("content-location", &format!("{}{}", msg.url.base_path, real));
+                }
                 Ok(resp)
             }
             // Store contract: keyless POST to a container creates a
@@ -292,11 +474,27 @@ impl Service for FileService {
                     Some(b) => b,
                     None => return Err(RsError::bad_request("write requires a body")),
                 };
+                // Friendly URLs: an extension-less write pins to the canonical
+                // top-priority slot (`E1`), so a no-`Accept` GET of the slug
+                // always returns this write and no later sibling can outrank it.
+                // The declared Content-Type is intentionally discarded — pin to
+                // `E1` regardless. Without a configured priority there's no slot
+                // to pin to, so the write is a 400.
+                let store_path = if site.friendly_urls && is_extensionless(&path) {
+                    let e1 = site.extension_priority.first().ok_or_else(|| {
+                        RsError::bad_request(
+                            "extension-less write requires a configured 'extensionPriority'",
+                        )
+                    })?;
+                    format!("{}.{}", path, e1.trim_start_matches('.').to_ascii_lowercase())
+                } else {
+                    path.clone()
+                };
                 // Fully streamed: the body flows to the store without
                 // materializing (G7 holds for the single-step case). With a
                 // conditional header the store does a best-effort (or atomic)
                 // check-then-write; an empty precondition is a plain upsert.
-                let outcome = files.write_cond(&path, body, precondition).await?;
+                let outcome = files.write_cond(&store_path, body, precondition).await?;
                 let template = Message::request(msg.method.clone(), &msg.url.path, &msg.tenant);
                 let mut resp = template.response(
                     if outcome.created { StatusCode::CREATED } else { StatusCode::OK },
@@ -305,6 +503,15 @@ impl Service for FileService {
                 resp.trace = msg.trace.clone();
                 if let Some(etag) = &outcome.etag {
                     resp.set_header("etag", etag);
+                }
+                // Pinned write: advertise the request URL as canonical and the
+                // real stored path so clients can discover the chosen extension.
+                if store_path != path {
+                    resp.set_header("location", &format!("{}{}", msg.url.base_path, path));
+                    resp.set_header(
+                        "content-location",
+                        &format!("{}{}", msg.url.base_path, store_path),
+                    );
                 }
                 Ok(resp)
             }
@@ -320,7 +527,25 @@ impl Service for FileService {
                         files.delete_dir(&path).await?;
                     }
                 } else {
-                    files.delete(&path).await?;
+                    // Mirror GET precedence: exact match first, then (friendly
+                    // URLs on) the pinned `E1` a no-`Accept` GET would resolve.
+                    match files.delete(&path).await {
+                        Ok(()) => {}
+                        Err(e)
+                            if e.code == crate::error::codes::NOT_FOUND
+                                && site.friendly_urls
+                                && is_extensionless(&path) =>
+                        {
+                            match self
+                                .resolve_friendly(&path, None, files, &site.extension_priority)
+                                .await?
+                            {
+                                Some(real) => files.delete(&real).await?,
+                                None => return Err(e),
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Ok(msg.no_content())
             }
@@ -331,5 +556,56 @@ impl Service for FileService {
                 format!("file service does not support {}", msg.method),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extensionless_detects_final_segment() {
+        assert!(is_extensionless("/docs/readme"));
+        assert!(is_extensionless("/readme"));
+        assert!(!is_extensionless("/docs/readme.md"));
+        // A dot earlier in the path doesn't count — only the final segment.
+        assert!(is_extensionless("/v1.2/readme"));
+    }
+
+    #[test]
+    fn negotiate_defaults_to_table_order() {
+        // No configured priority, no Accept → built-in table order (HTML first).
+        let order = negotiate_extensions(None, &[]);
+        assert_eq!(order.first().map(String::as_str), Some("html"));
+        let star = negotiate_extensions(Some("*/*"), &[]);
+        assert_eq!(star.first().map(String::as_str), Some("html"));
+    }
+
+    #[test]
+    fn negotiate_honors_accept() {
+        let md = negotiate_extensions(Some("text/markdown"), &[]);
+        assert_eq!(md.first().map(String::as_str), Some("md"));
+        // A type wildcard floats every image type above non-images.
+        let img = negotiate_extensions(Some("image/*"), &[]);
+        assert!(matches!(
+            img.first().map(String::as_str),
+            Some("svg" | "png" | "jpg" | "jpeg" | "gif" | "webp")
+        ));
+        // q-weighting: lower q for html lets markdown win.
+        let weighted = negotiate_extensions(Some("text/html;q=0.1, text/markdown;q=0.9"), &[]);
+        assert_eq!(weighted.first().map(String::as_str), Some("md"));
+    }
+
+    #[test]
+    fn negotiate_fronts_configured_priority() {
+        let priority = vec!["md".to_string(), "json".to_string()];
+        // No Accept → priority[0] is first, regardless of built-in table order.
+        let order = negotiate_extensions(None, &priority);
+        assert_eq!(order.first().map(String::as_str), Some("md"));
+        // Other known types still resolvable (appended after the priority front).
+        assert!(order.iter().any(|e| e == "html"));
+        // Accept still reorders among existing types (explicit opt-out).
+        let html = negotiate_extensions(Some("text/html"), &priority);
+        assert_eq!(html.first().map(String::as_str), Some("html"));
     }
 }

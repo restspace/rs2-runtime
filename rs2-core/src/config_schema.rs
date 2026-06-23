@@ -170,13 +170,30 @@ pub struct FileConfig {
     pub spa_fallback: bool,
     /// Whether directory GETs return `dir+json` listings (default `true`).
     pub listings: bool,
+    /// Serve files at extension-less "friendly" URLs (e.g. `/docs/readme`
+    /// resolves `docs/readme.md`). Exact matches still win; on a stem
+    /// collision the variant is chosen by `Accept` negotiation. Default `false`.
+    pub friendly_urls: bool,
+    /// Extension preference (no dots, e.g. `["html", "md"]`) for friendly URLs.
+    /// Its first entry is the canonical slot an extension-less PUT pins to (so a
+    /// no-`Accept` GET of the slug always returns that write); the list also
+    /// fronts the GET probe order. Required for extension-less PUTs when
+    /// `friendlyUrls` is on (empty → such a PUT is a 400).
+    pub extension_priority: Vec<String>,
     /// Backend selection (`store.adapter`); see [`StoreConfig`].
     pub store: Option<StoreConfig>,
 }
 
 impl Default for FileConfig {
     fn default() -> Self {
-        FileConfig { default_resource: None, spa_fallback: false, listings: true, store: None }
+        FileConfig {
+            default_resource: None,
+            spa_fallback: false,
+            listings: true,
+            friendly_urls: false,
+            extension_priority: Vec::new(),
+            store: None,
+        }
     }
 }
 

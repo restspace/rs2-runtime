@@ -86,30 +86,51 @@ impl MediaType {
         self.essence == DIR_JSON
     }
 
+    /// Known `(extension, essence)` pairs, in friendly-URL preference order
+    /// (human-readable docs first, then structured data, then assets). This is
+    /// the single source for both [`MediaType::from_extension`] and
+    /// [`MediaType::known_extensions`], so the two can't drift.
+    const EXTENSION_TABLE: &'static [(&'static str, &'static str)] = &[
+        ("html", "text/html"),
+        ("htm", "text/html"),
+        ("md", "text/markdown"),
+        ("txt", "text/plain"),
+        ("json", JSON),
+        ("xml", "application/xml"),
+        ("yaml", "application/yaml"),
+        ("yml", "application/yaml"),
+        ("csv", "text/csv"),
+        ("css", "text/css"),
+        ("js", "text/javascript"),
+        ("mjs", "text/javascript"),
+        ("jsx", "text/javascript"),
+        ("ts", "application/typescript"),
+        ("tsx", "application/typescript"),
+        ("svg", "image/svg+xml"),
+        ("png", "image/png"),
+        ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"),
+        ("gif", "image/gif"),
+        ("webp", "image/webp"),
+        ("pdf", "application/pdf"),
+        ("zip", "application/zip"),
+        ("wasm", "application/wasm"),
+    ];
+
     /// Media type from a file extension; `None` if unknown.
     pub fn from_extension(ext: &str) -> Option<Self> {
-        let essence = match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
-            "json" => JSON,
-            "txt" => "text/plain",
-            "html" | "htm" => "text/html",
-            "css" => "text/css",
-            "csv" => "text/csv",
-            "md" => "text/markdown",
-            "xml" => "application/xml",
-            "js" | "mjs" | "jsx" => "text/javascript",
-            "ts" | "tsx" => "application/typescript",
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "svg" => "image/svg+xml",
-            "webp" => "image/webp",
-            "pdf" => "application/pdf",
-            "zip" => "application/zip",
-            "wasm" => "application/wasm",
-            "yaml" | "yml" => "application/yaml",
-            _ => return None,
-        };
-        Some(Self::new(essence))
+        let ext = ext.trim_start_matches('.').to_ascii_lowercase();
+        Self::EXTENSION_TABLE
+            .iter()
+            .find(|(e, _)| *e == ext)
+            .map(|(_, essence)| Self::new(essence))
+    }
+
+    /// Every known `(extension-without-dot, media type)` pair, in friendly-URL
+    /// preference order. Used to probe candidate files for an extension-less
+    /// request.
+    pub fn known_extensions() -> impl Iterator<Item = (&'static str, MediaType)> {
+        Self::EXTENSION_TABLE.iter().map(|(ext, essence)| (*ext, Self::new(essence)))
     }
 
     /// Determine a media type for a stored file path (extension map),
