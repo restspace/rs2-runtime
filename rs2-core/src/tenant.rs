@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::capabilities::{DataStore, FileStore, ScopedDataStore, ScopedFileStore, ScopedQueryStore};
+use crate::capabilities::{
+    DataStore, FileStore, ScopedDataStore, ScopedFileStore, ScopedQueryStore, ScopedSmsGateway,
+};
 use crate::error::RsError;
 use crate::router::{Mount, MountTable};
 use crate::services::{DataService, FileService, Service, ServiceContext};
@@ -70,6 +72,10 @@ pub struct Adapters {
     /// Query store (PRD §10.4). Defaults to the reference adapter scanning
     /// the data store; SQL adapters push queries down.
     pub query: Arc<dyn crate::capabilities::QueryStore>,
+    /// Optional embedder-supplied default SMS gateway (PRD §9.2). There is no
+    /// node default, so an `sms` mount normally names a `code:`/`infra:` adapter;
+    /// this is the fallback when the mount sets no `store.adapter`.
+    pub sms: Option<Arc<dyn crate::capabilities::SmsGateway>>,
     /// Outbound HTTP (PRD §9.2): granted per mount with allowed-host
     /// patterns; `None` disables external calls entirely.
     pub http: Option<Arc<dyn crate::capabilities::HttpOut>>,
@@ -110,14 +116,17 @@ impl Adapters {
 
         // Seed the node built-ins under their canonical names.
         //
-        // `local` hands back the node file store itself (a `file` mount's
-        // default *is* the local filesystem), so `builtin:local` shares it.
-        // `mem`, by contrast, is its own dedicated in-memory store: the node
-        // default data adapter may be something else entirely (the server
-        // defaults it to file-backed), so `builtin:mem` must always mean an
-        // in-memory store, not "whatever the default is". `reference` rebuilds
-        // the scanning query adapter over the default data store. Factories
-        // ignore their config for now.
+        // `local` hands back the node file store, rooted under `store.root`
+        // when one is given (so a primary `builtin:local` mount is isolated —
+        // `file_capability` *requires* the root). Without a root it returns the
+        // bare node store: that's the spec-store backend path, where the
+        // `SpecStore` applies its own root. `mem`, by contrast, is a single
+        // dedicated in-memory store shared by the node default and every
+        // `builtin:mem` mount: the node default data adapter may be something
+        // else entirely (the server defaults it to file-backed), so `builtin:mem`
+        // must always mean an in-memory store, not "whatever the default is" —
+        // but it offers no per-mount isolation (it ignores `root`). `reference`
+        // rebuilds the scanning query adapter over the default data store.
         let mut builtins = crate::adapters::BuiltinRegistry::default();
         builtins.register_data("mem", {
             let mem: Arc<dyn DataStore> = Arc::new(crate::adapters::MemDataStore::new());
@@ -125,7 +134,15 @@ impl Adapters {
         });
         builtins.register_files("local", {
             let files = files.clone();
-            Arc::new(move |_cfg: &serde_json::Value| Ok(files.clone()))
+            Arc::new(move |cfg: &serde_json::Value| {
+                Ok(match crate::capabilities::sanitized_store_root(cfg)? {
+                    Some(root) => Arc::new(crate::capabilities::PrefixedFileStore::new(
+                        files.clone(),
+                        root,
+                    )) as Arc<dyn FileStore>,
+                    None => files.clone(),
+                })
+            })
         });
         builtins.register_query("reference", {
             let data = data.clone();
@@ -139,6 +156,7 @@ impl Adapters {
             files,
             query,
             data,
+            sms: None,
             idempotency: Arc::new(crate::idempotency::MemIdempotencyStore::default()),
             http: None,
             log: Arc::new(crate::logging::NullLogStore),
@@ -190,6 +208,13 @@ impl Adapters {
 
     pub fn with_http(mut self, http: Arc<dyn crate::capabilities::HttpOut>) -> Self {
         self.http = Some(http);
+        self
+    }
+
+    /// Supply an embedder default SMS gateway, used by an `sms` mount that names
+    /// no `store.adapter`.
+    pub fn with_sms(mut self, sms: Arc<dyn crate::capabilities::SmsGateway>) -> Self {
+        self.sms = Some(sms);
         self
     }
 
@@ -376,6 +401,8 @@ impl Tenant {
                 )?),
                 "services" => Arc::new(crate::services::ServicesService::new()),
                 "log" => Arc::new(crate::services::LogReaderService::new()),
+                "sms" => Arc::new(crate::services::SmsService::new()),
+                "proxy" => Arc::new(crate::services::ProxyService::new()),
                 code_ref if code_ref.starts_with("code:") => {
                     Arc::new(crate::services::CodeService::from_ref(code_ref)?)
                 }
@@ -393,6 +420,14 @@ impl Tenant {
             let files = file_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
             let data = data_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
             let query = query_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
+            let sms = sms_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
+
+            // Resolve secrets and outbound credential injectors once, host-side,
+            // so the secret material lands only in the injector / `secrets` map —
+            // never echoed back into the mount `config`.
+            let mount_secrets = resolve_secrets(&mount.config, config.secrets.as_ref());
+            let outbound_injectors =
+                resolve_outbound_injectors(mount, &infras, name, mount_secrets.as_ref())?;
 
             // Capability grants: each instance gets handles pre-scoped to
             // this tenant — host-enforced isolation (PRD §9.2).
@@ -401,6 +436,7 @@ impl Tenant {
                 files,
                 data,
                 query,
+                sms,
                 http: adapters.http.clone(),
                 cache_policy: crate::wrapper::CachePolicy::from_config(mount.config.get("caching")),
                 cache_openly_readable: crate::wrapper::CachePolicy::mount_is_openly_readable(&mount.config),
@@ -447,7 +483,8 @@ impl Tenant {
                 },
                 // Default-deny: only the secrets this mount's grant names, looked
                 // up in the tenant `secrets` block, resolved host-side.
-                secrets: resolve_secrets(&mount.config, config.secrets.as_ref()),
+                secrets: mount_secrets,
+                outbound_injectors,
             };
             instances.insert(mount.base_path.clone(), (service, Arc::new(ctx)));
         }
@@ -486,6 +523,13 @@ fn check_elevate_not_operator(mount: &Mount, operator_roles: Option<&str>) -> Re
     }
     Ok(())
 }
+
+/// The built-in names that alias the node's own default stores: selecting one
+/// as a *primary* mount backend therefore requires an explicit `store.root` so
+/// the mount is physically isolated (`require_store_root`). Other built-ins (and
+/// the spec-store backend path) manage their own namespacing.
+const NODE_DATA_BUILTIN: &str = "file";
+const NODE_FILE_BUILTIN: &str = "local";
 
 /// A resolved storage backend selection, after any `infra:<name>` expansion.
 /// `builtin:<name>` picks a built-in Rust adapter from the registry;
@@ -608,6 +652,109 @@ fn resolve_secrets(
     (!out.is_empty()).then_some(out)
 }
 
+/// Resolve a mount's outbound credential injectors from its `httpOut` grants'
+/// `inject` refs. Two forms (PRD §9.2 credential-injection-without-disclosure):
+///
+/// - `"inject": "infra:<name>"` — the operator infra supplies the whole strategy
+///   (`{"auth":…}` + secret) in `infras.json`; the tenant only names it.
+/// - `"inject": { "auth": …, "token": "secret:<name>", … }` — an inline strategy
+///   where any `secret:<name>` leaf is replaced by the mount's granted secret.
+///
+/// Either way the secret is read here, host-side, and returned inside the
+/// injector — never written back to the mount `config`. Runs at build time, so a
+/// bad ref or strategy is a 400 at config PUT.
+fn resolve_outbound_injectors(
+    mount: &Mount,
+    infras: &crate::infra::InfraSet,
+    tenant: &str,
+    secrets: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<HashMap<String, Arc<crate::adapters::CredentialInjector>>, RsError> {
+    let mut out = HashMap::new();
+    // Each `httpOut` grant on a code service may carry its own `inject`.
+    if let Some(grants) = mount.config.get("grants").and_then(|g| g.as_object()) {
+        for (capability, grant) in grants {
+            if let Some(inject) = grant.get("inject") {
+                if let Some(inj) = resolve_one_injector(capability, inject, infras, tenant, secrets)? {
+                    out.insert(capability.clone(), Arc::new(inj));
+                }
+            }
+        }
+    }
+    // A `proxy` mount carries a single top-level `inject`, stored under a
+    // reserved key the service reads (a proxy mount has no `grants`).
+    if mount.service == "proxy" {
+        if let Some(inject) = mount.config.get("inject") {
+            if let Some(inj) =
+                resolve_one_injector("proxy", inject, infras, tenant, secrets)?
+            {
+                out.insert(crate::services::PROXY_INJECTOR_KEY.to_string(), Arc::new(inj));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve a single `inject` value (a grant's, or a proxy mount's) to a
+/// [`CredentialInjector`]. `label` names the source for error messages.
+fn resolve_one_injector(
+    label: &str,
+    inject: &serde_json::Value,
+    infras: &crate::infra::InfraSet,
+    tenant: &str,
+    secrets: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<Option<crate::adapters::CredentialInjector>, RsError> {
+    match inject {
+        serde_json::Value::String(s) if s.starts_with("infra:") => {
+            let placeholder = serde_json::json!({ "adapter": s });
+            let merged = crate::infra::expand_infra(&placeholder, infras, tenant)?;
+            crate::adapters::CredentialInjector::from_config(&merged)
+        }
+        serde_json::Value::String(s) => Err(RsError::bad_request(format!(
+            "'{label}' inject string must be 'infra:<name>' (got '{s}'); use an object to inject \
+             from tenant secrets"
+        ))),
+        serde_json::Value::Object(_) => {
+            let resolved = substitute_secret_refs(inject, secrets)?;
+            crate::adapters::CredentialInjector::from_config(&resolved)
+        }
+        _ => Err(RsError::bad_request(format!(
+            "'{label}' inject must be 'infra:<name>' or an inline object"
+        ))),
+    }
+}
+
+/// Replace every `secret:<name>` string leaf in an inline inject config with the
+/// mount's granted secret value (host-side). Default-deny: an unknown/ungranted
+/// name is a 400. Non-`secret:` strings pass through unchanged.
+fn substitute_secret_refs(
+    value: &serde_json::Value,
+    secrets: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Result<serde_json::Value, RsError> {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                out.insert(k.clone(), substitute_secret_refs(v, secrets)?);
+            }
+            Ok(Value::Object(out))
+        }
+        Value::String(s) => match s.strip_prefix("secret:") {
+            Some(name) => match secrets.and_then(|m| m.get(name)) {
+                Some(v @ Value::String(_)) => Ok(v.clone()),
+                Some(_) => Err(RsError::bad_request(format!(
+                    "secret '{name}' must be a string to use in an inject strategy"
+                ))),
+                None => Err(RsError::bad_request(format!(
+                    "inject references secret '{name}' not granted to this mount"
+                ))),
+            },
+            None => Ok(value.clone()),
+        },
+        _ => Ok(value.clone()),
+    }
+}
+
 /// Resolve a mount's `data` capability. Absent `store.adapter` ⇒ the node
 /// built-in; `builtin:<name>` ⇒ a registered Rust adapter; `code:…` ⇒ a
 /// resident JS loadable adapter (G13 Phase 2), loaded lazily from the tenant
@@ -623,6 +770,14 @@ fn data_capability(
     match kind {
         StoreKind::Default => Ok(Some(ScopedDataStore::new(adapters.data.clone(), name))),
         StoreKind::Builtin(builtin) => {
+            // `builtin:file` aliases the node default data store; an explicit
+            // selection must root itself for per-mount isolation (a missing
+            // `root` is a config 400, preventing a public-write mount from
+            // sharing the store `auth` reads users from). `builtin:mem` is a
+            // dedicated shared in-memory store and intentionally ignores `root`.
+            if builtin == NODE_DATA_BUILTIN {
+                crate::capabilities::require_store_root(&store)?;
+            }
             let inner = adapters
                 .builtins
                 .build_data(&builtin, &store)?
@@ -659,6 +814,16 @@ fn file_capability(
     infras: &crate::infra::InfraSet,
 ) -> Result<Option<ScopedFileStore>, RsError> {
     let (kind, store) = expand_store(mount, "file", name, infras)?;
+    // `builtin:local` aliases the node file store; selecting it as a primary
+    // file backend must root itself for per-mount isolation (a missing `root`
+    // is a config 400). Spec stores reuse this adapter via `build_file_backend`
+    // directly and root themselves, so the requirement lives here, not in the
+    // factory.
+    if let StoreKind::Builtin(builtin) = &kind {
+        if builtin == NODE_FILE_BUILTIN {
+            crate::capabilities::require_store_root(&store)?;
+        }
+    }
     let inner = build_file_backend(kind, &store, adapters, "file", mount, name, limits)?;
     Ok(Some(ScopedFileStore::new(inner, name)))
 }
@@ -698,6 +863,51 @@ fn query_capability(
             {
                 let _ = limits;
                 Err(loadable_without_js("query", mount, &adapter_ref))
+            }
+        }
+    }
+}
+
+/// Resolve an `sms` mount's gateway. Only the `sms` service gets it (every other
+/// mount sees `None`). `code:…` ⇒ a resident JS provider adapter; `infra:<name>`
+/// ⇒ an operator infra resolving to one; absent `store.adapter` ⇒ the embedder
+/// default if any, else a config 400. `builtin:` is reserved for a future
+/// first-party provider — none ship today, so it is a clear 400 (use `code:`).
+fn sms_capability(
+    mount: &Mount,
+    adapters: &Adapters,
+    name: &str,
+    limits: crate::contract::InvocationLimits,
+    infras: &crate::infra::InfraSet,
+) -> Result<Option<ScopedSmsGateway>, RsError> {
+    if mount.service != "sms" {
+        return Ok(None);
+    }
+    let (kind, store) = expand_store(mount, "sms", name, infras)?;
+    match kind {
+        StoreKind::Default => match &adapters.sms {
+            Some(sms) => Ok(Some(ScopedSmsGateway::new(sms.clone(), name))),
+            None => Err(RsError::bad_request(
+                "sms mount requires a store.adapter ('code:<name>@<version>' or 'infra:<name>')",
+            )),
+        },
+        StoreKind::Builtin(builtin) => Err(RsError::bad_request(format!(
+            "sms store adapter 'builtin:{builtin}' is unknown (no first-party SMS providers ship \
+             yet; use a 'code:<name>@<version>' adapter)"
+        ))),
+        StoreKind::Code(adapter_ref) => {
+            #[cfg(feature = "js")]
+            {
+                let files = ScopedFileStore::new(adapters.files.clone(), name);
+                let guest = crate::engines::resident::GuestSmsGateway::from_config(
+                    &adapter_ref, &store, files, name, limits,
+                )?;
+                Ok(Some(ScopedSmsGateway::new(Arc::new(guest), name)))
+            }
+            #[cfg(not(feature = "js"))]
+            {
+                let _ = (limits, &store);
+                Err(loadable_without_js("sms", mount, &adapter_ref))
             }
         }
     }

@@ -178,6 +178,42 @@ pub trait HttpOut: Send + Sync {
     async fn request(&self, msg: Message) -> Result<Message, RsError>;
 }
 
+/// Outbound SMS behind a swappable provider adapter (Twilio, AWS SNS, …) — the
+/// reference *typed provider capability* (PRD §9.2): the canonical interface a
+/// tenant's app speaks, while the adapter maps it to one provider's wire format
+/// and auth. Like [`QueryStore`], it is one trait with many provider impls
+/// (a Rust built-in or a loadable `code:` guest), selected by config — a new
+/// provider needs no recompile. `tenant` is supplied by the host scoping
+/// wrapper, never by service code.
+#[async_trait]
+pub trait SmsGateway: Send + Sync {
+    /// Send a text message to `to`; returns the provider's message id.
+    async fn send(&self, tenant: &str, to: &str, body: &str) -> Result<String, RsError>;
+    /// Delivery status of a previously sent message (provider-shaped JSON).
+    async fn status(&self, tenant: &str, id: &str) -> Result<serde_json::Value, RsError>;
+}
+
+/// A [`SmsGateway`] handle pre-scoped to one tenant — the only form services see.
+#[derive(Clone)]
+pub struct ScopedSmsGateway {
+    inner: Arc<dyn SmsGateway>,
+    tenant: String,
+}
+
+impl ScopedSmsGateway {
+    pub fn new(inner: Arc<dyn SmsGateway>, tenant: &str) -> Self {
+        ScopedSmsGateway { inner, tenant: tenant.to_string() }
+    }
+
+    pub async fn send(&self, to: &str, body: &str) -> Result<String, RsError> {
+        self.inner.send(&self.tenant, to, body).await
+    }
+
+    pub async fn status(&self, id: &str) -> Result<serde_json::Value, RsError> {
+        self.inner.status(&self.tenant, id).await
+    }
+}
+
 /// Parameterized queries against a backing store (PRD §10.4) — the RS2
 /// equivalent of v1's `IQueryAdapter`, language-agnostic by design.
 ///
@@ -307,6 +343,63 @@ impl FileStore for PrefixedFileStore {
     async fn list(&self, tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
         self.inner.list(tenant, &self.join(path), take, skip).await
     }
+}
+
+/// Read an optional, **safe** storage root from a mount's expanded `store`
+/// config (the value a built-in registry factory receives). `Ok(None)` when no
+/// (or an empty) `root` is set; `Ok(Some(trimmed))` for a present root; a config
+/// error (a 400 at `PUT /raw` build time) for an unsafe one.
+///
+/// The root is sanitized against path-traversal and absolute escapes (`..`, a
+/// leading `/`/`\`, or a drive letter) rather than silently normalized, so an
+/// unsafe value is rejected outright. A built-in file/local factory uses this
+/// to root its backing store under the mount's prefix when a root is given;
+/// [`require_store_root`] is the variant that *demands* one.
+pub fn sanitized_store_root(store: &serde_json::Value) -> Result<Option<String>, RsError> {
+    let Some(root) = store
+        .get("root")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    // Reject absolute paths and Windows drive letters (`C:\…`), which would
+    // escape the tenant/node storage area.
+    let bytes = root.as_bytes();
+    if root.starts_with('/') || root.starts_with('\\') || (bytes.len() >= 2 && bytes[1] == b':') {
+        return Err(RsError::bad_request(format!(
+            "store root '{root}' must be a relative path (no leading '/'/'\\' or drive letter)"
+        )));
+    }
+    // Reject `..` traversal in any path component (either separator).
+    if root.split(['/', '\\']).any(|c| c == "..") {
+        return Err(RsError::bad_request(format!(
+            "store root '{root}' must not contain a '..' path segment"
+        )));
+    }
+    Ok(Some(root.trim_matches('/').to_string()))
+}
+
+/// Resolve a **required, safe** storage root from an explicit `builtin:file` /
+/// `builtin:local` *primary mount* store. Errors (a 400 at build time) when no
+/// root is set.
+///
+/// An explicit node-aliasing built-in backend (`builtin:file` for `data`,
+/// `builtin:local` for `file`) means the mount wants its own physical store, so
+/// a missing `root` is a hard error: sharing the node default would silently
+/// collide datasets/paths across mounts (an isolation/auth bypass). Mounts that
+/// genuinely want the shared default simply omit the `store` block entirely.
+/// (Spec stores reuse the same factory but apply their own root, so they go
+/// through [`sanitized_store_root`], not this.)
+pub fn require_store_root(store: &serde_json::Value) -> Result<String, RsError> {
+    sanitized_store_root(store)?.ok_or_else(|| {
+        RsError::bad_request(
+            "an explicit 'builtin:file'/'builtin:local' store requires a non-empty 'root' (each \
+             such mount gets its own physical store); omit the 'store' block to share the node \
+             default instead",
+        )
+    })
 }
 
 /// A [`FileStore`] handle pre-scoped to one tenant — the only form services see.

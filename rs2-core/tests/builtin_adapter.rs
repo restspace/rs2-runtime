@@ -90,12 +90,12 @@ async fn builtin_mem_is_a_shared_store_independent_of_the_default() {
 }
 
 #[tokio::test]
-async fn builtin_local_file_store_matches_default() {
+async fn builtin_local_is_rooted_and_isolated_from_the_default() {
     let dir = tempfile::tempdir().unwrap();
     let rt = runtime_with(
         json!([
             { "path": "/fd", "service": "file", "config": { "access": "open" } },
-            { "path": "/fb", "service": "file", "config": { "access": "open", "store": { "adapter": "builtin:local" } } }
+            { "path": "/fb", "service": "file", "config": { "access": "open", "store": { "adapter": "builtin:local", "root": ".rs2-fb" } } }
         ]),
         dir.path(),
     );
@@ -108,14 +108,30 @@ async fn builtin_local_file_store_matches_default() {
         .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED));
 
-    let mut resp = rt.handle(req(Method::GET, "/fd/docs/a.txt")).await;
-    assert_eq!(resp.status, Some(StatusCode::OK));
-    let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
+    // The default file mount must NOT see the rooted mount's write — each
+    // explicit `builtin:local` store is physically isolated (the security fix).
+    let resp = rt.handle(req(Method::GET, "/fd/docs/a.txt")).await;
     assert_eq!(
-        &bytes[..],
-        b"alpha",
-        "builtin:local must share the default file store"
+        resp.status,
+        Some(StatusCode::NOT_FOUND),
+        "builtin:local must be isolated from the default file store"
     );
+}
+
+#[tokio::test]
+async fn builtin_local_without_a_root_is_a_config_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime_with(
+        json!([
+            { "path": "/fb", "service": "file", "config": { "access": "open", "store": { "adapter": "builtin:local" } } }
+        ]),
+        dir.path(),
+    );
+
+    let mut resp = rt.handle(req(Method::GET, "/fb/docs/a.txt")).await;
+    assert_eq!(resp.status, Some(StatusCode::BAD_REQUEST));
+    let text = error_text(&mut resp).await;
+    assert!(text.contains("root"), "explains a root is required: {text}");
 }
 
 #[tokio::test]

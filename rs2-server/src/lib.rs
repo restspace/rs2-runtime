@@ -633,8 +633,21 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
         let data_fs = data_fs.clone();
         adapters.builtins.register_data(
             "file",
-            Arc::new(move |_cfg| {
-                Ok(Arc::new(rs2_core::adapters::FileDataStore::new(data_fs.clone()))
+            // Roots the file-backed data store under `store.root` when given, so
+            // each explicit `builtin:file` mount gets an isolated physical store.
+            // The "explicit selection requires a root" rule is enforced at the
+            // mount layer (`data_capability` in rs2-core); without a root this
+            // returns the bare node-default data store.
+            Arc::new(move |cfg| {
+                let backed: Arc<dyn rs2_core::capabilities::FileStore> =
+                    match rs2_core::capabilities::sanitized_store_root(cfg)? {
+                        Some(root) => Arc::new(rs2_core::capabilities::PrefixedFileStore::new(
+                            data_fs.clone(),
+                            root,
+                        )),
+                        None => data_fs.clone(),
+                    };
+                Ok(Arc::new(rs2_core::adapters::FileDataStore::new(backed))
                     as Arc<dyn rs2_core::capabilities::DataStore>)
             }),
         );
