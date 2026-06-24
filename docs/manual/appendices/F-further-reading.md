@@ -16,7 +16,7 @@ serve adjacent audiences.
 
 ## The operator skill
 
-`C:\dev\rs2-skill` is the **user-facing skill** — a concise operational reference
+The `rs2-skill` repo is the **user-facing skill** — a concise operational reference
 for driving a running RS2 server. It covers the same surface as this manual in
 terse, lookup-oriented form:
 
@@ -34,7 +34,7 @@ concepts.
 
 ## Specification
 
-The **PRD** (`C:\dev\rs-runtime\docs\PRD-runtime-v2.md`) is the product
+The **PRD** (`PRD-runtime-v2.md`, in the `rs-runtime` repo) is the product
 requirements document the runtime implements. Section references in this manual
 (e.g. "PRD §9.2") point into it. It's the place to understand intended behavior at
 the spec level, including open questions and milestone scope.

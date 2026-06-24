@@ -6,7 +6,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+# Open-source under AGPL-3.0; a commercial license is available for closed-source
+# embedding or hosted offerings. See LICENSING.md.
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 async-trait = "0.1"

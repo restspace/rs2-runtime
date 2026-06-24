@@ -46,14 +46,14 @@ by hand.
 
 ## Keep the skill in sync
 
-`C:\dev\rs2-skill` is the user-facing skill (operating an RS2 server). When a
+The `rs2-skill` repo is the user-facing skill (operating an RS2 server). When a
 change adds or alters a config field, endpoint, header, or facet, update the
 matching `references/*.md` (and `SKILL.md` if the service list or triggers
 change) in the same pass. This repo's `README.md` tracks build/run/status.
 
 ## Memory
 
-Durable project state lives at
-`C:\Users\james\.claude\projects\C--dev-rs2-runtime\memory\rs2-m1-status.md`
-(indexed from `MEMORY.md`). Update it when milestones, gotchas, or wasmtime/v8
-API notes change — it's the cross-session source of truth for "what's built".
+Durable project state lives in the agent's local project memory directory
+(`rs2-m1-status.md`, indexed from `MEMORY.md`). Update it when milestones,
+gotchas, or wasmtime/v8 API notes change — it's the cross-session source of
+truth for "what's built".

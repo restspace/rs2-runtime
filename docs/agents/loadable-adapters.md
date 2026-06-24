@@ -13,7 +13,7 @@ APIs or a raw-socket protocol implementation.
 
 Phased; each phase is its own commit(s). Run the matrix before each commit:
 `cargo test -p rs2-core` (native), `--features js`, `--features wasm` (build),
-and `cargo build` (workspace). Per AGENTS.md, update `C:\dev\rs2-skill` for any
+and `cargo build` (workspace). Per AGENTS.md, update the `rs2-skill` repo for any
 user-visible change in the same pass.
 
 ## Phase 0 — deno_core engine swap — DONE (`e8f1ec3`)

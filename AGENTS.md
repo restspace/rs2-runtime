@@ -2,7 +2,7 @@
 
 RS2 is a Rust reimplementation of the Restspace core: services are functions on
 HTTP messages, mounted per tenant, composable into pipelines, with custom code
-sandboxed under hard limits. PRD: `C:\dev\rs-runtime\docs\PRD-runtime-v2.md`.
+sandboxed under hard limits. PRD: `PRD-runtime-v2.md` (in the `rs-runtime` repo).
 **Repo layout, build commands, and run instructions are in `README.md` — read
 it first.** This file is the agent working guide.
 
@@ -42,7 +42,7 @@ it first.** This file is the agent working guide.
 
 ## This repo vs. the skill
 
-`C:\dev\rs2-skill` is the **user-facing** skill (how to operate an RS2 server).
+The `rs2-skill` repo is the **user-facing** skill (how to operate an RS2 server).
 This file is for **developing** the runtime. When a change alters behavior a
 user sees (a config field, endpoint, header, or facet), update the skill's
 `references/*.md` in the same pass.

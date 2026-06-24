@@ -84,7 +84,7 @@ Before adding a service, ask whether it's a mode of an existing one:
    capabilities it needs in the `ServiceContext` there.
 4. Add a `pattern_of` arm + agent-surface/OpenAPI items in `src/discovery.rs`.
 5. If it's store-shaped, hold it to `tests/store_conformance.rs`.
-6. Document it in the skill (`C:\dev\rs2-skill\references\services.md`).
+6. Document it in the skill (the `rs2-skill` repo's `references/services.md`).
 
 ## Instruction plane vs. data
 

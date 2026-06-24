@@ -1,9 +1,18 @@
 # RS2 — Sandboxed Composable-Service Runtime
 
-Rust reimplementation of the Restspace conceptual core, per
-`C:\dev\rs-runtime\docs\PRD-runtime-v2.md`. Services are functions on HTTP
-messages, mounted at URL paths per tenant; custom code runs in sandboxes with
-hard resource limits.
+A runtime where services are functions on HTTP messages, mounted at URL paths per
+tenant and composed into pipelines; custom code runs in sandboxes with hard
+resource limits.
+
+> **Status:** pre-1.0. The embedding API is unstable (0.x); only the server
+> binary is supported. See the milestone sections below for what's built.
+
+## License
+
+RS2 is **dual-licensed**: open source under **AGPL-3.0-only** (see [`LICENSE`](LICENSE)),
+with a **commercial license** available for closed-source embedding or hosted
+offerings. See [`LICENSING.md`](LICENSING.md). Contributions: see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Layout
 
