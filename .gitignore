@@ -11,3 +11,8 @@ examples/*/data/
 examples/*/data-store/
 # Local persistent dev nodes started by scripts/node-*.ps1
 /.run/
+# Internal strategy/positioning notes — not for the public repo.
+/docs/positioning.md
+# Dev-node log files.
+/rs2-dev.out.log
+/rs2-dev.err.log
