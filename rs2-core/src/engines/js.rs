@@ -75,8 +75,10 @@ const BOOTSTRAP: &str = r#"
     }
     read(max) {
       const r = rethrow(ops.op_rs2_sock_read(this._id, (max | 0) || 65536));
-      if (!r.data || r.data.length === 0) return null; // EOF
-      return Uint8Array.from(r.data);
+      if (r === null || !r.data) return null; // EOF
+      // The payload crosses as a real Uint8Array (see op_rs2_take_chunk);
+      // r.data is just its length.
+      return ops.op_rs2_take_chunk();
     }
     close() { ops.op_rs2_sock_close(this._id); }
   }
@@ -96,7 +98,7 @@ const BOOTSTRAP: &str = r#"
       readBody: () => {
         const r = rethrow(ops.op_rs2_body_read());
         if (r === null) return null; // EOF (the op is the sole EOF authority)
-        return Uint8Array.from(r.data || []);
+        return ops.op_rs2_take_chunk();
       },
       // Async-iterable sugar over `readBody`: `for await (const c of ctx.body())`.
       body: () => ({
@@ -221,6 +223,11 @@ pub(crate) struct InvocationState {
     /// returns the response (headers + a `ByteStream`) the moment the guest
     /// begins, then keeps the isolate running to drain chunks under backpressure.
     response_sink: Mutex<Option<Arc<StreamSink>>>,
+    /// One-chunk hand-off from `op_rs2_sock_read`/`op_rs2_body_read` (which
+    /// return a JSON control envelope) to `op_rs2_take_chunk` (which returns
+    /// the payload as a Uint8Array): bytes crossing the boundary inside the
+    /// JSON envelope serialized every byte as a boxed JS number.
+    pending_chunk: Mutex<Option<Vec<u8>>>,
 }
 
 /// The destination for a streamed response body. `headers` carries the status +
@@ -262,6 +269,7 @@ impl InvocationState {
             request_body: Mutex::new(None),
             streamed_in: AtomicU64::new(0),
             response_sink: Mutex::new(None),
+            pending_chunk: Mutex::new(None),
         })
     }
 
@@ -629,7 +637,7 @@ fn op_rs2_fetch(state: &mut OpState, #[serde] req: serde_json::Value) -> serde_j
 
 /// `crypto.getRandomValues`/`randomUUID` backing: `n` random bytes.
 #[op2]
-#[serde]
+#[buffer]
 fn op_rs2_random(#[smi] n: u32) -> Vec<u8> {
     use rand::RngCore;
     let mut bytes = vec![0u8; (n as usize).min(65536)];
@@ -687,10 +695,27 @@ fn op_rs2_sock_read(state: &mut OpState, #[smi] id: u32, #[smi] max: u32) -> ser
     };
     let max = (max as usize).clamp(1, 1 << 20);
     match block_on_main(&inv.main, async move { sock.lock().await.read_up_to(max).await }) {
-        Ok(Ok(bytes)) => json!({ "data": bytes }),
+        Ok(Ok(bytes)) => {
+            if bytes.is_empty() {
+                return Value::Null; // EOF
+            }
+            let len = bytes.len();
+            *inv.pending_chunk.lock().unwrap() = Some(bytes);
+            json!({ "data": len })
+        }
         Ok(Err(e)) => fail_socket(&inv, RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("socket read failed: {e}"))),
         Err(_) => fail_socket(&inv, RsError::internal("socket task dropped")),
     }
+}
+
+/// Return (and clear) the chunk stashed by the last `op_rs2_sock_read` /
+/// `op_rs2_body_read`, as a Uint8Array.
+#[op2]
+#[buffer]
+fn op_rs2_take_chunk(state: &mut OpState) -> Vec<u8> {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let taken = inv.pending_chunk.lock().unwrap().take();
+    taken.unwrap_or_default()
 }
 
 #[op2(fast)]
@@ -725,7 +750,9 @@ fn op_rs2_body_read(state: &mut OpState) -> serde_json::Value {
                     RsError::limit_exceeded("materialized_body_bytes", total, inv.materialize_cap),
                 );
             }
-            json!({ "data": bytes.to_vec() })
+            let len = bytes.len();
+            *inv.pending_chunk.lock().unwrap() = Some(bytes.to_vec());
+            json!({ "data": len })
         }
         Ok(None) => Value::Null, // EOF
         Ok(Some(Err(e))) => fail_body(
@@ -807,6 +834,7 @@ extension!(
         op_rs2_sock_read,
         op_rs2_sock_close,
         op_rs2_body_read,
+        op_rs2_take_chunk,
         op_rs2_stream_begin,
         op_rs2_body_write
     ]
@@ -824,20 +852,39 @@ impl JsEngine {
 
     /// Compile-only validation: the deployment-time smoke test for
     /// `PUT /code/<name>` with a JS bundle (PRD §10.6). Loads and evaluates
-    /// the bundle as a module with no invocation behind it.
+    /// the bundle as a module with no invocation behind it. Top-level
+    /// evaluation runs under its own wall clock and heap cap — an infinite
+    /// loop or allocation bomb in a deployed bundle must fail the deploy,
+    /// not park the joining thread forever (or abort the process).
     pub fn compile_check(&self, source: &str) -> Result<(), RsError> {
+        const WALL: Duration = Duration::from_secs(10);
+        const HEAP: usize = 256 * 1024 * 1024;
         let source = source.to_string();
         std::thread::spawn(move || -> Result<(), RsError> {
             let local = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| RsError::internal(format!("runtime build failed: {e}")))?;
-            local.block_on(async move {
-                let mut runtime = JsRuntime::new(RuntimeOptions {
-                    extensions: vec![rs2_host::init()],
-                    module_loader: Some(Rc::new(deno_core::NoopModuleLoader)),
-                    ..Default::default()
+            let create = v8::CreateParams::default().heap_limits(0, HEAP);
+            let mut runtime = JsRuntime::new(RuntimeOptions {
+                extensions: vec![rs2_host::init()],
+                module_loader: Some(Rc::new(deno_core::NoopModuleLoader)),
+                create_params: Some(create),
+                ..Default::default()
+            });
+            let oom = Arc::new(AtomicBool::new(false));
+            {
+                let oom = oom.clone();
+                let handle = runtime.v8_isolate().thread_safe_handle();
+                runtime.add_near_heap_limit_callback(move |current, _initial| {
+                    oom.store(true, Ordering::SeqCst);
+                    handle.terminate_execution();
+                    current * 2
                 });
+            }
+            let handle = runtime.v8_isolate().thread_safe_handle();
+            let (timed_out, done) = spawn_watchdog(handle, WALL);
+            let result = local.block_on(async {
                 let spec = resolve_url("rs2:service")
                     .map_err(|e| RsError::internal(format!("bad specifier: {e}")))?;
                 let mod_id = runtime
@@ -854,7 +901,18 @@ impl JsEngine {
                 eval.await
                     .map_err(|e| RsError::contract_violation(format!("JS bundle errored: {e}")))?;
                 Ok(())
-            })
+            });
+            done.store(true, Ordering::SeqCst);
+            if result.is_err() {
+                if timed_out.load(Ordering::SeqCst) {
+                    let ms = WALL.as_millis() as u64;
+                    return Err(RsError::limit_exceeded("wall_clock_ms", ms, ms));
+                }
+                if oom.load(Ordering::SeqCst) {
+                    return Err(RsError::limit_exceeded("memory_bytes", HEAP as u64, HEAP as u64));
+                }
+            }
+            result
         })
         .join()
         .map_err(|_| RsError::internal("compile-check thread panicked"))?
@@ -1175,27 +1233,72 @@ async fn run_invocation(
 
 /// Wall-clock watchdog: terminate the isolate at `deadline`. Returns
 /// `(timed_out, done)` — store `done` when the guarded work finishes so the
-/// watcher exits without firing. Shared by the build and dispatch phases.
+/// watcher drops the entry without firing. Shared by the build and dispatch
+/// phases.
+///
+/// One process-wide thread guards every in-flight isolate: spawning a raw
+/// OS thread per guarded phase (two per invocation, each polling at 5 ms)
+/// was thousands of thread creations per second under load, for pure
+/// bookkeeping. The thread blocks on its channel while idle and polls at
+/// the same 5 ms cadence while any entry is live.
 fn spawn_watchdog(
     handle: v8::IsolateHandle,
     wall: Duration,
 ) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    struct Entry {
+        handle: v8::IsolateHandle,
+        deadline: std::time::Instant,
+        timed_out: Arc<AtomicBool>,
+        done: Arc<AtomicBool>,
+    }
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<Entry>> =
+        std::sync::OnceLock::new();
+    let sender = SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Entry>();
+        std::thread::spawn(move || {
+            let mut live: Vec<Entry> = Vec::new();
+            loop {
+                if live.is_empty() {
+                    // Idle: no polling, wait for the next registration.
+                    match rx.recv() {
+                        Ok(e) => live.push(e),
+                        Err(_) => return,
+                    }
+                }
+                while let Ok(e) = rx.try_recv() {
+                    live.push(e);
+                }
+                let now = std::time::Instant::now();
+                live.retain(|e| {
+                    if e.done.load(Ordering::SeqCst) {
+                        return false;
+                    }
+                    if now >= e.deadline {
+                        e.timed_out.store(true, Ordering::SeqCst);
+                        e.handle.terminate_execution();
+                        return false;
+                    }
+                    true
+                });
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        tx
+    });
     let timed_out = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let (t2, d2) = (timed_out.clone(), done.clone());
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + wall;
-        while std::time::Instant::now() < deadline {
-            if d2.load(Ordering::SeqCst) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        if !d2.load(Ordering::SeqCst) {
-            t2.store(true, Ordering::SeqCst);
-            handle.terminate_execution();
-        }
-    });
+    let entry = Entry {
+        handle,
+        deadline: std::time::Instant::now() + wall,
+        timed_out: timed_out.clone(),
+        done: done.clone(),
+    };
+    // The watchdog thread never exits while the sender is live; a failed
+    // send can only mean it panicked — fail the guarded work open rather
+    // than run unguarded.
+    if sender.send(entry).is_err() {
+        timed_out.store(true, Ordering::SeqCst);
+    }
     (timed_out, done)
 }
 
