@@ -9,12 +9,27 @@ use crate::capabilities::HttpOut;
 use crate::error::RsError;
 use crate::message::{Body, MediaType, Message};
 
-#[derive(Default)]
-pub struct UreqHttpOut;
+pub struct UreqHttpOut {
+    /// One agent for the adapter's lifetime: ureq pools keep-alive
+    /// connections per agent, so the top-level `ureq::request` helper (a
+    /// fresh agent per call) would pay a new TCP + TLS handshake on every
+    /// outbound request.
+    agent: ureq::Agent,
+}
 
 impl UreqHttpOut {
     pub fn new() -> Self {
-        UreqHttpOut
+        UreqHttpOut {
+            agent: ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(30))
+                .build(),
+        }
+    }
+}
+
+impl Default for UreqHttpOut {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -40,9 +55,10 @@ impl HttpOut for UreqHttpOut {
             Some(b) => Some(b.materialize(100 * 1024 * 1024).await?.to_vec()),
         };
         let template = msg.response(http::StatusCode::OK, None);
+        let agent = self.agent.clone();
 
         let outcome = tokio::task::spawn_blocking(move || {
-            let mut req = ureq::request(&method, &url).timeout(std::time::Duration::from_secs(30));
+            let mut req = agent.request(&method, &url);
             for (k, v) in &headers {
                 req = req.set(k, v);
             }
