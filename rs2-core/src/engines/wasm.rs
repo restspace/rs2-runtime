@@ -1,9 +1,11 @@
 //! Wasmtime component engine (PRD §5.3): runs services compiled to Wasm
 //! components against the published WIT world (`wit/service.wit`).
 //!
-//! Limits: wall-clock via epoch interruption + tokio timeout; linear memory
-//! capped per store via `StoreLimits`. Compiled components are cached by
-//! content hash (content-addressed deployment, PRD §14).
+//! Limits: guests yield to the executor at every engine-wide epoch tick
+//! (so CPU-bound code can't pin a worker thread), which lets the tokio
+//! timeout enforce the wall-clock budget; linear memory capped per store via
+//! `StoreLimits`. Compiled components are cached by content hash
+//! (content-addressed deployment, PRD §14).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -153,9 +155,16 @@ impl rs2::service::host::Host for HostState {
     }
 }
 
+/// Period of the engine-wide epoch ticker. The epoch counter is shared by
+/// every in-flight store on the engine, so per-invocation deadlines must be
+/// expressed in ticks of a fixed clock — a per-invocation "increment once at
+/// my deadline" would trip every *other* store's deadline too.
+const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
 pub struct WasmEngine {
     engine: wasmtime::Engine,
     compiled: tokio::sync::RwLock<HashMap<u64, Component>>,
+    ticker_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WasmEngine {
@@ -166,7 +175,21 @@ impl WasmEngine {
         config.wasm_component_model(true);
         let engine = wasmtime::Engine::new(&config)
             .map_err(|e| RsError::internal(format!("wasmtime engine init failed: {e}")))?;
-        Ok(WasmEngine { engine, compiled: tokio::sync::RwLock::new(HashMap::new()) })
+        // One dedicated ticker thread per engine: a tokio timer can be starved
+        // by the very guests the ticks are meant to preempt. Stopped via flag
+        // on drop (tenant rebuilds drop the engine with its CodeService).
+        let ticker_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let engine = engine.clone();
+            let stop = ticker_stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(EPOCH_TICK);
+                    engine.increment_epoch();
+                }
+            });
+        }
+        Ok(WasmEngine { engine, compiled: tokio::sync::RwLock::new(HashMap::new()), ticker_stop })
     }
 
     /// Compile-only validation: the deployment-time smoke test for
@@ -188,6 +211,12 @@ impl WasmEngine {
             .map_err(|e| RsError::contract_violation(format!("component failed to compile: {e}")))?;
         self.compiled.write().await.insert(key, component.clone());
         Ok(component)
+    }
+}
+
+impl Drop for WasmEngine {
+    fn drop(&mut self) {
+        self.ticker_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -228,36 +257,22 @@ impl RsEngine for WasmEngine {
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.store_limits);
-        store.set_epoch_deadline(1);
+        // Yield at every epoch tick rather than trap: the guest can't pin an
+        // executor thread between ticks, which guarantees the tokio timeout
+        // below a chance to fire — dropping the store cancels the guest.
+        store.epoch_deadline_async_yield_and_update(1);
 
-        // Wall-clock enforcement: one epoch tick at the deadline interrupts
-        // even CPU-bound guests; the tokio timeout backstops host waits.
-        let engine = self.engine.clone();
-        let wall = limits.wall_clock;
-        let ticker = tokio::spawn(async move {
-            tokio::time::sleep(wall).await;
-            engine.increment_epoch();
-        });
-
-        let result = tokio::time::timeout(limits.wall_clock + std::time::Duration::from_secs(1), async {
+        let result = tokio::time::timeout(limits.wall_clock, async {
             let instance = Service::instantiate_async(&mut store, &component, &linker)
                 .await
                 .map_err(|e| RsError::contract_violation(format!("instantiation failed: {e}")))?;
             instance
                 .call_handle(&mut store, &wit_msg, &config.to_string())
                 .await
-                .map_err(|e| {
-                    let text = format!("{e:?}");
-                    if text.contains("epoch") || text.contains("interrupt") {
-                        RsError::limit_exceeded("wall_clock_ms", wall.as_millis() as u64, wall.as_millis() as u64)
-                    } else {
-                        RsError::contract_violation(format!("trap: {e}"))
-                    }
-                })?
+                .map_err(|e| RsError::contract_violation(format!("trap: {e}")))?
                 .map_err(RsError::contract_violation)
         })
         .await;
-        ticker.abort();
 
         match result {
             Ok(Ok(wit_out)) => Ok(message_from_wit(&template, wit_out)),
