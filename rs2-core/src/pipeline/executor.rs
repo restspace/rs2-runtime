@@ -266,19 +266,42 @@ impl Executor {
                         std::mem::replace(&mut msg, bodyless)
                     }
                 };
-                let mut attempt_vars = vars.clone();
-                let flow = self
-                    .run_segment(
+                // A retryable segment runs against scratch vars so a failed
+                // attempt can't leak partial captures into the retry. The
+                // common single-attempt segment mutates in place: captured
+                // vars hold whole response bodies, so the scratch deep-clone
+                // per segment is worth skipping.
+                let flow = if max_attempts == 1 {
+                    self.run_segment(
                         spec,
                         segment.start,
                         segment.end,
                         attempt_msg,
-                        &mut attempt_vars,
+                        vars,
                         depth,
                         key_path,
                         to_step,
                     )
-                    .await?;
+                    .await?
+                } else {
+                    let mut attempt_vars = vars.clone();
+                    let flow = self
+                        .run_segment(
+                            spec,
+                            segment.start,
+                            segment.end,
+                            attempt_msg,
+                            &mut attempt_vars,
+                            depth,
+                            key_path,
+                            to_step,
+                        )
+                        .await?;
+                    if !matches!(flow, Flow::Abort(_)) {
+                        *vars = attempt_vars;
+                    }
+                    flow
+                };
                 match flow {
                     Flow::Abort(failed) => {
                         let status = failed.status.map(|s| s.as_u16()).unwrap_or(500);
@@ -289,10 +312,7 @@ impl Executor {
                         }
                         break Flow::Abort(failed);
                     }
-                    other => {
-                        *vars = attempt_vars;
-                        break other;
-                    }
+                    other => break other,
                 }
             };
             match flow {
@@ -957,7 +977,7 @@ fn derive_key(invocation_id: &str, key_path: &str) -> String {
     hasher.update(invocation_id.as_bytes());
     hasher.update([0u8]);
     hasher.update(key_path.as_bytes());
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    crate::crypto::to_hex(&hasher.finalize())
 }
 
 /// Clone a materialized body; `None` for streams.

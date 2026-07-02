@@ -238,7 +238,7 @@ pub fn segment_key(invocation_id: &str, segment_index: usize) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::crypto::to_hex(bytes)
 }
 
 /// Capture a response into stored form, materializing its body up to
