@@ -37,6 +37,11 @@ pub type SpecValidator = Arc<dyn Fn(&Value) -> Result<Value, RsError> + Send + S
 /// representable in a file store).
 pub const ROOT_SPEC: &str = ".root";
 
+/// Cap on cached resolutions. Miss entries are keyed by request-derived
+/// paths (every prefix `resolve` probes), so the cache must be bounded
+/// against arbitrary URLs; specs themselves are operator-paced.
+const SPEC_CACHE_CAP: usize = 1024;
+
 pub struct SpecStore {
     inner: FileService,
     inner_ctx: ServiceContext,
@@ -47,6 +52,12 @@ pub struct SpecStore {
     /// `access` field (authority is operator-controlled config, not author
     /// content). Empty ⇒ no API operator.
     operator_roles: String,
+    /// Resolution cache: spec path → parsed doc, `None` = known-absent
+    /// (misses matter — `resolve` probes every path prefix, so uncached
+    /// execution pays file reads × path depth per request). Cleared
+    /// wholesale on any authoring mutation; specs change at authoring pace,
+    /// reads happen per request.
+    cache: std::sync::Mutex<std::collections::HashMap<String, Option<Arc<Value>>>>,
 }
 
 /// Resolve the storage root for a spec store: the spec-store root override
@@ -118,7 +129,16 @@ impl SpecStore {
             subtree,
             validate,
             operator_roles: operator_roles.unwrap_or_default(),
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn cache_insert(&self, path: &str, doc: Option<Arc<Value>>) {
+        let mut cache = self.cache.lock().unwrap();
+        if cache.len() >= SPEC_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(path.to_string(), doc);
     }
 
     /// Whether a request path enters the authoring subtree (its first
@@ -167,9 +187,14 @@ impl SpecStore {
 
         let is_listing = msg.method == http::Method::GET && msg.url.is_directory();
         let is_spec_read = msg.method == http::Method::GET && !msg.url.is_directory();
+        let mutates = msg.method != http::Method::GET && msg.method != http::Method::HEAD;
         let listing_path = msg.url.service_path.clone();
         let template = msg.response(http::StatusCode::OK, None);
-        match self.inner.handle(msg, &self.inner_ctx).await {
+        let result = self.inner.handle(msg, &self.inner_ctx).await;
+        if mutates {
+            self.cache.lock().unwrap().clear();
+        }
+        match result {
             // Specs are JSON by construction; extension-less files would
             // otherwise serve as octet-stream.
             Ok(mut resp) if is_spec_read => {
@@ -193,22 +218,33 @@ impl SpecStore {
         }
     }
 
-    /// Read one stored spec by its subtree-relative path.
-    pub async fn read(&self, spec_path: &str) -> Result<Value, RsError> {
+    /// Read one stored spec by its subtree-relative path (cached, including
+    /// not-found).
+    pub async fn read(&self, spec_path: &str) -> Result<Arc<Value>, RsError> {
+        if let Some(cached) = self.cache.lock().unwrap().get(spec_path).cloned() {
+            return cached
+                .ok_or_else(|| RsError::not_found(format!("no stored spec at '{spec_path}'")));
+        }
         let files = self.inner_ctx.files.as_ref().unwrap();
-        let mut body = files
-            .read(spec_path, None)
-            .await
-            .map_err(|_| RsError::not_found(format!("no stored spec at '{spec_path}'")))?;
+        let Ok(mut body) = files.read(spec_path, None).await else {
+            self.cache_insert(spec_path, None);
+            return Err(RsError::not_found(format!("no stored spec at '{spec_path}'")));
+        };
+        // Materialize/parse failures propagate uncached: they're transient
+        // or corrupt-store conditions, not resolutions.
         let bytes = body.materialize(self.inner_ctx.limits.materialized_body_bytes).await?;
-        serde_json::from_slice(bytes)
-            .map_err(|e| RsError::internal(format!("stored spec is corrupt: {e}")))
+        let doc: Arc<Value> = Arc::new(
+            serde_json::from_slice(bytes)
+                .map_err(|e| RsError::internal(format!("stored spec is corrupt: {e}")))?,
+        );
+        self.cache_insert(spec_path, Some(doc.clone()));
+        Ok(doc)
     }
 
     /// Execution resolution: the longest stored prefix of `segments` wins
     /// (peeled segments become the caller's positional params); with no
     /// match, the `.root` spec governs. Returns `(doc, matched_len)`.
-    pub async fn resolve(&self, segments: &[String]) -> Result<Option<(Value, usize)>, RsError> {
+    pub async fn resolve(&self, segments: &[String]) -> Result<Option<(Arc<Value>, usize)>, RsError> {
         let mut split = segments.len();
         while split >= 1 {
             let candidate = format!("/{}", segments[..split].join("/"));

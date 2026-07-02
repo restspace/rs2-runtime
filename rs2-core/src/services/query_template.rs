@@ -30,12 +30,14 @@ use serde_json::{Map, Value};
 use crate::error::RsError;
 
 /// A parsed stored-query envelope.
-#[derive(Debug, Clone)]
 pub struct QueryEnvelope {
     pub language: Language,
     pub query: Value,
     pub params_schema: Option<Value>,
     pub output_schema: Option<Value>,
+    /// Compiled once at parse — `prepare_params` runs per request, and
+    /// schema compilation dwarfs validation.
+    params_validator: Option<jsonschema::Validator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +80,16 @@ impl QueryEnvelope {
         if language == Language::Text && !query.is_string() {
             return Err(RsError::bad_request("a sql/text query must be a string template"));
         }
-        for (key, label) in [("params", "params"), ("output", "output")] {
-            if let Some(schema) = obj.get(key) {
-                jsonschema::validator_for(schema).map_err(|e| {
-                    RsError::bad_request(format!("'{label}' is not a valid JSON Schema: {e}"))
-                })?;
-            }
+        let params_validator = match obj.get("params") {
+            Some(schema) => Some(jsonschema::validator_for(schema).map_err(|e| {
+                RsError::bad_request(format!("'params' is not a valid JSON Schema: {e}"))
+            })?),
+            None => None,
+        };
+        if let Some(schema) = obj.get("output") {
+            jsonschema::validator_for(schema).map_err(|e| {
+                RsError::bad_request(format!("'output' is not a valid JSON Schema: {e}"))
+            })?;
         }
         // Placeholder scan: malformed placeholders fail at write time.
         if language == Language::Json {
@@ -94,6 +100,7 @@ impl QueryEnvelope {
             query,
             params_schema: obj.get("params").cloned(),
             output_schema: obj.get("output").cloned(),
+            params_validator,
         })
     }
 
@@ -109,8 +116,10 @@ impl QueryEnvelope {
                     }
                 }
             }
-            let validator = jsonschema::validator_for(schema)
-                .map_err(|e| RsError::internal(format!("params schema failed to compile: {e}")))?;
+            let validator = self
+                .params_validator
+                .as_ref()
+                .ok_or_else(|| RsError::internal("params schema was not compiled at parse"))?;
             let value = Value::Object(params.clone());
             let errors: Vec<Value> = validator
                 .iter_errors(&value)
