@@ -110,4 +110,27 @@ impl DataStore for MemDataStore {
             .map(|_| ())
             .ok_or_else(|| RsError::not_found(format!("no dataset '{dataset}'")))
     }
+
+    /// One pass under one read lock, cloning only the records that match —
+    /// the default (`list_keys` + `get`) took the lock and deep-cloned once
+    /// per record, matching or not.
+    async fn scan_matching(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        keep: &(dyn for<'a> Fn(&'a serde_json::Value) -> Result<bool, RsError> + Send + Sync),
+    ) -> Result<Vec<(String, serde_json::Value)>, RsError> {
+        let tenants = self.tenants.read().await;
+        let ds = tenants
+            .get(tenant)
+            .and_then(|t| t.get(dataset))
+            .ok_or_else(|| RsError::not_found(format!("no dataset '{dataset}'")))?;
+        let mut out = Vec::new();
+        for (key, record) in &ds.records {
+            if keep(record)? {
+                out.push((key.clone(), record.clone()));
+            }
+        }
+        Ok(out)
+    }
 }

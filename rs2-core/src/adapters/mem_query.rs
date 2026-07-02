@@ -101,25 +101,27 @@ impl QueryStore for MemQueryStore {
         };
 
         // Scan the dataset (the reference adapter trades efficiency for
-        // having no backend dependency; SQL adapters push this down).
-        let (keys, _) = self.data.list_keys(tenant, dataset, usize::MAX, 0).await?;
-        let mut rows = Vec::new();
-        for key in keys {
-            let mut record = self.data.get(tenant, dataset, &key).await?;
-            let mut keep = true;
+        // having no backend dependency; SQL adapters push this down). The
+        // store filters in one pass, so non-matching records are never
+        // cloned out of it.
+        let keep = |record: &serde_json::Value| -> Result<bool, RsError> {
             for (path, clause) in clauses {
-                if !matches(&record, path, clause)? {
-                    keep = false;
-                    break;
+                if !matches(record, path, clause)? {
+                    return Ok(false);
                 }
             }
-            if keep {
+            Ok(true)
+        };
+        let matched = self.data.scan_matching(tenant, dataset, &keep).await?;
+        let mut rows: Vec<serde_json::Value> = matched
+            .into_iter()
+            .map(|(key, mut record)| {
                 if let Some(obj) = record.as_object_mut() {
                     obj.entry("_key".to_string()).or_insert(serde_json::json!(key));
                 }
-                rows.push(record);
-            }
-        }
+                record
+            })
+            .collect();
 
         if let Some(order_by) = query.get("orderBy").and_then(|v| v.as_str()) {
             rows.sort_by(|a, b| {

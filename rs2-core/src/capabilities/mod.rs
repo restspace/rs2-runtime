@@ -170,6 +170,26 @@ pub trait DataStore: Send + Sync {
     async fn get_schema(&self, tenant: &str, dataset: &str) -> Result<Option<serde_json::Value>, RsError>;
     async fn put_schema(&self, tenant: &str, dataset: &str, schema: serde_json::Value) -> Result<(), RsError>;
     async fn delete_dataset(&self, tenant: &str, dataset: &str) -> Result<(), RsError>;
+    /// Every record in a dataset that passes `keep`, with its key — the
+    /// query adapter's full-scan seam. The default composes `list_keys` +
+    /// `get` (N+1 round trips, a clone per record whether it matches or
+    /// not); adapters override it to scan in one pass.
+    async fn scan_matching(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        keep: &(dyn for<'a> Fn(&'a serde_json::Value) -> Result<bool, RsError> + Send + Sync),
+    ) -> Result<Vec<(String, serde_json::Value)>, RsError> {
+        let (keys, _) = self.list_keys(tenant, dataset, usize::MAX, 0).await?;
+        let mut out = Vec::new();
+        for key in keys {
+            let record = self.get(tenant, dataset, &key).await?;
+            if keep(&record)? {
+                out.push((key, record));
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Outbound HTTP, granted with allowed-host patterns; default deny.
