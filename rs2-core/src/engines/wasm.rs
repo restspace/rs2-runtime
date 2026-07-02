@@ -8,7 +8,6 @@
 //! (content-addressed deployment, PRD §14).
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -163,7 +162,15 @@ const EPOCH_TICK: std::time::Duration = std::time::Duration::from_millis(10);
 
 pub struct WasmEngine {
     engine: wasmtime::Engine,
-    compiled: tokio::sync::RwLock<HashMap<u64, Component>>,
+    /// WASI + host imports, registered once: rebuilding the linker
+    /// (hundreds of host-function definitions) per invocation cost more
+    /// than small guests' actual work.
+    linker: Linker<HostState>,
+    /// Import-resolved instantiation templates, keyed by the code Arc's
+    /// address (the blob is content-addressed upstream and the entry pins
+    /// the Arc, so the address is stable and unambiguous while cached) —
+    /// re-hashing multi-MB component bytes per invocation was pure loss.
+    instantiable: tokio::sync::RwLock<HashMap<usize, (Arc<Vec<u8>>, ServicePre<HostState>)>>,
     ticker_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -175,6 +182,11 @@ impl WasmEngine {
         config.wasm_component_model(true);
         let engine = wasmtime::Engine::new(&config)
             .map_err(|e| RsError::internal(format!("wasmtime engine init failed: {e}")))?;
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+            .map_err(|e| RsError::internal(format!("wasi linker: {e}")))?;
+        rs2::service::host::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s: &mut HostState| s)
+            .map_err(|e| RsError::internal(format!("host linker: {e}")))?;
         // One dedicated ticker thread per engine: a tokio timer can be starved
         // by the very guests the ticks are meant to preempt. Stopped via flag
         // on drop (tenant rebuilds drop the engine with its CodeService).
@@ -189,7 +201,12 @@ impl WasmEngine {
                 }
             });
         }
-        Ok(WasmEngine { engine, compiled: tokio::sync::RwLock::new(HashMap::new()), ticker_stop })
+        Ok(WasmEngine {
+            engine,
+            linker,
+            instantiable: tokio::sync::RwLock::new(HashMap::new()),
+            ticker_stop,
+        })
     }
 
     /// Compile-only validation: the deployment-time smoke test for
@@ -200,17 +217,23 @@ impl WasmEngine {
             .map_err(|e| RsError::contract_violation(format!("component failed to compile: {e}")))
     }
 
-    async fn component_for(&self, bytes: &[u8]) -> Result<Component, RsError> {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut hasher);
-        let key = hasher.finish();
-        if let Some(c) = self.compiled.read().await.get(&key) {
-            return Ok(c.clone());
+    async fn instance_pre_for(
+        &self,
+        bytes: &Arc<Vec<u8>>,
+    ) -> Result<ServicePre<HostState>, RsError> {
+        let key = Arc::as_ptr(bytes) as usize;
+        if let Some((_, pre)) = self.instantiable.read().await.get(&key) {
+            return Ok(pre.clone());
         }
-        let component = Component::new(&self.engine, bytes)
+        let component = Component::new(&self.engine, bytes.as_slice())
             .map_err(|e| RsError::contract_violation(format!("component failed to compile: {e}")))?;
-        self.compiled.write().await.insert(key, component.clone());
-        Ok(component)
+        let pre = self
+            .linker
+            .instantiate_pre(&component)
+            .and_then(ServicePre::new)
+            .map_err(|e| RsError::contract_violation(format!("component imports unresolved: {e}")))?;
+        self.instantiable.write().await.insert(key, (bytes.clone(), pre.clone()));
+        Ok(pre)
     }
 }
 
@@ -234,13 +257,7 @@ impl RsEngine for WasmEngine {
             ServiceCode::WasmComponent(b) => b.clone(),
             _ => return Err(RsError::engine_unavailable("wasm engine only runs wasm components")),
         };
-        let component = self.component_for(&bytes).await?;
-
-        let mut linker: Linker<HostState> = Linker::new(&self.engine);
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(|e| RsError::internal(format!("wasi linker: {e}")))?;
-        rs2::service::host::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s: &mut HostState| s)
-            .map_err(|e| RsError::internal(format!("host linker: {e}")))?;
+        let pre = self.instance_pre_for(&bytes).await?;
 
         let template = msg.response(http::StatusCode::OK, None);
         let wit_msg = message_to_wit(&mut msg, limits.materialized_body_bytes).await?;
@@ -263,7 +280,8 @@ impl RsEngine for WasmEngine {
         store.epoch_deadline_async_yield_and_update(1);
 
         let result = tokio::time::timeout(limits.wall_clock, async {
-            let instance = Service::instantiate_async(&mut store, &component, &linker)
+            let instance = pre
+                .instantiate_async(&mut store)
                 .await
                 .map_err(|e| RsError::contract_violation(format!("instantiation failed: {e}")))?;
             instance
