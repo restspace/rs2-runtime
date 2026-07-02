@@ -226,6 +226,14 @@ impl AuthService {
 
     fn record_failure(&self, user: &str) {
         let mut lockouts = self.lockouts.lock().unwrap();
+        // Entries are otherwise only removed on that user's successful login,
+        // so a spray of invented usernames would grow the map for the mount's
+        // lifetime. Past a threshold, keep only currently-locked accounts —
+        // losing a sub-threshold failure count is harmless.
+        if lockouts.len() >= 10_000 {
+            let now = Instant::now();
+            lockouts.retain(|_, s| s.locked_until.is_some_and(|until| until > now));
+        }
         let state = lockouts.entry(user.to_string()).or_default();
         state.failures += 1;
         if state.failures >= self.settings.max_attempts {

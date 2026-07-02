@@ -86,15 +86,62 @@ struct Entry {
     state: EntryState,
 }
 
+/// Sweep cadence: every N `begin` calls, drop all expired entries. Expiry is
+/// otherwise only opportunistic on the addressed slot, so distinct keys —
+/// scope includes the request path — would accumulate for the process
+/// lifetime, each holding up to `DEFAULT_BODY_CAP` of stored response.
+const SWEEP_EVERY: u64 = 4096;
+
+/// Hard cap on retained entries: past it, the oldest completed entries are
+/// evicted early. A duplicate whose entry was evicted re-executes instead of
+/// replaying — safe for idempotent effects, and strictly better than
+/// unbounded growth. In-flight entries are never evicted.
+const MAX_ENTRIES: usize = 100_000;
+
 /// In-memory idempotency store with a fixed replay window.
 pub struct MemIdempotencyStore {
     window: Duration,
+    max_entries: usize,
     entries: Mutex<HashMap<(String, String), Entry>>,
+    begins: std::sync::atomic::AtomicU64,
 }
 
 impl MemIdempotencyStore {
     pub fn new(window: Duration) -> Self {
-        MemIdempotencyStore { window, entries: Mutex::new(HashMap::new()) }
+        Self::with_capacity(window, MAX_ENTRIES)
+    }
+
+    fn with_capacity(window: Duration, max_entries: usize) -> Self {
+        MemIdempotencyStore {
+            window,
+            max_entries,
+            entries: Mutex::new(HashMap::new()),
+            begins: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Drop every expired `Done` entry, then if still over the cap, evict the
+    /// oldest completed entries in a batch (an eighth of the cap, so the
+    /// O(n log n) scan amortizes instead of running per insert at saturation).
+    fn sweep(&self, entries: &mut HashMap<(String, String), Entry>, force_evict: bool) {
+        let window = self.window;
+        entries.retain(|_, e| match &e.state {
+            EntryState::InFlight => true,
+            EntryState::Done(_, at) => at.elapsed() <= window,
+        });
+        if force_evict && entries.len() >= self.max_entries {
+            let mut done: Vec<((String, String), Instant)> = entries
+                .iter()
+                .filter_map(|(k, e)| match &e.state {
+                    EntryState::Done(_, at) => Some((k.clone(), *at)),
+                    EntryState::InFlight => None,
+                })
+                .collect();
+            done.sort_by_key(|(_, at)| *at);
+            for (k, _) in done.into_iter().take(self.max_entries / 8 + 1) {
+                entries.remove(&k);
+            }
+        }
     }
 }
 
@@ -107,7 +154,11 @@ impl Default for MemIdempotencyStore {
 #[async_trait]
 impl IdempotencyStore for MemIdempotencyStore {
     async fn begin(&self, scope: &str, key: &str, payload_hash: Option<&str>) -> Result<Begin, RsError> {
+        let n = self.begins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap();
+        if n % SWEEP_EVERY == 0 || entries.len() >= self.max_entries {
+            self.sweep(&mut entries, true);
+        }
         // Opportunistic expiry of the addressed slot.
         let slot = (scope.to_string(), key.to_string());
         if let Some(entry) = entries.get(&slot) {
@@ -254,6 +305,22 @@ mod tests {
             .unwrap();
         // Window elapsed (zero): fresh again, not a replay.
         assert!(matches!(store.begin("s", "k", None).await.unwrap(), Begin::Fresh));
+    }
+
+    #[tokio::test]
+    async fn completed_entries_are_evicted_at_the_cap() {
+        let store = MemIdempotencyStore::with_capacity(Duration::from_secs(3600), 16);
+        for i in 0..64 {
+            let key = format!("k{i}");
+            assert!(matches!(store.begin("s", &key, None).await.unwrap(), Begin::Fresh));
+            store
+                .complete("s", &key, StoredResponse { status: 200, headers: vec![], body: None })
+                .await
+                .unwrap();
+        }
+        // Unbounded before the cap landed: 64 distinct keys, none expired,
+        // yet the map stays at the cap with the oldest entries evicted.
+        assert!(store.entries.lock().unwrap().len() <= 16);
     }
 
     #[test]
