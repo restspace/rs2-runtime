@@ -24,6 +24,7 @@ pub mod adapters;
 pub mod capabilities;
 pub mod config_schema;
 pub mod contract;
+pub mod crypto;
 pub mod discovery;
 pub mod engines;
 pub mod error;

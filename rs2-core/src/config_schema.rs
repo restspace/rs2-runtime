@@ -226,6 +226,31 @@ pub struct StoreConfig {
     pub adapter: Option<String>,
 }
 
+/// `sms` service config (beyond the base envelope). The provider is selected by
+/// `store.adapter` (`code:<name>@<version>` or `infra:<name>`); credentials for
+/// the provider call are injected host-side by the adapter's grants/infra.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SmsConfig {
+    /// Provider backend selection (`store.adapter`). Required — no node default
+    /// SMS provider ships. See [`StoreConfig`].
+    pub store: Option<StoreConfig>,
+}
+
+/// `proxy` service config (beyond the base envelope): forward to a fixed
+/// external `target`, attaching auth host-side via `inject`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProxyConfig {
+    /// External base URL every request is forwarded to (host fixed here).
+    pub target: Option<String>,
+    /// Credential to attach host-side: `"infra:<name>"` (operator-supplied) or
+    /// an inline strategy object whose `secret:<name>` leaves draw on granted
+    /// tenant secrets. The secret never appears in this config.
+    #[schemars(schema_with = "json_object_schema")]
+    pub inject: Option<Value>,
+}
+
 /// `pipeline` service config (beyond the base envelope).
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -327,6 +352,12 @@ pub fn catalogue() -> Value {
             { "name": "auth",
               "description": "Authentication & RBAC (PRD §10.5)",
               "configSchema": schema_of::<AuthSettings>() },
+            { "name": "sms",
+              "description": "Outbound SMS over a swappable provider adapter (PRD §9.2): POST /send {to, body}, GET /status/{id}. Select the provider with store.adapter (code:/infra:)",
+              "configSchema": schema_of::<SmsConfig>() },
+            { "name": "proxy",
+              "description": "Forward to a fixed external target, attaching operator-supplied auth host-side via `inject` (the credential never appears in config)",
+              "configSchema": schema_of::<ProxyConfig>() },
             { "name": "services",
               "description": "Self-configuration API (PRD §10.6)",
               "configSchema": schema_of::<ServicesConfig>() }

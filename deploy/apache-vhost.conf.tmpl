@@ -1,0 +1,39 @@
+# RS2 reverse-proxy vhost template.
+# ${DOMAIN} is substituted by deploy/install.sh (or replace it by hand).
+#
+# Requires: a2enmod proxy proxy_http headers ssl
+# TLS:      certbot --apache -d ${DOMAIN}   (run after this vhost is enabled)
+
+<VirtualHost *:80>
+    ServerName ${DOMAIN}
+    # Redirect everything to HTTPS. certbot also manages this once it runs;
+    # the explicit redirect keeps plain-HTTP traffic off the runtime.
+    RewriteEngine On
+    RewriteCond %{HTTPS} off
+    RewriteRule ^/?(.*) https://%{SERVER_NAME}/$1 [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName ${DOMAIN}
+
+    # RS2 resolves tenancy from the Host header (domain map + subdomain), so the
+    # original Host MUST reach the runtime unchanged.
+    ProxyPreserveHost On
+    # Tell RS2 the edge terminated TLS (for cookie Secure flags, absolute URLs).
+    RequestHeader set X-Forwarded-Proto "https"
+
+    ProxyPass        / http://127.0.0.1:3100/
+    ProxyPassReverse / http://127.0.0.1:3100/
+
+    # RS2 streams response bodies; don't let the proxy buffer them whole.
+    SetEnv proxy-sendcl 0
+    SetEnv proxy-initial-not-pooled 1
+
+    SSLEngine on
+    # certbot --apache fills these in; placeholders until then.
+    SSLCertificateFile    /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+
+    ErrorLog  ${APACHE_LOG_DIR}/rs2-error.log
+    CustomLog ${APACHE_LOG_DIR}/rs2-access.log combined
+</VirtualHost>

@@ -1,0 +1,33 @@
+[Unit]
+Description=RS2 runtime (sandboxed composable-service runtime)
+Documentation=https://github.com/atelyr/rs2-runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rs2-server /etc/rs2/serverConfig.json
+User=rs2
+Group=rs2
+Restart=on-failure
+RestartSec=2
+
+# Host hardening. RS2 sandboxes its guests; this sandboxes the host process so
+# a runtime bug can't reach beyond its own state and log directories.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+# The only paths the service may write to:
+ReadWritePaths=/var/lib/rs2 /var/log/rs2
+# Bind a loopback port only; Apache fronts it. No need for low ports.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

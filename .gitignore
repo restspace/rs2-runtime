@@ -16,3 +16,5 @@ examples/*/data-store/
 # Dev-node log files.
 /rs2-dev.out.log
 /rs2-dev.err.log
+# Prebuilt server binaries (release artifacts, not source).
+/rs2-server-ubuntu18

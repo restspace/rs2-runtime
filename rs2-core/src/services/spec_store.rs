@@ -109,6 +109,8 @@ impl SpecStore {
             builtin_adapters: None,
             infras: None,
             secrets: None,
+            outbound_injectors: std::collections::HashMap::new(),
+            sms: None,
         };
         SpecStore {
             inner: FileService::new(),

@@ -1,0 +1,12 @@
+{
+  "listen": "127.0.0.1:3100",
+  "tenancy": { "mode": "single", "tenant": "main" },
+  "fileRoot": "/var/lib/rs2/data",
+  "dataRoot": "/var/lib/rs2/data-store",
+  "tenantsDir": "/etc/rs2/tenants",
+  "logging": {
+    "sink": "file",
+    "level": "info",
+    "file": { "path": "/var/log/rs2", "maxBytes": 8388608, "backups": 5 }
+  }
+}

@@ -148,9 +148,15 @@ impl CodeService {
                         "this deployment has no outbound HTTP adapter configured",
                     )
                 })?;
-                let target: CapabilityTarget = Arc::new(move |msg: Message| {
+                // Host-side credential injection (resolved at tenant build, never
+                // in `config`): applied after the allowlist check, before the
+                // request leaves the host. Absent ⇒ headers pass through verbatim.
+                let injector = ctx.outbound_injectors.get(capability).cloned();
+                let body_cap = ctx.limits.materialized_body_bytes;
+                let target: CapabilityTarget = Arc::new(move |mut msg: Message| {
                     let http = http.clone();
                     let hosts = hosts.clone();
+                    let injector = injector.clone();
                     Box::pin(async move {
                         let host = url_host(&msg.url.path).ok_or_else(|| {
                             RsError::bad_request(format!(
@@ -162,6 +168,9 @@ impl CodeService {
                             return Err(RsError::capability_denied(&format!(
                                 "httpOut to '{host}'"
                             )));
+                        }
+                        if let Some(inj) = &injector {
+                            inj.apply(&mut msg, body_cap).await?;
                         }
                         http.request(msg).await
                     })

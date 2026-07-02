@@ -1,32 +1,75 @@
 {
   "mounts": [
     {
+      "config": {
+        "access": "open"
+      },
       "path": "/files",
-      "service": "file",
-      "config": { "access": "open" }
+      "service": "file"
     },
     {
       "config": {
-        "enforceSchema": true,
-        "access": "open"
+        "access": "open",
+        "enforceSchema": true
       },
       "path": "/data",
       "service": "data"
     },
     {
+      "config": {
+        "access": "open"
+      },
       "path": "/services",
-      "service": "services",
-      "config": { "access": "open" }
+      "service": "services"
     },
     {
+      "config": {
+        "access": "open"
+      },
       "path": "/q",
-      "service": "query",
-      "config": { "access": "open" }
+      "service": "query"
     },
     {
+      "config": {
+        "access": "open"
+      },
       "path": "/pipes",
-      "service": "pipeline",
-      "config": { "access": "open" }
+      "service": "pipeline"
+    },
+    {
+      "config": {
+        "access": "open",
+        "defaultResource": "index.html",
+        "description": "Static HTML site for RS2 — home page (index.html) and assets, served by the file service.",
+        "store": {
+          "adapter": "builtin:local",
+          "root": ".rs2-html"
+        }
+      },
+      "path": "/html",
+      "service": "file"
+    },
+    {
+      "config": {
+        "access": {
+          "delete": "A",
+          "invoke": "all",
+          "read": "A",
+          "write": "A"
+        },
+        "description": "Update/newsletter sign-up submissions. Anyone may POST a signup; reading the list requires role A.",
+        "store": {
+          "adapter": "builtin:file",
+          "root": ".rs2-signups"
+        },
+        "x-policy": {
+          "note": "Collected emails are not anonymously readable; reads/edits/deletes require an authenticated admin (role A).",
+          "publicWrite": true,
+          "readRole": "A"
+        }
+      },
+      "path": "/signups",
+      "service": "data"
     }
   ]
 }

@@ -6,6 +6,7 @@
 //! S3 and database-backed adapters are M1 stretch items tracked in the PRD;
 //! they slot in behind the same traits without touching services.
 
+mod credential;
 mod file_data;
 mod file_log;
 #[cfg(feature = "http")]
@@ -15,6 +16,7 @@ mod mem_data;
 mod mem_query;
 mod registry;
 
+pub use credential::{AuthStrategy, CredentialInjector};
 pub use file_data::FileDataStore;
 pub use file_log::FileLogStore;
 #[cfg(feature = "http")]

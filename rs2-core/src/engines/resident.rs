@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use base64::Engine as _;
 
 use crate::capabilities::{
-    ByteRange, DataStore, DirEntry, FileMeta, FileStore, QueryStore, ScopedFileStore,
+    ByteRange, DataStore, DirEntry, FileMeta, FileStore, QueryStore, ScopedFileStore, SmsGateway,
 };
 use crate::contract::{GrantedHost, HostApi, InvocationLimits};
 use crate::error::{codes, RsError};
@@ -544,6 +544,54 @@ impl DataStore for GuestDataStore {
             Ok(())
         } else {
             Err(store_error(status, &body))
+        }
+    }
+}
+
+/// An [`SmsGateway`] backed by a resident JS adapter — the reference proof that
+/// the resident substrate generalizes beyond storage to a typed *provider*
+/// capability. Maps `send`/`status` to store-pattern requests (`POST /send`,
+/// `GET /status/{id}`); the adapter bundle maps those to the provider's wire
+/// format + auth. The stock `sms` service runs unchanged over any provider.
+pub struct GuestSmsGateway {
+    inner: ResidentAdapter,
+}
+
+impl GuestSmsGateway {
+    /// Build a guest-backed SMS gateway from a `"store"` config block.
+    pub fn from_config(
+        adapter_ref: &str,
+        store_config: &Value,
+        files: ScopedFileStore,
+        tenant: &str,
+        limits: InvocationLimits,
+    ) -> Result<Self, RsError> {
+        Ok(GuestSmsGateway {
+            inner: ResidentAdapter::from_config("sms", adapter_ref, store_config, files, tenant, limits)?,
+        })
+    }
+}
+
+#[async_trait]
+impl SmsGateway for GuestSmsGateway {
+    async fn send(&self, _tenant: &str, to: &str, body: &str) -> Result<String, RsError> {
+        let (status, resp) =
+            self.inner.call("POST", "/send", Some(json!({ "to": to, "body": body }))).await?;
+        if !(200..300).contains(&status) {
+            return Err(store_error(status, &resp));
+        }
+        resp.get("id")
+            .and_then(|i| i.as_str())
+            .map(String::from)
+            .ok_or_else(|| RsError::contract_violation("sms adapter response missing string 'id'"))
+    }
+
+    async fn status(&self, _tenant: &str, id: &str) -> Result<Value, RsError> {
+        let (status, resp) = self.inner.call("GET", &format!("/status/{id}"), None).await?;
+        if (200..300).contains(&status) {
+            Ok(resp)
+        } else {
+            Err(store_error(status, &resp))
         }
     }
 }

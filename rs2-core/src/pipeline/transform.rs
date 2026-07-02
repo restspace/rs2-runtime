@@ -8,10 +8,9 @@
 //! a template — an object template transforms per-key, a bare string is a
 //! whole-body expression (Restspace semantics retained).
 
-use hmac::{Hmac, Mac};
 use serde_json::Value;
-use sha2::{Sha256, Sha512};
 
+use crate::crypto::{hmac_bytes, hmac_verify, to_hex};
 use crate::error::RsError;
 
 /// Cap on evaluation depth and wall time per expression. The time limit guards
@@ -175,60 +174,6 @@ fn jsonata_verify_password<'a>(
     Ok(jsonata_rs::Value::bool(ok))
 }
 
-/// HMAC of `message` under `key` for `sha256`/`sha512`; `None` on unknown algo.
-fn hmac_bytes(algorithm: &str, key: &[u8], message: &[u8]) -> Option<Vec<u8>> {
-    match algorithm {
-        "sha256" => {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
-            mac.update(message);
-            Some(mac.finalize().into_bytes().to_vec())
-        }
-        "sha512" => {
-            let mut mac = Hmac::<Sha512>::new_from_slice(key).ok()?;
-            mac.update(message);
-            Some(mac.finalize().into_bytes().to_vec())
-        }
-        _ => None,
-    }
-}
-
-/// Constant-time HMAC verification against a hex signature.
-fn hmac_verify(algorithm: &str, key: &[u8], message: &[u8], signature_hex: &str) -> bool {
-    let Some(provided) = from_hex(signature_hex) else { return false };
-    match algorithm {
-        "sha256" => match Hmac::<Sha256>::new_from_slice(key) {
-            Ok(mut mac) => {
-                mac.update(message);
-                mac.verify_slice(&provided).is_ok()
-            }
-            Err(_) => false,
-        },
-        "sha512" => match Hmac::<Sha512>::new_from_slice(key) {
-            Ok(mut mac) => {
-                mac.update(message);
-                mac.verify_slice(&provided).is_ok()
-            }
-            Err(_) => false,
-        },
-        _ => false,
-    }
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
-fn from_hex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.is_empty() || s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
-}
 
 #[cfg(test)]
 mod tests {

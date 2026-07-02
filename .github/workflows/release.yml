@@ -1,0 +1,78 @@
+name: release
+
+# Builds both server variants on the oldest supported glibc (Ubuntu 22.04) and
+# attaches them — plus the Apache vhost template and SHA256SUMS — to the
+# release the tag points at.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag/release to attach artifacts to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # native + wasm engines: small binary, light build.
+          - variant: rs2-server
+            features: "wasm"
+          # adds the V8 isolate: large binary, heavy build (needs the runner's RAM).
+          - variant: rs2-server-js
+            features: "wasm,js"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}
+
+      - name: Build
+        run: cargo build --release -p rs2-server --features "${{ matrix.features }}"
+
+      - name: Stage artifact
+        run: |
+          mkdir -p dist
+          cp target/release/rs2-server "dist/${{ matrix.variant }}-x86_64-linux"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Add vhost template + checksums
+        run: |
+          cp deploy/apache-vhost.conf.tmpl dist/
+          cp deploy/install.sh dist/
+          ( cd dist && sha256sum rs2-server-* > SHA256SUMS )
+          ls -l dist
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*

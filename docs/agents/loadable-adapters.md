@@ -185,6 +185,36 @@ WebCrypto `subtle`), so the adapter targets unauthenticated/network-trusted Mong
 adding a `crypto.subtle` to the prelude (the host already has `hmac`/`sha2`) would
 unlock it — the only remaining piece.
 
+**Outbound credential injection — DONE.** Host-side auth attached to an outbound
+message before it leaves the host (the v1 "proxy adapter"), the secret never in
+tenant config or guest-visible config. `adapters/credential.rs` defines
+`AuthStrategy` (bearer/header/basic/query/HMAC/AWS SigV4) + `CredentialInjector`
+(`apply` materializes the body only for signing strategies; the rest are
+streaming-safe). Resolved at `Tenant::build` from an `httpOut` grant's (or a
+`proxy` mount's) `inject` ref — `"infra:<name>"` (operator-supplied) or an inline
+strategy whose `secret:<name>` leaves draw on granted tenant secrets — into
+`ServiceContext.outbound_injectors`, applied in the `httpOut` grant closure
+(`services/code.rs`) and the `proxy` service. Hex/HMAC/SHA-256 share `crypto.rs`
+(factored out of `pipeline/transform.rs`). Proof: `tests/credential_inject.rs`
+(infra bearer + inline `secret:` query, both asserting no leak to
+`GET /services/raw` or guest `ctx`) and `tests/proxy.rs`. SigV4 golden vector in
+`adapters/credential.rs`.
+
+**Typed swappable provider capability (`SmsGateway`) — DONE (reference domain).**
+The chosen model for "switch one external provider for another" is a typed Rust
+trait per *domain* (the `QueryStore` precedent: one trait, many providers), with
+dual impls — a Rust `builtin:`/embedder default and a loadable `code:` guest over
+the resident substrate — so a new *provider* needs no recompile, only a new
+*domain* touches the host. SMS is the shipped reference: `SmsGateway` +
+`ScopedSmsGateway` (`capabilities/mod.rs`), `GuestSmsGateway` mapping
+`send`/`status` to `POST /send` / `GET /status/{id}` envelopes (`resident.rs`),
+`sms_capability` wiring (`tenant.rs`, mirrors `data_capability`; `code:`/`infra:`
+only — no first-party builtins ship yet), and a stock `sms` service
+(`services/sms.rs`). Proof: `tests/sms_gateway.rs`. A `proxy` service
+(`services/proxy.rs`) packages the forward-with-auth case as a no-code mount.
+Follow-on domains (`EmailGateway`, `SignerGateway`/KMS, an LLM trait — deferred
+as its surface is leaky/fast-moving) repeat the same six seams.
+
 **Remaining:** a **`GuestActor`** model for long-lived server-push connections
 (Discord gateway / Slack socket-mode — needs a continuously driven runtime, real
 wall-clock timers, and an inbound-event egress path: a sibling to the resident

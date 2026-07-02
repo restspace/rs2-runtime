@@ -176,6 +176,32 @@ fn is_extensionless(path: &str) -> bool {
     !path.rsplit('/').next().unwrap_or("").contains('.')
 }
 
+/// Whether `Accept` *explicitly* asks for the directory-listing type
+/// (`application/vnd.rs2.dir+json`) — i.e. names it exactly with `q > 0`.
+/// A wildcard (`*/*`, `application/*`) does **not** count: browsers send
+/// `Accept: …,*/*`, and we must keep serving them the `default_resource`, not a
+/// listing. Only a deliberate `Accept: application/vnd.rs2.dir+json` (agents,
+/// the CLI, the discovery surface) forces the listing on a static-site mount.
+fn wants_dir_listing(accept: Option<&str>) -> bool {
+    let (dtype, dsubtype) = crate::message::media_type::DIR_JSON
+        .split_once('/')
+        .unwrap_or(("application", "vnd.rs2.dir+json"));
+    accept
+        .into_iter()
+        .flat_map(|h| h.split(','))
+        .filter_map(|part| {
+            let mut params = part.split(';');
+            let media = params.next()?.trim();
+            let (t, s) = media.split_once('/')?;
+            let q = params
+                .find_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.trim().parse::<f32>().ok()))
+                .unwrap_or(1.0);
+            Some((t.trim().to_ascii_lowercase(), s.trim().to_ascii_lowercase(), q))
+        })
+        // Exact type+subtype only — no wildcard match.
+        .any(|(t, s, q)| q > 0.0 && t == dtype && s == dsubtype)
+}
+
 /// Quality of `essence` against one parsed `Accept` range `(type, subtype, q)`.
 /// `*/*` and `type/*` match as wildcards; an exact essence match also scores its
 /// `q`. Returns `0.0` when the range doesn't apply.
@@ -298,33 +324,51 @@ impl Service for FileService {
 
         match msg.method {
             Method::GET if msg.url.is_directory() => {
+                // A deliberate `Accept: application/vnd.rs2.dir+json` asks for
+                // the machine listing even on a static-site mount whose
+                // `default_resource` would otherwise shadow it — this is how the
+                // discovery surface enumerates files. Browsers (which send
+                // `*/*`) and humans keep getting the default doc. The `listings`
+                // gate below still applies: an explicit request can surface a
+                // listing the default resource hides, but it cannot override
+                // `listings: false`. The representation served at a directory
+                // URL now depends on `Accept`, so every branch sets `Vary`.
+                let force_listing = wants_dir_listing(accept.as_deref());
+
                 // Static-site mode: directories serve the default resource.
-                if let Some(default) = &site.default_resource {
-                    match self
-                        .serve_file(
-                            msg.response(StatusCode::OK, None),
-                            range,
-                            if_none_match.clone(),
-                            files,
-                            &format!("{path}{default}"),
-                        )
-                        .await
-                    {
-                        Ok(resp) => return Ok(resp),
-                        Err(e) if e.code != crate::error::codes::NOT_FOUND => return Err(e),
-                        // No default doc here: SPA routes fall to the root.
-                        Err(_) if site.spa_fallback && path != "/" => {
-                            return self
-                                .serve_file(
-                                    msg.response(StatusCode::OK, None),
-                                    range,
-                                    if_none_match,
-                                    files,
-                                    &format!("/{default}"),
-                                )
-                                .await
+                if !force_listing {
+                    if let Some(default) = &site.default_resource {
+                        match self
+                            .serve_file(
+                                msg.response(StatusCode::OK, None),
+                                range,
+                                if_none_match.clone(),
+                                files,
+                                &format!("{path}{default}"),
+                            )
+                            .await
+                        {
+                            Ok(mut resp) => {
+                                resp.set_header("vary", "accept");
+                                return Ok(resp);
+                            }
+                            Err(e) if e.code != crate::error::codes::NOT_FOUND => return Err(e),
+                            // No default doc here: SPA routes fall to the root.
+                            Err(_) if site.spa_fallback && path != "/" => {
+                                let mut resp = self
+                                    .serve_file(
+                                        msg.response(StatusCode::OK, None),
+                                        range,
+                                        if_none_match,
+                                        files,
+                                        &format!("/{default}"),
+                                    )
+                                    .await?;
+                                resp.set_header("vary", "accept");
+                                return Ok(resp);
+                            }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
                 }
                 if !site.listings {
@@ -339,6 +383,7 @@ impl Service for FileService {
                 });
                 let mut resp = msg.ok(Some(Body::from_bytes(listing.to_string(), MediaType::dir_json())));
                 resp.set_header("x-total-count", &total.to_string());
+                resp.set_header("vary", "accept");
                 Ok(resp)
             }
             Method::GET => {
