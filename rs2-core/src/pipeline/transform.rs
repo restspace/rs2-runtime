@@ -28,6 +28,19 @@ pub fn evaluate(
     input: &Value,
     vars: &serde_json::Map<String, Value>,
 ) -> Result<Value, RsError> {
+    evaluate_str(expr, &input.to_string(), vars)
+}
+
+/// Inner evaluation against pre-serialized input: `apply` serializes the
+/// body once and shares it across every template leaf — serializing per
+/// leaf made a transform O(keys × body size). Each leaf keeps its own
+/// arena (jsonata parses the input into it), so peak memory stays one
+/// parsed body, not one per leaf.
+fn evaluate_str(
+    expr: &str,
+    input_text: &str,
+    vars: &serde_json::Map<String, Value>,
+) -> Result<Value, RsError> {
     let arena = bumpalo::Bump::new();
     let jsonata = jsonata_rs::JsonAta::new(expr, &arena)
         .map_err(|e| RsError::bad_request(format!("invalid JSONata expression '{expr}': {e}")))?;
@@ -49,9 +62,8 @@ pub fn evaluate(
     // the inverse check (argon2id or legacy bcrypt).
     jsonata.register_function("hashPassword", 1, jsonata_hash_password);
     jsonata.register_function("verifyPassword", 2, jsonata_verify_password);
-    let input_text = input.to_string();
     let result = jsonata
-        .evaluate_timeboxed(Some(&input_text), Some(MAX_DEPTH), Some(TIME_LIMIT_MS))
+        .evaluate_timeboxed(Some(input_text), Some(MAX_DEPTH), Some(TIME_LIMIT_MS))
         .map_err(|e| {
             RsError::bad_request(format!("JSONata evaluation failed for '{expr}': {e}"))
         })?;
@@ -100,19 +112,40 @@ pub fn apply(
     input: &Value,
     vars: &serde_json::Map<String, Value>,
 ) -> Result<Value, RsError> {
+    apply_inner(template, &input.to_string(), vars)
+}
+
+fn apply_inner(
+    template: &Value,
+    input_text: &str,
+    vars: &serde_json::Map<String, Value>,
+) -> Result<Value, RsError> {
     match template {
-        Value::String(expr) => evaluate(expr, input, vars),
+        Value::String(expr) => evaluate_str(expr, input_text, vars),
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
-                out.insert(k.clone(), apply(v, input, vars)?);
+                out.insert(k.clone(), apply_inner(v, input_text, vars)?);
             }
             Ok(Value::Object(out))
         }
-        Value::Array(items) => {
-            Ok(Value::Array(items.iter().map(|v| apply(v, input, vars)).collect::<Result<_, _>>()?))
-        }
+        Value::Array(items) => Ok(Value::Array(
+            items.iter().map(|v| apply_inner(v, input_text, vars)).collect::<Result<_, _>>()?,
+        )),
         other => Ok(other.clone()),
+    }
+}
+
+/// Whether any string leaf of a template mentions `name` (a substring
+/// check — JSONata has no string-to-variable indirection, so a miss is
+/// definitive and a false positive merely binds a variable unnecessarily).
+/// Gates per-step binding costs like the `$_rawBody` copy.
+pub fn mentions(template: &Value, name: &str) -> bool {
+    match template {
+        Value::String(s) => s.contains(name),
+        Value::Object(o) => o.values().any(|v| mentions(v, name)),
+        Value::Array(a) => a.iter().any(|v| mentions(v, name)),
+        _ => false,
     }
 }
 

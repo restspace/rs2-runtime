@@ -545,14 +545,15 @@ impl Executor {
             // The exact request bytes (now materialized by `as_json`), so a
             // transform can verify a signature over the raw payload — e.g.
             // `$hmacVerify('sha256', $secret, $_rawBody, $sig)` — before any
-            // later step rewrites the body.
+            // later step rewrites the body. Bound only when the template
+            // mentions it: it's a full owned copy of the body per step.
             let raw_body = match &mut msg.body {
-                Some(body) => body
+                Some(body) if transform::mentions(template, "_rawBody") => body
                     .materialize(self.limits.materialize_cap)
                     .await
                     .ok()
                     .map(|b| String::from_utf8_lossy(b).into_owned()),
-                None => None,
+                _ => None,
             };
             let mut eval_vars = vars.clone();
             let status = msg.status.map(|s| s.as_u16()).unwrap_or(200);
