@@ -72,9 +72,12 @@ pub struct Runtime {
     limiter: TenantLimiter,
     breaker: TenantBreaker,
     tenants: tokio::sync::RwLock<HashMap<String, Arc<Tenant>>>,
-    /// Serializes tenant builds so concurrent first requests load once
-    /// (re-entrance guard, PRD §9.1).
-    load_guard: tokio::sync::Mutex<()>,
+    /// Per-tenant build guards so concurrent first requests load once
+    /// (re-entrance guard, PRD §9.1) — per tenant, not node-wide, so one
+    /// slow tenant's cold build can't head-of-line-block every other
+    /// tenant's first request (worst after `purge_all`, which would
+    /// otherwise rebuild the node one tenant at a time).
+    load_guards: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Self-reference handed to services as the internal-dispatch capability.
     self_ref: std::sync::Weak<Runtime>,
     /// Node log sink (PRD §14): boundary + error logs emit here.
@@ -148,7 +151,7 @@ impl Runtime {
             limiter: TenantLimiter::new(),
             breaker: TenantBreaker::new(),
             tenants: tokio::sync::RwLock::new(HashMap::new()),
-            load_guard: tokio::sync::Mutex::new(()),
+            load_guards: tokio::sync::Mutex::new(HashMap::new()),
             self_ref: me.clone(),
         })
     }
@@ -161,25 +164,41 @@ impl Runtime {
         if let Some(t) = self.tenants.read().await.get(name) {
             return Ok(t.clone());
         }
-        let _guard = self.load_guard.lock().await;
-        // Double-check: another request may have loaded it while we waited.
-        if let Some(t) = self.tenants.read().await.get(name) {
-            return Ok(t.clone());
+        let guard = self
+            .load_guards
+            .lock()
+            .await
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let locked = guard.lock().await;
+        let result = async {
+            // Double-check: another request may have loaded it while we waited.
+            if let Some(t) = self.tenants.read().await.get(name) {
+                return Ok(t.clone());
+            }
+            let config = self.loader.load_tenant(name).await?;
+            let requester: Arc<dyn crate::pipeline::Requester> =
+                Arc::new(RuntimeRequester(self.self_ref.clone()));
+            let control: Arc<dyn TenantControl> = Arc::new(RuntimeControl(self.self_ref.clone()));
+            let tenant = Arc::new(Tenant::build(
+                name,
+                config,
+                &self.adapters,
+                &self.limits,
+                Some(requester),
+                Some(control),
+            )?);
+            self.tenants.write().await.insert(name.to_string(), tenant.clone());
+            Ok(tenant)
         }
-        let config = self.loader.load_tenant(name).await?;
-        let requester: Arc<dyn crate::pipeline::Requester> =
-            Arc::new(RuntimeRequester(self.self_ref.clone()));
-        let control: Arc<dyn TenantControl> = Arc::new(RuntimeControl(self.self_ref.clone()));
-        let tenant = Arc::new(Tenant::build(
-            name,
-            config,
-            &self.adapters,
-            &self.limits,
-            Some(requester),
-            Some(control),
-        )?);
-        self.tenants.write().await.insert(name.to_string(), tenant.clone());
-        Ok(tenant)
+        .await;
+        // Drop the guard entry so failed or wildcard-derived names don't
+        // accumulate. Waiters already queued hold their own Arc of the same
+        // mutex and re-check the tenants map on acquire.
+        self.load_guards.lock().await.remove(name);
+        drop(locked);
+        result
     }
 
     /// Drop a tenant's built instances so the next request rebuilds from
