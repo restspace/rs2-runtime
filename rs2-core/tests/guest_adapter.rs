@@ -307,155 +307,22 @@ export default async (msg) => {
 };
 "#;
 
-/// A MongoDB `DataStore` adapter speaking the real wire protocol — OP_MSG
-/// framing + a hand-written BSON codec — over the pooled socket. Datasets are
-/// collections; a record's key is its string `_id`. **No auth**: SCRAM-SHA-256
-/// needs HMAC/PBKDF2 which the JS prelude's `crypto` doesn't expose, so this
-/// targets unauthenticated MongoDB (or a network-trusted deployment); adding a
-/// WebCrypto `subtle` to the prelude would unlock SCRAM.
-const MONGO_ADAPTER: &str = r#"
-let SOCK = null, RBUF = new Uint8Array(0), DB = "test", REQID = 0;
-const SCHEMA_COLL = "__rs2_schemas__";
-
-// --- BSON encode (subset: doc/array/string/int32/double/bool/null) ---
-function pushI32(a, v) { a.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff); }
-function pushDouble(a, v) { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, v, true); for (const x of b) a.push(x); }
-function pushCStr(a, s) { for (const x of new TextEncoder().encode(s)) a.push(x); a.push(0); }
-function pushStr(a, s) { const b = new TextEncoder().encode(s); pushI32(a, b.length + 1); for (const x of b) a.push(x); a.push(0); }
-function encodeInto(a, obj) {
-  const body = [];
-  for (const [k, v] of Object.entries(obj)) {
-    if (v === null || v === undefined) { body.push(0x0a); pushCStr(body, k); }
-    else if (typeof v === "boolean") { body.push(0x08); pushCStr(body, k); body.push(v ? 1 : 0); }
-    else if (typeof v === "number") {
-      if (Number.isInteger(v) && v >= -2147483648 && v <= 2147483647) { body.push(0x10); pushCStr(body, k); pushI32(body, v); }
-      else { body.push(0x01); pushCStr(body, k); pushDouble(body, v); }
-    } else if (typeof v === "string") { body.push(0x02); pushCStr(body, k); pushStr(body, v); }
-    else if (Array.isArray(v)) { const o = {}; v.forEach((x, i) => (o[i] = x)); body.push(0x04); pushCStr(body, k); encodeInto(body, o); }
-    else if (typeof v === "object") { body.push(0x03); pushCStr(body, k); encodeInto(body, v); }
-    else throw new Error("bson encode: bad type " + typeof v);
-  }
-  pushI32(a, body.length + 5);
-  for (const x of body) a.push(x);
-  a.push(0);
-}
-function encodeDoc(obj) { const a = []; encodeInto(a, obj); return Uint8Array.from(a); }
-
-// --- BSON decode ---
-function decodeDoc(bytes, start) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const end = start + dv.getInt32(start, true);
-  let off = start + 4;
-  const obj = {};
-  while (off < end - 1) {
-    const type = bytes[off++];
-    let ns = off;
-    while (bytes[off] !== 0) off++;
-    const name = new TextDecoder().decode(bytes.subarray(ns, off));
-    off++;
-    let val;
-    if (type === 0x01) { val = dv.getFloat64(off, true); off += 8; }
-    else if (type === 0x02) { const l = dv.getInt32(off, true); off += 4; val = new TextDecoder().decode(bytes.subarray(off, off + l - 1)); off += l; }
-    else if (type === 0x03) { const r = decodeDoc(bytes, off); val = r[0]; off = r[1]; }
-    else if (type === 0x04) { const r = decodeDoc(bytes, off); val = Object.values(r[0]); off = r[1]; }
-    else if (type === 0x08) { val = bytes[off++] !== 0; }
-    else if (type === 0x0a) { val = null; }
-    else if (type === 0x10) { val = dv.getInt32(off, true); off += 4; }
-    else if (type === 0x12) { val = Number(dv.getBigInt64(off, true)); off += 8; }
-    else if (type === 0x07) { off += 12; val = null; }
-    else throw new Error("bson decode: unsupported type 0x" + type.toString(16));
-    obj[name] = val;
-  }
-  return [obj, end];
-}
-
-// --- OP_MSG over the socket ---
-function cat(a, b) { const o = new Uint8Array(a.length + b.length); o.set(a, 0); o.set(b, a.length); return o; }
-function ensure(n) { while (RBUF.length < n) { const c = SOCK.read(65536); if (c === null) throw new Error("mongo: closed"); RBUF = cat(RBUF, c); } }
-function command(doc) {
-  doc["$db"] = DB;
-  const body = encodeDoc(doc);
-  const msg = new Uint8Array(21 + body.length);
-  const dv = new DataView(msg.buffer);
-  dv.setInt32(0, msg.length, true);
-  dv.setInt32(4, ++REQID, true);
-  dv.setInt32(12, 2013, true); // OP_MSG
-  msg[20] = 0; // section kind 0
-  msg.set(body, 21);
-  SOCK.write(msg);
-  ensure(4);
-  const len = new DataView(RBUF.buffer, RBUF.byteOffset, RBUF.byteLength).getInt32(0, true);
-  ensure(len);
-  const reply = decodeDoc(RBUF.slice(0, len), 21)[0];
-  RBUF = RBUF.slice(len);
-  if (!reply.ok) throw new Error("mongo error: " + JSON.stringify(reply));
-  return reply;
-}
-
-export default async (msg, ctx) => {
-  if (!SOCK) { DB = ctx.config.db || "test"; SOCK = RS2Socket.connect(ctx.config.host || "127.0.0.1", ctx.config.port | 0); }
-  const path = String(msg.url).split("?")[0];
-  const qs = new URLSearchParams(String(msg.url).split("?")[1] || "");
-  const segs = path.split("/").filter(Boolean);
-  const skip = parseInt(qs.get("$skip") || "0", 10), take = parseInt(qs.get("$take") || "1000", 10);
-
-  if (segs.length === 0) {
-    if (msg.method !== "GET") return { status: 400, body: { detail: "root supports GET" } };
-    const reply = command({ listCollections: 1, nameOnly: true });
-    const names = (reply.cursor.firstBatch || []).map((c) => c.name).filter((n) => n !== SCHEMA_COLL).sort();
-    const entries = names.slice(skip, skip + take).map((n) => ({ name: n + "/", dir: true }));
-    return { status: 200, body: { path: "/", entries, total: names.length } };
-  }
-
-  const dataset = segs[0];
-  if (segs.length === 1 && path.endsWith("/")) {
-    if (msg.method === "GET") {
-      const total = command({ count: dataset }).n || 0;
-      const found = command({ find: dataset, filter: {}, skip, limit: take });
-      const names = (found.cursor.firstBatch || []).map((d) => String(d._id)).sort();
-      const entries = names.map((n) => ({ name: n, dir: false, contentType: "application/json" }));
-      return { status: 200, body: { path: "/" + dataset + "/", entries, total } };
-    }
-    if (msg.method === "DELETE") { command({ drop: dataset }); return { status: 204 }; }
-    return { status: 400, body: { detail: "container supports GET, DELETE" } };
-  }
-
-  const key = segs.slice(1).join("/");
-  if (key === ".schema.json") {
-    if (msg.method === "GET") {
-      const doc = (command({ find: SCHEMA_COLL, filter: { _id: dataset }, limit: 1 }).cursor.firstBatch || [])[0];
-      return doc ? { status: 200, body: doc.schema } : { status: 404, body: { detail: "no schema" } };
-    }
-    if (msg.method === "PUT") {
-      command({ update: SCHEMA_COLL, updates: [{ q: { _id: dataset }, u: { _id: dataset, schema: msg.body }, upsert: true }] });
-      return { status: 200 };
-    }
-    return { status: 400, body: { detail: "schema supports GET, PUT" } };
-  }
-
-  if (msg.method === "GET") {
-    const doc = (command({ find: dataset, filter: { _id: key }, limit: 1 }).cursor.firstBatch || [])[0];
-    if (!doc) return { status: 404, body: { detail: "no record '" + key + "'" } };
-    delete doc._id;
-    return { status: 200, body: doc };
-  }
-  if (msg.method === "PUT") {
-    const reply = command({ update: dataset, updates: [{ q: { _id: key }, u: Object.assign({}, msg.body, { _id: key }), upsert: true }] });
-    const created = reply.upserted && reply.upserted.length > 0;
-    return { status: created ? 201 : 200 };
-  }
-  if (msg.method === "DELETE") {
-    if (!command({ delete: dataset, deletes: [{ q: { _id: key }, limit: 1 }] }).n) return { status: 404, body: { detail: "no record" } };
-    return { status: 204 };
-  }
-  return { status: 400, body: { detail: "unsupported" } };
-};
-"#;
+/// The MongoDB adapters are the checked-in deployable bundles under
+/// `guest-adapters/` — embedded verbatim so the contract tests hold the
+/// shipped files themselves to the store contract. `mongo-data.js` is a
+/// `DataStore` over OP_MSG + a hand-written BSON codec; `mongo-query.js`
+/// executes stored aggregation queries (`POST /query` → one `aggregate` with a
+/// `$facet` page + count).
+const MONGO_ADAPTER: &str = include_str!("../../guest-adapters/mongo-data.js");
+const MONGO_QUERY_ADAPTER: &str = include_str!("../../guest-adapters/mongo-query.js");
 
 // ---- a mock mongod (OP_MSG + a hand-rolled BSON codec) ---------------------
-// A self-contained BSON subset (doc/array/string/int32/int64/double/bool/null)
-// over serde_json::Value, mirroring the adapter's JS codec — no `bson` crate
-// (it bloats the dependency graph past the MSVC linker's module limit).
+// A self-contained BSON subset (doc/array/string/int32/int64/double/bool/null,
+// plus UTC datetime and ObjectId via extended-JSON-style sentinels
+// `{"$date": millis}` / `{"$oid": "24-hex"}`) over serde_json::Value, mirroring
+// the adapter's JS codec — no `bson` crate (it bloats the dependency graph past
+// the MSVC linker's module limit). The sentinels let a test seed the store with
+// the wire types real v1 data carries and assert the adapter's decode.
 
 fn cstr(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
@@ -509,6 +376,24 @@ fn bson_encode_doc(obj: &serde_json::Map<String, Value>) -> Vec<u8> {
                 body.extend_from_slice(&bson_encode_doc(&m));
             }
             Value::Object(o) => {
+                if o.len() == 1 {
+                    // Sentinels for the non-JSON wire types.
+                    if let Some(ms) = o.get("$date").and_then(|v| v.as_i64()) {
+                        body.push(0x09);
+                        cstr(&mut body, k);
+                        body.extend_from_slice(&ms.to_le_bytes());
+                        continue;
+                    }
+                    if let Some(hex) = o.get("$oid").and_then(|v| v.as_str()) {
+                        body.push(0x07);
+                        cstr(&mut body, k);
+                        let oid: Vec<u8> = (0..12)
+                            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+                            .collect();
+                        body.extend_from_slice(&oid);
+                        continue;
+                    }
+                }
                 body.push(0x03);
                 cstr(&mut body, k);
                 body.extend_from_slice(&bson_encode_doc(o));
@@ -580,6 +465,16 @@ fn bson_decode_doc(b: &[u8], start: usize) -> (Value, usize) {
                 off += 8;
                 json!(v)
             }
+            0x09 => {
+                let v = i64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+                off += 8;
+                json!({ "$date": v })
+            }
+            0x07 => {
+                let hex: String = b[off..off + 12].iter().map(|x| format!("{x:02x}")).collect();
+                off += 12;
+                json!({ "$oid": hex })
+            }
             _ => return (Value::Object(map), end),
         };
         map.insert(name, val);
@@ -587,27 +482,28 @@ fn bson_decode_doc(b: &[u8], start: usize) -> (Value, usize) {
     (Value::Object(map), end)
 }
 
-/// A minimal MongoDB server: OP_MSG framing + the command subset the adapter
-/// uses (find/count/update/delete/drop/listCollections), over an in-memory map.
-/// Returns the bound port.
-async fn spawn_mock_mongo() -> u16 {
+/// collection -> (_id -> document): the mock mongod's backing map, returned by
+/// [`spawn_mock_mongo`] so a test can pre-seed wire types (dates, ObjectIds)
+/// that JSON PUTs can't produce.
+type MongoStore = Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>;
+
+/// A minimal MongoDB server: OP_MSG framing + the command subset the adapters
+/// use (find/count/update/delete/drop/listCollections/aggregate), over an
+/// in-memory map. Returns the bound port and the backing store.
+async fn spawn_mock_mongo() -> (u16, MongoStore) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    // collection -> (_id -> document)
-    let store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>> =
-        Arc::new(Mutex::new(BTreeMap::new()));
+    let store: MongoStore = Arc::new(Mutex::new(BTreeMap::new()));
+    let served = store.clone();
     tokio::spawn(async move {
         while let Ok((sock, _)) = listener.accept().await {
-            tokio::spawn(serve_mongo(sock, store.clone()));
+            tokio::spawn(serve_mongo(sock, served.clone()));
         }
     });
-    port
+    (port, store)
 }
 
-async fn serve_mongo(
-    mut sock: TcpStream,
-    store: Arc<Mutex<BTreeMap<String, BTreeMap<String, Value>>>>,
-) {
+async fn serve_mongo(mut sock: TcpStream, store: MongoStore) {
     loop {
         let mut header = [0u8; 16];
         if sock.read_exact(&mut header).await.is_err() {
@@ -666,6 +562,18 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
                 None => batch.extend(map.values().skip(skip).take(limit).cloned()),
             }
         }
+        return json!({ "ok": 1.0, "cursor": { "firstBatch": batch, "id": 0, "ns": format!("test.{coll}") } });
+    }
+    if let Some(coll) = str_of("aggregate") {
+        let pipeline = cmd
+            .get("pipeline")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let docs: Vec<Value> = s.get(coll).map(|m| m.values().cloned().collect()).unwrap_or_default();
+        let batch = run_pipeline(docs, &pipeline);
+        // Real mongod replies to `aggregate` with the cursor shape (the whole
+        // result in firstBatch when it fits): {cursor:{firstBatch,id,ns},ok:1}.
         return json!({ "ok": 1.0, "cursor": { "firstBatch": batch, "id": 0, "ns": format!("test.{coll}") } });
     }
     if let Some(coll) = str_of("count") {
@@ -728,6 +636,68 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
         return json!({ "ok": 1.0, "cursor": { "firstBatch": batch, "id": 0, "ns": "test.$cmd.listCollections" } });
     }
     json!({ "ok": 1.0 }) // hello / ping / unknown
+}
+
+/// Evaluate the aggregation-stage subset the query adapter produces: `$match`
+/// (equality on top-level fields), `$sort` (single field, 1/-1), and the
+/// `$facet`/`$skip`/`$limit`/`$count` combination its paging facet appends.
+fn run_pipeline(mut docs: Vec<Value>, stages: &[Value]) -> Vec<Value> {
+    for stage in stages {
+        let (op, arg) = stage.as_object().and_then(|o| o.iter().next()).expect("stage object");
+        match op.as_str() {
+            "$match" => {
+                let filter = arg.as_object().expect("$match object").clone();
+                docs.retain(|d| filter.iter().all(|(f, want)| d.get(f) == Some(want)));
+            }
+            "$sort" => {
+                let (field, dir) = arg
+                    .as_object()
+                    .and_then(|o| o.iter().next())
+                    .expect("$sort field");
+                let field = field.clone();
+                let asc = dir.as_i64().unwrap_or(1) >= 0;
+                docs.sort_by(|a, b| {
+                    let ord = sort_cmp(a.get(&field), b.get(&field));
+                    if asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
+                });
+            }
+            "$skip" => {
+                let n = (arg.as_u64().unwrap_or(0) as usize).min(docs.len());
+                docs.drain(..n);
+            }
+            "$limit" => docs.truncate(arg.as_u64().unwrap_or(u64::MAX) as usize),
+            "$count" => {
+                let mut counted = serde_json::Map::new();
+                counted.insert(arg.as_str().unwrap_or("n").to_string(), json!(docs.len() as i64));
+                docs = vec![Value::Object(counted)];
+            }
+            "$facet" => {
+                let mut out = serde_json::Map::new();
+                for (k, sub) in arg.as_object().expect("$facet object") {
+                    let sub = sub.as_array().expect("$facet sub-pipeline");
+                    out.insert(k.clone(), Value::Array(run_pipeline(docs.clone(), sub)));
+                }
+                docs = vec![Value::Object(out)];
+            }
+            other => panic!("mock mongod: unsupported pipeline stage {other}"),
+        }
+    }
+    docs
+}
+
+fn sort_cmp(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
+        (Some(Value::Number(x)), Some(Value::Number(y))) => {
+            x.as_f64().partial_cmp(&y.as_f64()).unwrap_or(Ordering::Equal)
+        }
+        _ => Ordering::Equal,
+    }
 }
 
 // ---- the mock Redis (RESP) -------------------------------------------------
@@ -1458,7 +1428,7 @@ async fn guest_backed_file_store_satisfies_the_store_contract() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guest_backed_mongo_data_store_satisfies_the_store_contract() {
-    let port = spawn_mock_mongo().await;
+    let (port, _store) = spawn_mock_mongo().await;
     let dir = tempfile::tempdir().unwrap();
     let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
     let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
@@ -1618,4 +1588,200 @@ async fn guest_backed_mongo_data_store_satisfies_the_store_contract() {
             .any(|e| e["name"] == "orders/"),
         "dropped collection left the root listing: {root}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_backed_mongo_query_adapter_runs_an_aggregation() {
+    let (port, _store) = spawn_mock_mongo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: &str| Body::from_string(s.to_string(), MediaType::new("application/javascript"));
+    files
+        .write("t", ".rs2-code/mongo-data/v1.js", js(MONGO_ADAPTER))
+        .await
+        .unwrap();
+    files
+        .write("t", ".rs2-code/mongo-query/v1.js", js(MONGO_QUERY_ADAPTER))
+        .await
+        .unwrap();
+
+    let socket = json!({ "type": "socket", "hosts": [format!("127.0.0.1:{port}")] });
+    let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/data", "service": "data", "config": { "access": "open", "store": {
+            "adapter": "code:mongo-data@v1", "host": "127.0.0.1", "port": port, "db": "test",
+            "grants": { "mongo": socket.clone() }
+        }}},
+        { "path": "/q", "service": "query", "config": { "access": "open", "store": {
+            "adapter": "code:mongo-query@v1", "host": "127.0.0.1", "port": port, "db": "test",
+            "grants": { "mongo": socket }
+        }}}
+    ]})));
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
+
+    // Seed through the guest data mount (same backend, its own pooled socket).
+    for (k, account, name) in [
+        ("p1", "acc1", "gamma"),
+        ("p2", "acc2", "alpha"),
+        ("p3", "acc1", "alpha"),
+        ("p4", "acc1", "beta"),
+    ] {
+        let resp = rt
+            .handle(
+                req(Method::PUT, &format!("/data/projectItem/{k}"))
+                    .with_json(&json!({ "accountId": account, "name": name })),
+            )
+            .await;
+        assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {k}");
+    }
+
+    // Author a stored aggregation — normal SpecStore authoring, unchanged.
+    let envelope = json!({
+        "language": "json",
+        "query": {
+            "collection": "projectItem",
+            "pipeline": [
+                { "$match": { "accountId": "${accountId}" } },
+                { "$sort": { "name": 1 } }
+            ]
+        },
+        "params": { "type": "object", "properties": { "accountId": { "type": "string" } } }
+    });
+    assert_eq!(
+        rt.handle(req(Method::PUT, "/q/.queries/items").with_json(&envelope))
+            .await
+            .status,
+        Some(StatusCode::CREATED),
+        "author query"
+    );
+
+    // Execute with a param: the adapter runs ONE aggregate — the stored
+    // pipeline plus its paging $facet — and returns the sorted rows + total.
+    let mut resp = rt.handle(req(Method::GET, "/q/items?accountId=acc1")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "execute: {:?}", resp.body);
+    assert_eq!(resp.header("x-total-count"), Some("3"), "X-Total-Count");
+    let rows = body_json(&mut resp).await;
+    let rows = rows.as_array().unwrap();
+    assert!(
+        rows.iter().all(|r| r["accountId"] == "acc1"),
+        "only acc1 items: {rows:?}"
+    );
+    let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["alpha", "beta", "gamma"], "$sort by name");
+
+    // $take/$skip page inside the facet; the total stays the full match count.
+    let mut resp = rt
+        .handle(req(Method::GET, "/q/items?accountId=acc1&$take=1&$skip=1"))
+        .await;
+    assert_eq!(
+        resp.header("x-total-count"),
+        Some("3"),
+        "paged total is the full count"
+    );
+    let page = body_json(&mut resp).await;
+    let page = page.as_array().unwrap();
+    assert_eq!(page.len(), 1, "$take pages");
+    assert_eq!(page[0]["name"], "beta", "$skip offsets into the sorted rows");
+
+    // A malformed stored query (no pipeline) is a clear 400 from the adapter.
+    let bad = json!({
+        "language": "json",
+        "query": { "collection": "projectItem" },
+        "params": { "type": "object" }
+    });
+    assert_eq!(
+        rt.handle(req(Method::PUT, "/q/.queries/bad").with_json(&bad))
+            .await
+            .status,
+        Some(StatusCode::CREATED)
+    );
+    assert_eq!(
+        rt.handle(req(Method::GET, "/q/bad")).await.status,
+        Some(StatusCode::BAD_REQUEST),
+        "missing pipeline → 400"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mongo_adapter_round_trips_int64_and_decodes_dates_and_object_ids() {
+    let (port, store) = spawn_mock_mongo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: &str| Body::from_string(s.to_string(), MediaType::new("application/javascript"));
+    files
+        .write("t", ".rs2-code/mongo-data/v1.js", js(MONGO_ADAPTER))
+        .await
+        .unwrap();
+    let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [{
+        "path": "/data", "service": "data", "config": { "access": "open", "store": {
+            "adapter": "code:mongo-data@v1", "host": "127.0.0.1", "port": port, "db": "test",
+            "grants": { "mongo": { "type": "socket", "hosts": [format!("127.0.0.1:{port}")] } }
+        }}
+    }]})));
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
+
+    // Integers beyond int32 encode as BSON int64 (0x12) and survive put/get.
+    // (Values beyond ±2^53-1 would lose precision as a JS Number — documented
+    // codec caveat — so the boundary case is the largest safe integer.)
+    let resp = rt
+        .handle(req(Method::PUT, "/data/orders/big").with_json(
+            &json!({ "big": 3_000_000_000i64, "max": 9_007_199_254_740_991i64 }),
+        ))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT: {:?}", resp.body);
+    {
+        // The backend received true int64s, not doubles.
+        let s = store.lock().unwrap();
+        let doc = &s["orders"]["big"];
+        assert_eq!(doc["big"], json!(3_000_000_000i64));
+        assert_eq!(doc["max"], json!(9_007_199_254_740_991i64));
+    }
+    let mut resp = rt.handle(req(Method::GET, "/data/orders/big")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK));
+    // Compare numerically: the JS→host envelope may carry a large integer as
+    // a float (exact up to 2^53), so the JSON number *representation* can
+    // differ while the value round-trips losslessly.
+    let rec = body_json(&mut resp).await;
+    assert_eq!(rec["big"].as_f64(), Some(3_000_000_000.0), "int64 round-trips");
+    assert_eq!(
+        rec["max"].as_f64(),
+        Some(9_007_199_254_740_991.0),
+        "2^53-1 round-trips"
+    );
+
+    // Wire types a JSON PUT can't produce: seed the backend directly with a
+    // UTC datetime + ObjectId (what real v1 data holds) and assert the
+    // adapter's decode doesn't lose them.
+    store.lock().unwrap().entry("legacy".to_string()).or_default().insert(
+        "v1".to_string(),
+        json!({
+            "_id": "v1",
+            "created": { "$date": 1_704_067_200_000i64 },
+            "owner": { "$oid": "507f1f77bcf86cd799439011" },
+            "n": 1
+        }),
+    );
+    let mut resp = rt.handle(req(Method::GET, "/data/legacy/v1")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "GET seeded record");
+    let rec = body_json(&mut resp).await;
+    assert_eq!(
+        rec["created"], "2024-01-01T00:00:00.000Z",
+        "datetime decodes to ISO-8601"
+    );
+    assert_eq!(
+        rec["owner"], "507f1f77bcf86cd799439011",
+        "ObjectId decodes to 24-char hex"
+    );
+    assert_eq!(rec["n"], 1);
 }
