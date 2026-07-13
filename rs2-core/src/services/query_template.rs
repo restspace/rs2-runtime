@@ -21,6 +21,12 @@
 //! generalization of v1 Mongo's `ignoreEmptyVariables`). Placeholders
 //! embedded in longer strings splice through the adapter's `quote`.
 //!
+//! Two structural forms extend this for real-world Mongo templates:
+//! an object **key** that is exactly `"${name}"`/`"${name?}"` substitutes to
+//! the parameter's string value (`{"$sort": {"${sortField?}": "${sortDir?}"}}`);
+//! and an object carrying `"$if": "${flag?}"` is elided wholesale when the
+//! flag parameter is absent or empty (v1's `_include` conditional clauses).
+//!
 //! String-language templates (SQL) are **not** substituted by the service:
 //! they pass to the adapter with the validated params intact, so adapters
 //! bind (prepared statements) instead of splicing.
@@ -267,11 +273,68 @@ fn subst_node(
             Ok(Subst::Value(node.clone()))
         }
         Value::Object(o) => {
+            // A `"$if": "${flag?}"` member gates its whole object: when the
+            // parameter is absent or empty (null, false, "", []) the object
+            // is elided from its parent — the structural equivalent of v1
+            // Mongo's `_include`-gated conditional clauses. Otherwise the
+            // marker itself is dropped and the object substitutes normally.
+            if let Some(cond) = o.get("$if") {
+                let ph = cond.as_str().and_then(parse_exact).ok_or_else(|| {
+                    RsError::bad_request(format!(
+                        "$if must be a '${{name}}' or '${{name?}}' placeholder, got {cond}"
+                    ))
+                })?;
+                let keep = match params.get(&ph.name) {
+                    None if ph.optional => false,
+                    None => {
+                        return Err(RsError::bad_request(format!(
+                            "missing query parameter '{}' (required $if condition)",
+                            ph.name
+                        )))
+                    }
+                    Some(v) => match v {
+                        Value::Null | Value::Bool(false) => false,
+                        Value::String(s) => !s.is_empty(),
+                        Value::Array(a) => !a.is_empty(),
+                        _ => true,
+                    },
+                };
+                if !keep {
+                    return Ok(Subst::Elide);
+                }
+            }
             let mut out = Map::with_capacity(o.len());
             for (k, v) in o {
+                if k == "$if" {
+                    continue;
+                }
+                // Keys may themselves be exact placeholders (v1's
+                // `{${sortField}: ${sortDir}}`); an absent optional key
+                // elides the member. Key parameters must be strings — a
+                // spliced/quoted key would be an injection surface.
+                let key = match parse_exact(k) {
+                    None => k.clone(),
+                    Some(ph) => match params.get(&ph.name) {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(other) => {
+                            return Err(RsError::bad_request(format!(
+                                "query parameter '{}' is used as an object key and must be a \
+                                 string, got {other}",
+                                ph.name
+                            )))
+                        }
+                        None if ph.optional => continue,
+                        None => {
+                            return Err(RsError::bad_request(format!(
+                                "missing query parameter '{}'",
+                                ph.name
+                            )))
+                        }
+                    },
+                };
                 match subst_node(v, params, quote)? {
                     Subst::Value(v) => {
-                        out.insert(k.clone(), v);
+                        out.insert(key, v);
                     }
                     Subst::Elide => {} // drop the member
                 }
@@ -405,6 +468,72 @@ mod tests {
         let template = json!({ "where": { "status": "${status?}" } });
         let out = substitute_json(&template, &params(json!({ "status": "open" })), &q).unwrap();
         assert_eq!(out, json!({ "where": { "status": "open" } }));
+    }
+
+    #[test]
+    fn placeholder_object_keys_substitute() {
+        // The v1 dynamic-sort idiom: the sort field is itself a parameter.
+        let template = json!({ "$sort": { "${sortField?}": "${sortDir?}" } });
+        let out = substitute_json(
+            &template,
+            &params(json!({ "sortField": "name", "sortDir": -1 })),
+            &q,
+        )
+        .unwrap();
+        assert_eq!(out, json!({ "$sort": { "name": -1 } }));
+
+        // Optional key absent → the member vanishes.
+        let out = substitute_json(&template, &params(json!({})), &q).unwrap();
+        assert_eq!(out, json!({ "$sort": {} }));
+
+        // Required key absent → 400; non-string key parameter → 400.
+        let required = json!({ "$sort": { "${sortField}": 1 } });
+        assert_eq!(substitute_json(&required, &params(json!({})), &q).unwrap_err().status, 400);
+        let err = substitute_json(&template, &params(json!({ "sortField": 3, "sortDir": 1 })), &q)
+            .unwrap_err();
+        assert_eq!(err.status, 400, "key params must be strings");
+    }
+
+    #[test]
+    fn if_marker_gates_whole_clauses() {
+        let template = json!({ "pipeline": [
+            { "$match": { "accountId": "${accountId}" } },
+            { "$if": "${onlyMissingCost?}", "$match": { "cost": null } },
+            { "$limit": 10 }
+        ]});
+        let with = substitute_json(
+            &template,
+            &params(json!({ "accountId": "a1", "onlyMissingCost": true })),
+            &q,
+        )
+        .unwrap();
+        assert_eq!(
+            with["pipeline"],
+            json!([ { "$match": { "accountId": "a1" } }, { "$match": { "cost": null } },
+                    { "$limit": 10 } ]),
+            "flag present: clause kept, marker stripped"
+        );
+
+        // Absent or empty flag values drop the clause entirely.
+        for absent in [json!({}), json!({ "onlyMissingCost": null }),
+                       json!({ "onlyMissingCost": "" }), json!({ "onlyMissingCost": [] }),
+                       json!({ "onlyMissingCost": false })] {
+            let mut p = params(absent);
+            p.insert("accountId".into(), json!("a1"));
+            let out = substitute_json(&template, &p, &q).unwrap();
+            assert_eq!(
+                out["pipeline"],
+                json!([ { "$match": { "accountId": "a1" } }, { "$limit": 10 } ]),
+                "clause dropped for {p:?}"
+            );
+        }
+
+        // A required (non-`?`) $if with no param is an error, and a
+        // non-placeholder $if is malformed.
+        let strict = json!({ "$if": "${must}", "x": 1 });
+        assert_eq!(substitute_json(&strict, &params(json!({})), &q).unwrap_err().status, 400);
+        let bad = json!({ "$if": true, "x": 1 });
+        assert_eq!(substitute_json(&bad, &params(json!({})), &q).unwrap_err().status, 400);
     }
 
     #[test]
