@@ -62,6 +62,8 @@ pub struct Principal {
     pub roles: Vec<String>,
     /// `user` or `agent` (PRD §10.5: agent principals are first-class).
     pub kind: String,
+    /// Extra JWT claims (the auth mount's `jwtUserProps`), e.g. `accountId`.
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Path + query of a message URL, with the mount split applied by the router:

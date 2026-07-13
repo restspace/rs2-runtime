@@ -36,6 +36,7 @@ fn as_role(mut msg: Message, role: &str) -> Message {
         id: format!("{role}-1"),
         roles: vec![role.to_string()],
         kind: "user".into(),
+        extra: Default::default(),
     });
     msg
 }

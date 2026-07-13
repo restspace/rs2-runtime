@@ -731,6 +731,7 @@ mod tests {
             id: "u1".into(),
             roles: vec!["U".into()],
             kind: "user".into(),
+            extra: Default::default(),
         });
         assert!(check_access(
             &authed,

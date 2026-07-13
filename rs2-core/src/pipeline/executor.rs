@@ -191,6 +191,42 @@ impl Executor {
             ));
         }
         let mut vars = self.initial_vars.clone();
+        // Bind the original caller (not any per-step elevated principal) into
+        // the spec planes: `$_user.x` in transforms, `${_user.x}` in URLs.
+        // Inserted after `initial_vars` so the principal wins name clashes
+        // with granted vars; anonymous callers get no binding at all.
+        if let Some(p) = &msg.principal {
+            let mut user = Map::new();
+            user.insert("email".into(), Value::String(p.id.clone()));
+            user.insert(
+                "roles".into(),
+                Value::Array(p.roles.iter().map(|r| Value::String(r.clone())).collect()),
+            );
+            for (k, v) in &p.extra {
+                user.insert(k.clone(), v.clone());
+            }
+            vars.insert("_user".into(), Value::Object(user.clone()));
+            vars.insert("principal".into(), Value::Object(user));
+        }
+        // Bind the triggering URL for specs that dispatch on it (v1's
+        // pathPattern `$N` segment refs): `$_url.path[n]` in transforms,
+        // `${_url.query.x}` in step URLs.
+        let mut url = Map::new();
+        url.insert(
+            "path".into(),
+            Value::Array(
+                msg.url.service_segments().iter().map(|s| Value::String((*s).into())).collect(),
+            ),
+        );
+        let mut query = Map::new();
+        for pair in msg.url.query.split('&').filter(|p| !p.is_empty()) {
+            let (k, _) = pair.split_once('=').unwrap_or((pair, ""));
+            if let Some(v) = msg.url.query_param(k) {
+                query.entry(k.to_string()).or_insert(Value::String(v));
+            }
+        }
+        url.insert("query".into(), Value::Object(query));
+        vars.insert("_url".into(), Value::Object(url));
         match self.run_pipeline(spec, msg, &mut vars, 0, "", to_step).await? {
             Flow::Continue(m) | Flow::Exit(m) | Flow::Abort(m) => Ok(m),
         }
@@ -598,7 +634,11 @@ impl Executor {
                 .await
                 .map_err(|e| RsError::internal(format!("transform task panicked: {e}")))??;
             if let Some(capture) = &step.capture {
+                // Captured raw — a `$response` envelope is data here, keeping
+                // capture orthogonal to response shaping.
                 vars.insert(capture.trim_start_matches('$').to_string(), out);
+            } else if let Some(envelope) = super::response::ResponseEnvelope::detect(&out) {
+                envelope.apply(&mut msg)?;
             } else {
                 msg.body = Some(Body::from_json(&out));
                 msg.status = Some(http::StatusCode::OK);
@@ -685,6 +725,7 @@ impl Executor {
                     id: String::new(),
                     roles: Vec::new(),
                     kind: "agent".into(),
+                    extra: Default::default(),
                 });
                 if !p.roles.iter().any(|r| r == role) {
                     p.roles.push(role.clone());

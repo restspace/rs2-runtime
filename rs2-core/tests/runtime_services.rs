@@ -358,6 +358,7 @@ async fn auth_stub_gates_protected_mounts() {
         id: "u1".into(),
         roles: vec!["U".into()],
         kind: "user".into(),
+        extra: Default::default(),
     });
     // Passes auth, then 404s on the missing file — proving the gate opened.
     let resp = rt.handle(authed).await;

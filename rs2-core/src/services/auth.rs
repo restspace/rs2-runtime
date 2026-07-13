@@ -43,6 +43,12 @@ pub struct AuthSettings {
     /// `allowedLoginDomains`); empty = no origin restriction. Same-origin
     /// requests are always allowed.
     pub allowed_login_origins: Vec<String>,
+    /// User-record fields copied into the token as extra claims (and exposed
+    /// on the [`Principal`]). These become bearer authority for the session,
+    /// so every named field must be operator-writable-only in the user
+    /// dataset (enforce via the data mount's field-level authz); never name a
+    /// self-writable field here.
+    pub jwt_user_props: Vec<String>,
 }
 
 impl Default for AuthSettings {
@@ -54,6 +60,7 @@ impl Default for AuthSettings {
             lock_minutes: 10,
             user_dataset: "users".to_string(),
             allowed_login_origins: vec![],
+            jwt_user_props: vec![],
         }
     }
 }
@@ -67,6 +74,10 @@ pub struct Claims {
     pub kind: String,
     pub iat: u64,
     pub exp: u64,
+    /// Extra claims copied from the user record per `jwtUserProps`. Absent
+    /// from the payload when empty, so pre-existing tokens verify unchanged.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn now_secs() -> u64 {
@@ -143,6 +154,7 @@ pub fn principal_from_token(msg: &Message, secret: &str) -> Result<Option<Princi
         id: claims.sub,
         roles: claims.roles.split_whitespace().map(String::from).collect(),
         kind: claims.kind,
+        extra: claims.extra,
     }))
 }
 
@@ -247,11 +259,23 @@ impl AuthService {
         self.lockouts.lock().unwrap().remove(user);
     }
 
-    fn issue(&self, sub: &str, roles: &str, kind: &str) -> Result<(String, u64), RsError> {
+    fn issue(
+        &self,
+        sub: &str,
+        roles: &str,
+        kind: &str,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(String, u64), RsError> {
         let iat = now_secs();
         let exp = iat + self.settings.session_minutes * 60;
-        let claims =
-            Claims { sub: sub.to_string(), roles: roles.to_string(), kind: kind.to_string(), iat, exp };
+        let claims = Claims {
+            sub: sub.to_string(),
+            roles: roles.to_string(),
+            kind: kind.to_string(),
+            iat,
+            exp,
+            extra,
+        };
         Ok((sign(&claims, &self.settings.jwt_secret)?, exp))
     }
 
@@ -354,7 +378,15 @@ impl AuthService {
             _ => "U".to_string(),
         };
         let kind = user.get("kind").and_then(|v| v.as_str()).unwrap_or("user");
-        let (token, exp) = self.issue(&email, &roles, kind)?;
+        let mut extra = serde_json::Map::new();
+        for prop in &self.settings.jwt_user_props {
+            if let Some(v) = user.get(prop) {
+                if !v.is_null() {
+                    extra.insert(prop.clone(), v.clone());
+                }
+            }
+        }
+        let (token, exp) = self.issue(&email, &roles, kind, extra)?;
         Ok(self.token_response(&msg, ctx, &token, exp))
     }
 
@@ -371,7 +403,8 @@ impl AuthService {
             // Not yet refreshable: return the existing token unchanged.
             return Ok(msg.ok_json(&serde_json::json!({ "token": token, "exp": claims.exp })));
         }
-        let (token, exp) = self.issue(&claims.sub, &claims.roles, &claims.kind)?;
+        let (token, exp) =
+            self.issue(&claims.sub, &claims.roles, &claims.kind, claims.extra.clone())?;
         Ok(self.token_response(&msg, ctx, &token, exp))
     }
 
@@ -397,9 +430,17 @@ impl Service for AuthService {
             (&http::Method::POST, ["refresh"]) => self.refresh(msg, ctx),
             (&http::Method::POST, ["logout"]) => Ok(self.logout(msg)),
             (&http::Method::GET, ["user"]) => match &msg.principal {
-                Some(p) => Ok(msg.ok_json(&serde_json::json!({
-                    "id": p.id, "roles": p.roles, "kind": p.kind,
-                }))),
+                Some(p) => {
+                    let mut body = serde_json::Map::new();
+                    body.insert("id".into(), serde_json::json!(p.id));
+                    body.insert("roles".into(), serde_json::json!(p.roles));
+                    body.insert("kind".into(), serde_json::json!(p.kind));
+                    // Extra claims ride along; id/roles/kind win name clashes.
+                    for (k, v) in &p.extra {
+                        body.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                    Ok(msg.ok_json(&serde_json::Value::Object(body)))
+                }
                 None => Err(RsError::unauthorized("no authenticated principal")),
             },
             _ => Err(RsError::not_found(format!(
@@ -422,6 +463,7 @@ mod tests {
             kind: "user".into(),
             iat: now_secs(),
             exp: now_secs() + 3600,
+            extra: serde_json::Map::new(),
         };
         let token = sign(&claims, "secret-key").unwrap();
         let back = verify(&token, "secret-key").unwrap();
@@ -434,6 +476,33 @@ mod tests {
         let expired = Claims { exp: now_secs() - 10, ..claims };
         let token = sign(&expired, "secret-key").unwrap();
         assert!(verify(&token, "secret-key").is_err());
+    }
+
+    #[test]
+    fn extra_claims_round_trip_and_extra_free_tokens_stay_compatible() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("accountId".into(), serde_json::json!("acc-42"));
+        let claims = Claims {
+            sub: "ada@example.com".into(),
+            roles: "U".into(),
+            kind: "user".into(),
+            iat: now_secs(),
+            exp: now_secs() + 3600,
+            extra,
+        };
+        let token = sign(&claims, "secret-key").unwrap();
+        let back = verify(&token, "secret-key").unwrap();
+        assert_eq!(back.extra["accountId"], "acc-42");
+
+        // With no extra claims the payload omits the field entirely, so the
+        // token bytes match the pre-`extra` format and old tokens verify.
+        let old = Claims { extra: serde_json::Map::new(), ..claims };
+        let token = sign(&old, "secret-key").unwrap();
+        let payload =
+            String::from_utf8(B64.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        assert!(!payload.contains("extra"), "empty extra must not appear in the payload");
+        let back = verify(&token, "secret-key").unwrap();
+        assert!(back.extra.is_empty());
     }
 
     #[test]
