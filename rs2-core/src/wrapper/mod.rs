@@ -556,8 +556,20 @@ pub(crate) fn satisfies_role_spec(spec: &str, msg: &Message) -> bool {
             match path_pattern {
                 None => return true,
                 Some(pattern) => {
+                    // `{email}` resolves to the principal id; any other
+                    // `{name}` to a string extra claim (`jwtUserProps`, e.g.
+                    // `{accountId}`). An unresolved placeholder is left
+                    // verbatim and so never matches a real path — fail closed.
                     let resolved = match principal {
-                        Some(p) => pattern.replace("{email}", &p.id),
+                        Some(p) => {
+                            let mut resolved = pattern.replace("{email}", &p.id);
+                            for (k, v) in &p.extra {
+                                if let Some(s) = v.as_str() {
+                                    resolved = resolved.replace(&format!("{{{k}}}"), s);
+                                }
+                            }
+                            resolved
+                        }
                         None => pattern.to_string(),
                     };
                     let path = &msg.url.service_path;
@@ -684,6 +696,33 @@ mod tests {
         assert!(policy
             .check_cookie_csrf(&same, "https://api.acme.com", Some("api.acme.com"))
             .is_ok());
+    }
+
+    #[test]
+    fn path_scoped_grants_resolve_extra_claims() {
+        let user = |account: Option<&str>, path: &str| {
+            let mut msg = Message::request(Method::GET, path, "t1");
+            msg.url.apply_mount("");
+            let mut extra = serde_json::Map::new();
+            if let Some(a) = account {
+                extra.insert("accountId".into(), serde_json::json!(a));
+            }
+            msg.principal = Some(crate::message::Principal {
+                id: "u1@x.com".into(),
+                roles: vec!["U".into()],
+                kind: "user".into(),
+                extra,
+            });
+            msg
+        };
+        let spec = "authenticated /{accountId} A";
+        // Own-account subtree matches; another account's does not.
+        assert!(satisfies_role_spec(spec, &user(Some("acc1"), "/acc1/photo.jpg")));
+        assert!(!satisfies_role_spec(spec, &user(Some("acc1"), "/acc2/photo.jpg")));
+        // No claim → the placeholder stays verbatim → fail closed.
+        assert!(!satisfies_role_spec(spec, &user(None, "/acc1/photo.jpg")));
+        // `{email}` keeps resolving from the principal id.
+        assert!(satisfies_role_spec("U /{email}", &user(None, "/u1@x.com/inbox")));
     }
 
     #[test]
