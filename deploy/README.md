@@ -68,6 +68,13 @@ Manual steps mirror the installer: copy the binary to `/usr/bin`, create the
 config + unit, `systemctl enable --now rs2`, then render the vhost with your
 domain and `a2ensite`.
 
+## Building from source instead
+
+The above uses prebuilt release binaries. To **compile on the box** (native +
+Wasm + V8/JS) and run it **multi-tenant** behind Apache, follow the step-by-step
+runbook in [`build-from-source-ubuntu.md`](build-from-source-ubuntu.md). It
+reuses the same systemd unit and vhost, so the two paths converge operationally.
+
 ## Upgrading
 
 Re-run the same one-liner. The installer is idempotent: it downloads the new

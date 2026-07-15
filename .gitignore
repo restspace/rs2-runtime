@@ -18,3 +18,7 @@ examples/*/data-store/
 /rs2-dev.err.log
 # Prebuilt server binaries (release artifacts, not source).
 /rs2-server-ubuntu18
+# Local npm helper (personal SSH shortcut with private key path).
+/package.json
+# Stray agent worktrees.
+/.claude/
