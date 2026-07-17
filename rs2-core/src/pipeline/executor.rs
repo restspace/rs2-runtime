@@ -24,8 +24,9 @@ use super::spec::{Action, Joiner, Mode, PipelineSpec, Step};
 use super::transform;
 
 /// Dispatches a message produced by a pipeline step. The runtime supplies an
-/// implementation that routes internally (and, in time, externally through
-/// `HttpOut` grants); failures come back as error-status messages.
+/// implementation that routes internally; absolute `http(s)://` call URLs
+/// leave the node through the mount's `httpOut` grants instead
+/// ([`Executor::with_external`]). Failures come back as error-status messages.
 #[async_trait]
 pub trait Requester: Send + Sync {
     async fn request(&self, msg: Message) -> Message;
@@ -96,6 +97,17 @@ pub struct Executor {
     /// Verbatim service-path remainder for `${url.rest}` (byte-exact, leading
     /// slash) — the wrapper service forwards this for transparent passthrough.
     url_rest: String,
+    /// External-call capability, built from the pipeline mount's `httpOut`
+    /// grants. `None` ⇒ absolute call URLs are denied (`capability_denied`).
+    external: Option<Arc<crate::outbound::ExternalDispatch>>,
+}
+
+/// Where a resolved call goes: back through internal dispatch, or out through
+/// the mount's `httpOut` grants (the grant index selects the injector).
+#[derive(Clone)]
+enum CallTarget {
+    Internal(Arc<dyn Requester>),
+    External(Arc<crate::outbound::ExternalDispatch>, usize),
 }
 
 /// What a step did with the in-flight message.
@@ -124,6 +136,7 @@ impl Executor {
             url_name: None,
             url_query: String::new(),
             url_rest: String::new(),
+            external: None,
         }
     }
 
@@ -157,6 +170,16 @@ impl Executor {
     /// pipeline mount's operator-controlled config).
     pub fn with_elevate_role(mut self, role: Option<String>) -> Self {
         self.elevate_role = role;
+        self
+    }
+
+    /// The mount's external-call capability (its `httpOut` grants). Without
+    /// this, absolute `http(s)://` call URLs are denied before any I/O.
+    pub(crate) fn with_external(
+        mut self,
+        external: Option<Arc<crate::outbound::ExternalDispatch>>,
+    ) -> Self {
+        self.external = external;
         self
     }
 
@@ -735,37 +758,81 @@ impl Executor {
             _ => msg.principal.clone(),
         };
 
+        // Where the call goes: an absolute `http(s)://` URL (detected after
+        // interpolation, so `${var}`-built URLs are gated too) leaves the node
+        // through the mount's `httpOut` grants — allowlist checked once here,
+        // before the retry loop and before any I/O. Everything else re-enters
+        // internal dispatch.
+        let is_external = crate::outbound::is_external_url(&url);
+        let target: Result<CallTarget, RsError> = if is_external {
+            match &self.external {
+                Some(ext) => ext.authorize(&url).map(|g| CallTarget::External(ext.clone(), g)),
+                None => Err(RsError::capability_denied(&format!(
+                    "httpOut to '{}' (this pipeline's mount has no httpOut grants)",
+                    crate::outbound::url_host(&url).unwrap_or_default()
+                ))),
+            }
+        } else {
+            Ok(CallTarget::Internal(self.requester.clone()))
+        };
+
         // Bodies move into the closure: borrowing them across the retry
         // awaits would require `Body: Sync`, which stream payloads are not.
         let mut bodies = (cloneable_body, one_shot_body);
-        let requester = self.requester.clone();
         let headers = call.headers.clone();
-        let response = retry_request(&policy, effect, needs_key, move |_attempt| {
-            let mut req = Message::request(method.clone(), &url, &tenant);
-            req.source = Source::Internal;
-            req.depth = depth_for_call;
-            req.trace = trace.child();
-            req.principal = principal.clone();
-            req.body = bodies.0.as_ref().and_then(clone_body).or_else(|| bodies.1.take());
-            if let Some(headers) = &headers {
-                for (k, v) in headers {
-                    if let (Ok(name), Ok(value)) = (
-                        http::header::HeaderName::try_from(k.as_str()),
-                        http::HeaderValue::from_str(v),
-                    ) {
-                        req.headers.insert(name, value);
+        let result = match target {
+            Err(e) => Err(e),
+            Ok(target) => {
+                retry_request(&policy, effect, needs_key, move |_attempt| {
+                    let mut req = Message::request(method.clone(), &url, &tenant);
+                    req.source = Source::Internal;
+                    req.depth = depth_for_call;
+                    req.trace = trace.child();
+                    // The principal stays inside the node: an external request
+                    // carries only spec headers (+ the idempotency key), so
+                    // `elevate` is structurally inert externally.
+                    if matches!(target, CallTarget::Internal(_)) {
+                        req.principal = principal.clone();
                     }
-                }
+                    req.body =
+                        bodies.0.as_ref().and_then(clone_body).or_else(|| bodies.1.take());
+                    if let Some(headers) = &headers {
+                        for (k, v) in headers {
+                            if let (Ok(name), Ok(value)) = (
+                                http::header::HeaderName::try_from(k.as_str()),
+                                http::HeaderValue::from_str(v),
+                            ) {
+                                req.headers.insert(name, value);
+                            }
+                        }
+                    }
+                    // Auto-generated idempotency key (PRD §7.2): keyed targets get
+                    // exactly-once-effective semantics without key plumbing.
+                    if needs_key && req.header("idempotency-key").is_none() {
+                        req.set_header("idempotency-key", &auto_key);
+                    }
+                    let target = target.clone();
+                    async move {
+                        match target {
+                            CallTarget::Internal(requester) => Ok(requester.request(req).await),
+                            // Transport errors propagate as `Err` so the retry
+                            // loop's `retryOnNetworkError` path sees them.
+                            CallTarget::External(ext, grant) => ext.send(grant, req).await,
+                        }
+                    }
+                })
+                .await
             }
-            // Auto-generated idempotency key (PRD §7.2): keyed targets get
-            // exactly-once-effective semantics without key plumbing.
-            if needs_key && req.header("idempotency-key").is_none() {
-                req.set_header("idempotency-key", &auto_key);
-            }
-            let requester = requester.clone();
-            async move { Ok(requester.request(req).await) }
-        })
-        .await?;
+        };
+        // Internal dispatch never errs (the requester shapes failures into
+        // error-status messages); external gate denials and exhausted
+        // transport errors do — shape them the same way, so try/stop/capture
+        // and the step report see one failure form for both targets.
+        let response = match result {
+            Ok(resp) => resp,
+            Err(e) if is_external => msg.error_response(&e),
+            Err(e) => return Err(e),
+        };
 
         let mut out = response;
         if let Some(name) = &step.name {

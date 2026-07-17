@@ -144,9 +144,20 @@ impl Service for PipelineService {
                     .to_string();
                 let doc = self.store.read(&rel).await?;
                 let spec = Self::spec_from_doc(&doc)?;
+                let mut plan = plan(&spec);
+                // Static external-coverage check: literal absolute call URLs
+                // whose host no `httpOut` grant on this mount covers would be
+                // denied at execution — surface that here, at authoring time.
+                let external = crate::outbound::ExternalDispatch::from_mount(
+                    &ctx.config,
+                    ctx.http.clone(),
+                    &ctx.outbound_injectors,
+                    ctx.limits.materialized_body_bytes,
+                );
+                append_external_warnings(&spec, "", external.as_ref(), &mut plan.warnings);
                 return Ok(msg.ok_json(&serde_json::json!({
                     "pipeline": spec,
-                    "plan": plan(&spec),
+                    "plan": plan,
                 })));
             }
             return self.store.handle_authoring(msg).await;
@@ -282,6 +293,17 @@ pub(crate) async fn run_inline(
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         )
+        // External calls (absolute http(s) URLs in call steps) go out through
+        // the mount's `httpOut` grants; without any, they are denied.
+        .with_external(
+            crate::outbound::ExternalDispatch::from_mount(
+                &ctx.config,
+                ctx.http.clone(),
+                &ctx.outbound_injectors,
+                ctx.limits.materialized_body_bytes,
+            )
+            .map(std::sync::Arc::new),
+        )
         .with_url(inputs.peeled, inputs.base_segs, inputs.url_name, inputs.url_query, inputs.rest);
     // Bind the mount's granted secrets as `$<name>` variables (host-side),
     // so a transform can `$hmacVerify('sha256', $<name>, $_rawBody, $sig)`.
@@ -332,6 +354,41 @@ pub(crate) async fn run_inline(
             Ok(resp)
         }
         other => other,
+    }
+}
+
+/// `?$plan` static coverage: warn on literal external call URLs whose host no
+/// `httpOut` grant on the mount covers (they would be `capability_denied` at
+/// execution). Hosts built by `${…}` interpolation can't be checked statically
+/// and are skipped.
+fn append_external_warnings(
+    spec: &PipelineSpec,
+    at: &str,
+    external: Option<&crate::outbound::ExternalDispatch>,
+    warnings: &mut Vec<String>,
+) {
+    for (i, step) in spec.steps.iter().enumerate() {
+        if let Some(call) = &step.call {
+            if crate::outbound::is_external_url(&call.url) {
+                if let Some(host) = crate::outbound::url_host(&call.url) {
+                    let interpolated = host.contains("${");
+                    if !interpolated && !external.map(|e| e.covers(&host)).unwrap_or(false) {
+                        warnings.push(format!(
+                            "{at}/steps[{i}]: external host '{host}' is not covered by any \
+                             httpOut grant on this mount — the call would be denied",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(sub) = &step.pipeline {
+            append_external_warnings(
+                sub,
+                &format!("{at}/steps[{i}]/pipeline"),
+                external,
+                warnings,
+            );
+        }
     }
 }
 

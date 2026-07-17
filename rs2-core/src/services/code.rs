@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::contract::CapabilityTarget;
 use crate::error::RsError;
 use crate::message::{Message, Source};
+use crate::outbound::{host_matches, url_host};
 
 use super::{Service, ServiceContext};
 
@@ -217,30 +218,6 @@ impl CodeService {
     }
 }
 
-/// Host of an absolute URL ("https://api.x.com:8443/v1" → "api.x.com").
-#[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
-pub(crate) fn url_host(url: &str) -> Option<String> {
-    let rest = url.split_once("://")?.1;
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host = authority.rsplit('@').next()?.split(':').next()?;
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_ascii_lowercase())
-    }
-}
-
-/// Allowlist matching: exact host or a `*.suffix` wildcard.
-#[cfg_attr(not(any(feature = "wasm", feature = "js")), allow(dead_code))]
-pub(crate) fn host_matches(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        host == suffix || host.ends_with(&format!(".{suffix}"))
-    } else {
-        host == pattern
-    }
-}
-
 #[async_trait]
 impl Service for CodeService {
     async fn handle(&self, msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
@@ -348,18 +325,6 @@ mod tests {
         assert!(CodeService::from_ref("code:noversion").is_err());
         assert!(CodeService::from_ref("code:bad/name@v").is_err());
         assert!(CodeService::from_ref("file").is_err());
-    }
-
-    #[test]
-    fn host_allowlist_matching() {
-        assert_eq!(url_host("https://api.stripe.com/v1/charges").as_deref(), Some("api.stripe.com"));
-        assert_eq!(url_host("https://api.x.com:8443/v1?q=1").as_deref(), Some("api.x.com"));
-        assert_eq!(url_host("/relative/path"), None);
-        assert!(host_matches("api.stripe.com", "api.stripe.com"));
-        assert!(host_matches("*.stripe.com", "api.stripe.com"));
-        assert!(host_matches("*.stripe.com", "stripe.com"));
-        assert!(!host_matches("*.stripe.com", "evil-stripe.com"));
-        assert!(!host_matches("api.stripe.com", "api.stripe.com.evil.io"));
     }
 
     #[test]

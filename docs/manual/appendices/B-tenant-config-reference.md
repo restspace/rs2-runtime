@@ -65,7 +65,7 @@ Trusted = credentialed CORS + cookie lane; allowed = bearer-only. See 5.5.
 | `elevate` | (pipeline mounts) role an `elevate` step adds to the caller — operator-set, not an operator role | 5.0, 7.3 |
 | `retry` | Retry policy for calls this mount makes | 7.7 |
 | `caching` | `mode`/`maxAgeSeconds`/`public`/`immutable` | 9.4 |
-| `grants` | Capability grants (custom-code mounts): `{prefix}`, `{type:"httpOut",hosts}`, `{type:"socket",hosts}` | 8.5 |
+| `grants` | Capability grants: `{prefix}`, `{type:"httpOut",hosts}`, `{type:"socket",hosts}` — code mounts (8.5); `httpOut` also on pipeline/wrapper mounts for external `call` steps (7.3) | 8.5 |
 | `x-agent`, `x-policy`, `x-expose`, `x-render`, `x-context`, `description` | Agent-surface metadata | 9.1 |
 
 ## Per-service config highlights
@@ -74,7 +74,7 @@ Trusted = credentialed CORS + cookie lane; allowed = bearer-only. See 5.5.
 | --- | --- |
 | `file` | `defaultResource`, `spaFallback`, `listings`, `friendlyUrls`, `extensionPriority` (static-site, 4.3); `store: {adapter}` for a loadable backend (8.9) |
 | `data` | `enforceSchema` (4.4); `fieldLevelAuthz` — per-field `x-rs-read`/`x-rs-write` schema rules (4.5); `store: {adapter}` for a loadable backend (8.9) |
-| `pipeline` | `retry`, `store: {root}` (relocate spec storage) (7.1) |
+| `pipeline` | `retry`, `store: {root}` (relocate spec storage) (7.1); `grants` (`httpOut`) for external `call` steps (7.3) |
 | `query` | `store: {root}` (6.1); `store: {adapter}` for a loadable backend (8.9) |
 | `auth` | usually just `access`; tenant-level `auth` holds the real settings (5.1) |
 | `services` | `access` with `write: "A"`; config changes are operator-only (5.0, 10.4) |

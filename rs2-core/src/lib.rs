@@ -32,6 +32,7 @@ pub mod idempotency;
 pub mod infra;
 pub mod logging;
 pub mod message;
+pub(crate) mod outbound;
 pub mod path_pattern;
 pub mod pipeline;
 pub mod retry;

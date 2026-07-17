@@ -63,7 +63,7 @@ pub trait CatalogueClient: Send + Sync {
 }
 
 /// The real client: a bounded outbound `GET` over [`HttpOut`], gated by the
-/// operator host-allowlist (wildcard patterns, reusing `code::host_matches`)
+/// operator host-allowlist (wildcard patterns, reusing `outbound::host_matches`)
 /// before any I/O.
 pub struct HttpCatalogueClient {
     http: Arc<dyn HttpOut>,
@@ -76,9 +76,9 @@ impl HttpCatalogueClient {
     }
 
     fn check_host(&self, url: &str) -> Result<(), RsError> {
-        let host = super::code::url_host(url)
+        let host = crate::outbound::url_host(url)
             .ok_or_else(|| RsError::bad_request(format!("catalogue URL '{url}' has no host")))?;
-        if self.hosts.iter().any(|p| super::code::host_matches(p, &host)) {
+        if self.hosts.iter().any(|p| crate::outbound::host_matches(p, &host)) {
             Ok(())
         } else {
             Err(RsError::capability_denied(&format!("catalogue fetch to '{host}'")))

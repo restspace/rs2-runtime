@@ -270,7 +270,7 @@ impl Tenant {
         // so a malformed URL is a 400 at `PUT /raw`, not a runtime surprise.
         // The operator host-allowlist is enforced separately, at fetch time.
         for cat in &config.catalogues {
-            if crate::services::code::url_host(&cat.url).is_none()
+            if crate::outbound::url_host(&cat.url).is_none()
                 || !(cat.url.starts_with("http://") || cat.url.starts_with("https://"))
             {
                 return Err(RsError::bad_request(format!(

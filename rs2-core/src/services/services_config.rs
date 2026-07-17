@@ -499,7 +499,7 @@ impl ServicesService {
                         Some(serde_json::json!({
                             "name": name,
                             "url": url,
-                            "host": super::code::url_host(url),
+                            "host": crate::outbound::url_host(url),
                             "allowlisted": allowlisted,
                         }))
                     })
