@@ -407,6 +407,59 @@ async fn spec_headers_interpolate_captured_variables() {
 }
 
 #[tokio::test]
+async fn external_request_defaults_standard_headers() {
+    let http = MockHttp::new();
+    let dir = tempfile::tempdir().unwrap();
+    let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
+
+    put_spec(&rt, "typed", json!({ "pipeline": { "steps": [
+        { "call": { "method": "POST", "url": "https://api.stripe.com/v1/things" } }
+    ] } }))
+    .await;
+
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/typed", "t").with_json(&json!({ "a": 1 })))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
+    // Content-Type from the forwarded body's media type; Accept and
+    // User-Agent defaulted so picky upstreams don't reject the request.
+    assert!(
+        http.header(0, "content-type").unwrap_or_default().starts_with("application/json"),
+        "{:?}",
+        http.header(0, "content-type")
+    );
+    assert_eq!(http.header(0, "accept").as_deref(), Some("*/*"));
+    assert!(
+        http.header(0, "user-agent").unwrap_or_default().starts_with("rs2/"),
+        "{:?}",
+        http.header(0, "user-agent")
+    );
+}
+
+#[tokio::test]
+async fn spec_headers_override_the_standard_defaults() {
+    let http = MockHttp::new();
+    let dir = tempfile::tempdir().unwrap();
+    let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
+
+    put_spec(&rt, "xml", json!({ "pipeline": { "steps": [
+        { "call": { "method": "POST", "url": "https://api.stripe.com/v1/things",
+                    "headers": { "content-type": "application/xml",
+                                 "accept": "text/plain",
+                                 "user-agent": "custom-agent/1.0" } } }
+    ] } }))
+    .await;
+
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/xml", "t").with_json(&json!({ "a": 1 })))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
+    assert_eq!(http.header(0, "content-type").as_deref(), Some("application/xml"));
+    assert_eq!(http.header(0, "accept").as_deref(), Some("text/plain"));
+    assert_eq!(http.header(0, "user-agent").as_deref(), Some("custom-agent/1.0"));
+}
+
+#[tokio::test]
 async fn header_interpolation_failure_aborts_before_any_io() {
     let http = MockHttp::new();
     let dir = tempfile::tempdir().unwrap();

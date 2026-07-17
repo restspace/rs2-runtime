@@ -136,6 +136,28 @@ impl ExternalDispatch {
         let http = self.http.as_ref().ok_or_else(|| {
             RsError::engine_unavailable("this deployment has no outbound HTTP adapter configured")
         })?;
+        // Inside the node a body's media type travels on the `Body` itself and
+        // headers are never consulted, but on the wire only headers exist —
+        // default `Content-Type` from the body so a forwarded/shaped body
+        // isn't sent untyped, plus the standard headers picky upstreams
+        // require (GitHub 403s UA-less requests). Explicit spec headers win;
+        // `Host`/`Content-Length` stay with the transport.
+        if let Some(body) = &msg.body {
+            if !msg.headers.contains_key(http::header::CONTENT_TYPE) {
+                if let Ok(v) = http::HeaderValue::from_str(&body.media_type.to_string()) {
+                    msg.headers.insert(http::header::CONTENT_TYPE, v);
+                }
+            }
+        }
+        if !msg.headers.contains_key(http::header::ACCEPT) {
+            msg.headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("*/*"));
+        }
+        if !msg.headers.contains_key(http::header::USER_AGENT) {
+            msg.headers.insert(
+                http::header::USER_AGENT,
+                http::HeaderValue::from_static(concat!("rs2/", env!("CARGO_PKG_VERSION"))),
+            );
+        }
         if let Some(inj) = &self.grants[grant].injector {
             inj.apply(&mut msg, self.max_body_bytes).await?;
         }
