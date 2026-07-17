@@ -150,14 +150,18 @@ fn default_log_backups() -> usize {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "mode")]
+#[serde(tag = "mode")]
 enum TenancyConfig {
     #[serde(rename = "single")]
     Single { tenant: String },
-    #[serde(rename = "multi")]
+    // `rename_all` must sit on the variant: on the enum it renames variant
+    // names only, silently ignoring `domainMap`/`mainDomain` (both optional) —
+    // which made every multi-tenant host resolve to "no tenant".
+    #[serde(rename = "multi", rename_all = "camelCase")]
     Multi {
-        #[serde(default)]
+        #[serde(default, alias = "domain_map")]
         domain_map: HashMap<String, String>,
+        #[serde(alias = "main_domain")]
         main_domain: Option<String>,
     },
 }
@@ -714,7 +718,33 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{constant_time_eq, ServerConfig, TenancyConfig};
+
+    /// The documented multi-tenant config shape (manual 10.2, deploy runbook)
+    /// uses camelCase `domainMap`/`mainDomain`. Both fields are optional, so a
+    /// key-name regression doesn't fail parsing — it silently yields a node
+    /// where no host resolves. Parse the exact documented JSON and check the
+    /// fields actually land.
+    #[test]
+    fn multi_tenancy_parses_documented_camel_case_keys() {
+        let config: ServerConfig = serde_json::from_str(
+            r#"{
+                "tenancy": {
+                    "mode": "multi",
+                    "mainDomain": "rs2.example.com",
+                    "domainMap": { "api.acme.com": "acme" }
+                }
+            }"#,
+        )
+        .unwrap();
+        match config.tenancy {
+            TenancyConfig::Multi { domain_map, main_domain } => {
+                assert_eq!(main_domain.as_deref(), Some("rs2.example.com"));
+                assert_eq!(domain_map.get("api.acme.com").map(String::as_str), Some("acme"));
+            }
+            other => panic!("expected multi tenancy, got {other:?}"),
+        }
+    }
 
     #[test]
     fn constant_time_eq_matches_only_equal_bytes() {

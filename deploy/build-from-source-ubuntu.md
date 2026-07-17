@@ -368,21 +368,24 @@ sudo tee /etc/rs2/tenants/main.json >/dev/null <<JSON
   "auth": { "jwtSecret": "${JWT_MAIN}", "userDataset": "users" },
   "operatorRoles": "A",
   "mounts": [
-    { "path": "/auth", "service": "auth", "access": "open" },
+    { "path": "/auth", "service": "auth",
+      "config": { "access": "open" } },
     { "path": "/services", "service": "services",
-      "access": { "readRoles": "A", "writeRoles": "A" } },
+      "config": { "access": { "read": "A", "write": "A" } } },
 
     { "path": "/data", "service": "data",
-      "access": { "readRoles": "A", "writeRoles": "A" } },
+      "config": { "access": { "read": "A", "write": "A" } } },
 
     { "path": "/mongo", "service": "data",
-      "store": {
-        "adapter": "code:mongo-data@v1",
-        "grants": {
-          "db": { "type": "socket", "hosts": ["127.0.0.1:27017"] }
-        }
-      },
-      "access": { "readRoles": "A", "writeRoles": "A" } }
+      "config": {
+        "store": {
+          "adapter": "code:mongo-data@v1",
+          "grants": {
+            "db": { "type": "socket", "hosts": ["127.0.0.1:27017"] }
+          }
+        },
+        "access": { "read": "A", "write": "A" }
+      } }
   ]
 }
 JSON

@@ -51,6 +51,10 @@ pub struct TenantConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+// Strict: service settings (notably `access`) belong under `config`; a typo
+// that puts them at the mount level must fail the dry-build loudly rather
+// than silently leave the mount on default access.
+#[serde(deny_unknown_fields)]
 pub struct MountSpec {
     /// URL path prefix, e.g. `/files`.
     pub path: String,
