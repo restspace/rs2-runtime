@@ -216,12 +216,42 @@ impl PipelineSpec {
                     errors.push(format!("{here}: {}", e.detail));
                 }
             }
+            if let Some(template) = &step.transform {
+                Self::validate_template(template, &here, errors);
+            }
             if step.elevate && step.call.is_none() {
                 errors.push(format!("{here}: 'elevate' applies only to call steps"));
             }
             if let Some(sub) = &step.pipeline {
                 sub.validate_into(&here, errors);
             }
+        }
+    }
+
+    /// Walk a transform template with the same shape semantics as the runtime
+    /// apply (string leaves are JSONata expressions; objects and arrays
+    /// recurse; other scalars pass through) and record every leaf that fails
+    /// to parse. Runs on untaken branches and nested subpipelines too, so a
+    /// bad expression anywhere fails the write instead of a later execution.
+    fn validate_template(template: &serde_json::Value, at: &str, errors: &mut Vec<String>) {
+        use serde_json::Value;
+        match template {
+            Value::String(expr) => {
+                if let Err(e) = super::transform::validate_expr(expr) {
+                    errors.push(format!("{at}: {}", e.detail));
+                }
+            }
+            Value::Object(map) => {
+                for v in map.values() {
+                    Self::validate_template(v, at, errors);
+                }
+            }
+            Value::Array(items) => {
+                for v in items {
+                    Self::validate_template(v, at, errors);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -278,6 +308,40 @@ mod tests {
         assert!(spec.validate().is_empty());
         // Method-inferred effects.
         assert_eq!(spec.steps[0].call.as_ref().unwrap().effect_class(), EffectClass::Pure);
+    }
+
+    #[test]
+    fn validation_parses_transform_expressions_everywhere() {
+        // Bad expressions surface from every template position — top-level
+        // leaves, nested objects, arrays, and subpipelines — while non-string
+        // scalars pass through and untaken `if` branches are still checked.
+        let spec: PipelineSpec = serde_json::from_value(serde_json::json!({
+            "steps": [
+                { "if": "status == 999",
+                  "transform": { "ok": "$sum(lines.price)", "n": 42, "bad": "$sum((" } },
+                { "transform": { "nested": { "deep": ["a.b", ")("] } } },
+                { "pipeline": { "steps": [ { "transform": "$merge(" } ] } }
+            ]
+        }))
+        .unwrap();
+        let errors = spec.validate();
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("/steps[0]") && errors[0].contains("$sum(("), "{errors:?}");
+        assert!(errors[1].contains("/steps[1]"), "{errors:?}");
+        assert!(errors[2].contains("/steps[2]/steps[0]"), "{errors:?}");
+    }
+
+    #[test]
+    fn valid_transform_templates_pass_validation() {
+        let spec: PipelineSpec = serde_json::from_value(serde_json::json!({
+            "steps": [
+                { "transform": { "total": "$sum(lines.price)",
+                                 "fixed": 42, "flag": true, "nil": null,
+                                 "list": ["a.b", { "quoted": "'literal'" }] } }
+            ]
+        }))
+        .unwrap();
+        assert!(spec.validate().is_empty(), "{:?}", spec.validate());
     }
 
     #[test]

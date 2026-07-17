@@ -74,6 +74,17 @@ fn evaluate_str(
         .map_err(|e| RsError::internal(format!("JSONata produced unserializable output: {e}")))
 }
 
+/// Parse-only check of a single expression: construct the parser and discard
+/// the result. Used by spec validation to reject unparseable expressions at
+/// write time; it catches syntax errors only — binding and semantic errors
+/// still surface at evaluation.
+pub fn validate_expr(expr: &str) -> Result<(), RsError> {
+    let arena = bumpalo::Bump::new();
+    jsonata_rs::JsonAta::new(expr, &arena)
+        .map(|_| ())
+        .map_err(|e| RsError::bad_request(format!("invalid JSONata expression '{expr}': {e}")))
+}
+
 fn json_to_value<'a>(
     arena: &'a bumpalo::Bump,
     json: &Value,
@@ -247,6 +258,16 @@ mod tests {
     fn invalid_expression_is_a_structured_error() {
         let err = apply(&json!("$$$nonsense((("), &json!({}), &serde_json::Map::new()).unwrap_err();
         assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn validate_expr_is_parse_only() {
+        assert!(validate_expr("$sum(lines.price)").is_ok());
+        // Semantically doomed but syntactically fine — parse-only passes it.
+        assert!(validate_expr("$noSuchFunction(x)").is_ok());
+        let err = validate_expr("$sum((").unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(err.detail.contains("invalid JSONata expression"), "{}", err.detail);
     }
 
     // RFC 4231 / well-known HMAC-SHA256 test vector.
