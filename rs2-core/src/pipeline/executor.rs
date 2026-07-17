@@ -779,7 +779,32 @@ impl Executor {
         // Bodies move into the closure: borrowing them across the retry
         // awaits would require `Body: Sync`, which stream payloads are not.
         let mut bodies = (cloneable_body, one_shot_body);
-        let headers = call.headers.clone();
+        // Header values interpolate over the same context as the URL
+        // (`Authorization: Bearer ${conn.accessToken}`), resolved once here —
+        // before the retry loop, so every attempt sends identical headers and
+        // a resolution failure aborts the step instead of being silently
+        // dropped mid-flight (a dropped auth header would send the request
+        // unauthenticated).
+        let headers: Option<Vec<(http::header::HeaderName, http::HeaderValue)>> =
+            match &call.headers {
+                None => None,
+                Some(spec_headers) => {
+                    let mut resolved = Vec::with_capacity(spec_headers.len());
+                    for (k, v) in spec_headers {
+                        let name = http::header::HeaderName::try_from(k.as_str()).map_err(|_| {
+                            RsError::bad_request(format!("invalid header name '{k}'"))
+                        })?;
+                        let value = path_pattern::resolve(v, &url_view, &interp_ctx)?;
+                        let value = http::HeaderValue::from_str(&value).map_err(|_| {
+                            RsError::bad_request(format!(
+                                "header '{k}' resolved to an invalid header value"
+                            ))
+                        })?;
+                        resolved.push((name, value));
+                    }
+                    Some(resolved)
+                }
+            };
         let result = match target {
             Err(e) => Err(e),
             Ok(target) => {
@@ -797,13 +822,8 @@ impl Executor {
                     req.body =
                         bodies.0.as_ref().and_then(clone_body).or_else(|| bodies.1.take());
                     if let Some(headers) = &headers {
-                        for (k, v) in headers {
-                            if let (Ok(name), Ok(value)) = (
-                                http::header::HeaderName::try_from(k.as_str()),
-                                http::HeaderValue::from_str(v),
-                            ) {
-                                req.headers.insert(name, value);
-                            }
+                        for (name, value) in headers {
+                            req.headers.insert(name.clone(), value.clone());
                         }
                     }
                     // Auto-generated idempotency key (PRD §7.2): keyed targets get

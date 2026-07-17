@@ -56,6 +56,8 @@ pub struct CallSpec {
     /// Declared effect class; defaults from the method (PRD §7.1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effect: Option<EffectClass>,
+    /// Extra request headers; values `${...}`-interpolate like the URL
+    /// (e.g. `"Authorization": "Bearer ${conn.accessToken}"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::HashMap<String, String>>,
 }
@@ -215,6 +217,16 @@ impl PipelineSpec {
                 if let Err(e) = crate::path_pattern::validate(&call.url) {
                     errors.push(format!("{here}: {}", e.detail));
                 }
+                if let Some(headers) = &call.headers {
+                    for (name, value) in headers {
+                        if http::header::HeaderName::try_from(name.as_str()).is_err() {
+                            errors.push(format!("{here}: invalid header name '{name}'"));
+                        }
+                        if let Err(e) = crate::path_pattern::validate(value) {
+                            errors.push(format!("{here}: in header '{name}': {}", e.detail));
+                        }
+                    }
+                }
             }
             if let Some(template) = &step.transform {
                 Self::validate_template(template, &here, errors);
@@ -342,6 +354,32 @@ mod tests {
         }))
         .unwrap();
         assert!(spec.validate().is_empty(), "{:?}", spec.validate());
+    }
+
+    #[test]
+    fn validation_checks_call_headers() {
+        let spec: PipelineSpec = serde_json::from_value(serde_json::json!({
+            "steps": [
+                { "call": { "method": "GET", "url": "/x",
+                            "headers": { "bad name": "v",
+                                         "authorization": "Bearer ${unterminated" } } }
+            ]
+        }))
+        .unwrap();
+        let errors = spec.validate();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let all = errors.join("; ");
+        assert!(all.contains("invalid header name 'bad name'"), "{errors:?}");
+        assert!(all.contains("in header 'authorization'"), "{errors:?}");
+
+        let good: PipelineSpec = serde_json::from_value(serde_json::json!({
+            "steps": [
+                { "call": { "method": "GET", "url": "/x",
+                            "headers": { "authorization": "Bearer ${conn.accessToken}" } } }
+            ]
+        }))
+        .unwrap();
+        assert!(good.validate().is_empty(), "{:?}", good.validate());
     }
 
     #[test]

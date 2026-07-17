@@ -378,6 +378,54 @@ async fn external_request_carries_only_spec_headers() {
 }
 
 #[tokio::test]
+async fn spec_headers_interpolate_captured_variables() {
+    let http = MockHttp::new();
+    let dir = tempfile::tempdir().unwrap();
+    let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
+
+    // A stored connection record supplies the token the header interpolates.
+    let resp = rt
+        .handle(
+            Message::request(Method::PUT, "/data/conns/stripe", "t")
+                .with_json(&json!({ "accessToken": "sek_12345" })),
+        )
+        .await;
+    assert!(resp.is_ok(), "{:?}", resp.status);
+
+    put_spec(&rt, "charge", json!({ "pipeline": { "steps": [
+        { "call": { "method": "GET", "url": "/data/conns/stripe" }, "as": "$conn" },
+        { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges",
+                    "headers": { "authorization": "Bearer ${conn.accessToken}",
+                                 "x-static": "plain" } } }
+    ] } }))
+    .await;
+
+    let resp = rt.handle(Message::request(Method::POST, "/p/charge", "t")).await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
+    assert_eq!(http.header(0, "authorization").as_deref(), Some("Bearer sek_12345"));
+    assert_eq!(http.header(0, "x-static").as_deref(), Some("plain"));
+}
+
+#[tokio::test]
+async fn header_interpolation_failure_aborts_before_any_io() {
+    let http = MockHttp::new();
+    let dir = tempfile::tempdir().unwrap();
+    let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
+
+    // `${conn.accessToken}` never captured: the step must fail at resolution
+    // time — the request must not go out with a missing/mangled auth header.
+    put_spec(&rt, "noauth", json!({ "pipeline": { "steps": [
+        { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges",
+                    "headers": { "authorization": "Bearer ${conn.accessToken}" } } }
+    ] } }))
+    .await;
+
+    let resp = rt.handle(Message::request(Method::POST, "/p/noauth", "t")).await;
+    assert!(!resp.is_ok(), "{:?}", resp.status);
+    assert_eq!(http.calls(), 0);
+}
+
+#[tokio::test]
 async fn wrapper_inline_spec_calls_externally_through_its_grants() {
     let http = MockHttp::new();
     let dir = tempfile::tempdir().unwrap();
