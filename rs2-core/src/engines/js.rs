@@ -1436,10 +1436,22 @@ pub(crate) async fn build_runtime(
     limits: &InvocationLimits,
     oom: Arc<AtomicBool>,
 ) -> Result<(JsRuntime, v8::Global<v8::Value>), RsError> {
-    // When the committed snapshot is present, the bootstrap + prelude globals
-    // are already baked into the isolate's heap; otherwise fall back to running
-    // them from source (identical result, just slower per request).
-    let snapshot = (!PRELUDE_SNAPSHOT.is_empty()).then_some(PRELUDE_SNAPSHOT);
+    // When the committed snapshot is used, the bootstrap + prelude globals are
+    // already baked into the isolate's heap; otherwise they run from source
+    // (identical result, ~10ms slower per isolate creation).
+    //
+    // Windows-only for now: on Linux, creating isolates from a custom snapshot
+    // intermittently aborts inside V8's `SharedHeapDeserializer` /
+    // `ReadReadOnlyHeapRef` (hardened-libc++ vector[] OOB) whenever other
+    // threads are active in the process — ~20% of parallel npm_compat runs.
+    // Reproduced with blobs generated on both Windows and Linux, with isolate
+    // creation fully serialized behind a mutex, and with a never-dropped
+    // anchor isolate pinning the shared read-only heap — so it is not a
+    // first-init race the host can guard against. Suspected upstream
+    // deno_core/rusty_v8 bug (family of denoland/deno#15590, which deno_core
+    // mutexes on Windows only); revisit at the planned deno_core upgrade
+    // (G13 Phase 2).
+    let snapshot = (cfg!(windows) && !PRELUDE_SNAPSHOT.is_empty()).then_some(PRELUDE_SNAPSHOT);
     let create = v8::CreateParams::default().heap_limits(0, limits.memory_bytes as usize);
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![rs2_host::init()],
