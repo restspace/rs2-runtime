@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # NOTE: rustfmt + clippy (-D warnings) gates are deferred. The toolchain is
+  # pinned (rust-toolchain.toml, 1.92.0) but the code predates that pin and
+  # carries fmt drift (~800 hunks) plus a handful of new-lint clippy errors
+  # (is_none_or, is_multiple_of, ...). Enable both gates after a one-time
+  # `cargo fmt --all` + clippy cleanup commit establishes a clean baseline.
+
+  test-native:
+    name: test (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-native
+      # Whole workspace on default features: rs2-core + rs2-server + rs2-cli.
+      - run: cargo test --workspace
+
+  test-js:
+    name: test (js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-js
+      # V8 isolate engine. npm_compat is self-contained; sdk_corpus self-skips
+      # when corpus/bundles/ is absent (it is gitignored).
+      - run: cargo test -p rs2-core --features js
+
+  test-wasm:
+    name: test (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-wasm
+      - run: rustup target add wasm32-wasip2
+      - name: Build conformance guest component
+        run: cargo build --manifest-path conformance/echo-guest/Cargo.toml --target wasm32-wasip2 --release
+      - name: Point the conformance suite at the guest component
+        run: |
+          echo "RS2_CONFORMANCE_COMPONENT=${{ github.workspace }}/conformance/echo-guest/target/wasm32-wasip2/release/conformance_echo.wasm" >> "$GITHUB_ENV"
+      - run: cargo test -p rs2-core --features wasm

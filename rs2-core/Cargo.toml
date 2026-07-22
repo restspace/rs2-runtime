@@ -3,6 +3,7 @@ name = "rs2-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "RS2 sandboxed composable-service runtime — core crate (0.x, unstable embedding surface)"
 
 [features]

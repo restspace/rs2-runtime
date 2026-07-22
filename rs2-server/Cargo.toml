@@ -3,6 +3,7 @@ name = "rs2-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "RS2 server binary: HTTP listener, config loading, adapter wiring"
 
 [features]

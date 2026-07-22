@@ -9,6 +9,7 @@ edition = "2021"
 # Open-source under AGPL-3.0; a commercial license is available for closed-source
 # embedding or hosted offerings. See LICENSING.md.
 license = "AGPL-3.0-only"
+repository = "https://github.com/restspace/rs2-runtime"
 
 [workspace.dependencies]
 async-trait = "0.1"

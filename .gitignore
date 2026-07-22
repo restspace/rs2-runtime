@@ -22,3 +22,4 @@ examples/*/data-store/
 /package.json
 # Stray agent worktrees.
 /.claude/
+/PUBLIC-RELEASE-HANDOFF.md

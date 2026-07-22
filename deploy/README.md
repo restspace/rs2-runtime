@@ -8,10 +8,10 @@ This directory holds everything needed to run it as a hardened systemd service.
 
 ```bash
 # native + wasm engines:
-curl -fsSL https://github.com/atelyr/rs2-runtime/releases/latest/download/install.sh | sudo bash
+curl -fsSL https://github.com/restspace/rs2-runtime/releases/latest/download/install.sh | sudo bash
 
 # with the V8 engine (code: JS services) and an Apache TLS proxy:
-curl -fsSL https://github.com/atelyr/rs2-runtime/releases/latest/download/install.sh \
+curl -fsSL https://github.com/restspace/rs2-runtime/releases/latest/download/install.sh \
   | sudo bash -s -- --js --apache api.example.com
 ```
 
@@ -84,11 +84,11 @@ logs are untouched (the config is only written when absent).
 
 ```bash
 # upgrade to the latest release (keep the same flags you installed with)
-curl -fsSL https://github.com/atelyr/rs2-runtime/releases/latest/download/install.sh \
+curl -fsSL https://github.com/restspace/rs2-runtime/releases/latest/download/install.sh \
   | sudo bash -s -- --js
 
 # pin / roll back to a specific release
-curl -fsSL https://github.com/atelyr/rs2-runtime/releases/download/v0.2.0/install.sh \
+curl -fsSL https://github.com/restspace/rs2-runtime/releases/download/v0.2.0/install.sh \
   | sudo bash -s -- --js --version v0.2.0
 ```
 

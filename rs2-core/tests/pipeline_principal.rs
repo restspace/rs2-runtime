@@ -112,7 +112,7 @@ async fn step_urls_interpolate_user_fields() {
     let seed = as_admin(req(Method::PUT, "/store/things/acc-42_p1")).with_json(&json!({ "v": 7 }));
     assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED), "seed");
 
-    // The compound-key pattern the Atelyr migration relies on.
+    // Compound-key pattern: scope a record key to the caller's principal claim.
     let author = as_admin(req(Method::PUT, "/pipe/.pipelines/.root"))
         .with_json(&json!({ "pipeline": ["GET /store/things/${_user.accountId}_p1"] }));
     assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author");

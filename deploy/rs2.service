@@ -1,6 +1,6 @@
 [Unit]
 Description=RS2 runtime (sandboxed composable-service runtime)
-Documentation=https://github.com/atelyr/rs2-runtime
+Documentation=https://github.com/restspace/rs2-runtime
 After=network-online.target
 Wants=network-online.target
 

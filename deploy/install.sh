@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ---- settings ---------------------------------------------------------------
-REPO="${RS2_REPO:-atelyr/rs2-runtime}"        # GitHub owner/repo for releases
+REPO="${RS2_REPO:-restspace/rs2-runtime}"        # GitHub owner/repo for releases
 BASE_URL="${RS2_BASE_URL:-https://github.com/${REPO}/releases}"
 RS2_USER="rs2"
 BIN_DST="/usr/bin/rs2-server"

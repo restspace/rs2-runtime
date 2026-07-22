@@ -145,7 +145,7 @@ export RUSTFLAGS="-C link-arg=-fuse-ld=lld"   # lower peak link memory + faster
 ```bash
 sudo mkdir -p /opt/src && sudo chown "$USER" /opt/src
 cd /opt/src
-git clone https://github.com/atelyr/rs2-runtime.git
+git clone https://github.com/restspace/rs2-runtime.git
 cd rs2-runtime
 ```
 
@@ -421,7 +421,7 @@ Matches `deploy/rs2.service`, plus an ordering hint so mongod comes up first.
 sudo tee /etc/systemd/system/rs2.service >/dev/null <<'UNIT'
 [Unit]
 Description=RS2 runtime (sandboxed composable-service runtime)
-Documentation=https://github.com/atelyr/rs2-runtime
+Documentation=https://github.com/restspace/rs2-runtime
 # Mongo is the data backend; start it first (soft dependency).
 After=network-online.target mongod.service
 Wants=network-online.target

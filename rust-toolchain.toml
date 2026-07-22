@@ -1,0 +1,6 @@
+# Pin the toolchain the codebase is developed and tested against. The heavy
+# pinned deps (wasmtime 37, deno_core 0.404, v8 150) and the fmt/clippy
+# baseline are only verified under this version — bump deliberately, not via
+# ambient `rustup update`.
+[toolchain]
+channel = "1.92.0"
