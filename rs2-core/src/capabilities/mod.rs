@@ -78,7 +78,12 @@ pub struct DirEntry {
 #[async_trait]
 pub trait FileStore: Send + Sync {
     async fn head(&self, tenant: &str, path: &str) -> Result<FileMeta, RsError>;
-    async fn read(&self, tenant: &str, path: &str, range: Option<ByteRange>) -> Result<Body, RsError>;
+    async fn read(
+        &self,
+        tenant: &str,
+        path: &str,
+        range: Option<ByteRange>,
+    ) -> Result<Body, RsError>;
     /// Returns `true` if the resource was created (vs. overwritten).
     async fn write(&self, tenant: &str, path: &str, body: Body) -> Result<bool, RsError>;
 
@@ -153,22 +158,59 @@ pub trait FileStore: Send + Sync {
     /// Delete a directory and all its contents (the `?confirm=` path).
     async fn delete_dir_all(&self, tenant: &str, path: &str) -> Result<(), RsError>;
     /// Paginated listing; returns (entries, total count).
-    async fn list(&self, tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError>;
+    async fn list(
+        &self,
+        tenant: &str,
+        path: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<DirEntry>, u64), RsError>;
 }
 
 /// Schema-validated JSON storage keyed by dataset + key.
 #[async_trait]
 pub trait DataStore: Send + Sync {
-    async fn get(&self, tenant: &str, dataset: &str, key: &str) -> Result<serde_json::Value, RsError>;
+    async fn get(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        key: &str,
+    ) -> Result<serde_json::Value, RsError>;
     /// Returns `true` if the record was created (vs. updated).
-    async fn put(&self, tenant: &str, dataset: &str, key: &str, value: serde_json::Value) -> Result<bool, RsError>;
+    async fn put(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<bool, RsError>;
     async fn delete(&self, tenant: &str, dataset: &str, key: &str) -> Result<(), RsError>;
     /// Paginated key listing; returns (keys, total count).
-    async fn list_keys(&self, tenant: &str, dataset: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError>;
+    async fn list_keys(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError>;
     /// Paginated dataset enumeration; returns (names, total count).
-    async fn list_datasets(&self, tenant: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError>;
-    async fn get_schema(&self, tenant: &str, dataset: &str) -> Result<Option<serde_json::Value>, RsError>;
-    async fn put_schema(&self, tenant: &str, dataset: &str, schema: serde_json::Value) -> Result<(), RsError>;
+    async fn list_datasets(
+        &self,
+        tenant: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError>;
+    async fn get_schema(
+        &self,
+        tenant: &str,
+        dataset: &str,
+    ) -> Result<Option<serde_json::Value>, RsError>;
+    async fn put_schema(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        schema: serde_json::Value,
+    ) -> Result<(), RsError>;
     async fn delete_dataset(&self, tenant: &str, dataset: &str) -> Result<(), RsError>;
     /// Every record in a dataset that passes `keep`, with its key — the
     /// query adapter's full-scan seam. The default composes `list_keys` +
@@ -222,7 +264,10 @@ pub struct ScopedSmsGateway {
 
 impl ScopedSmsGateway {
     pub fn new(inner: Arc<dyn SmsGateway>, tenant: &str) -> Self {
-        ScopedSmsGateway { inner, tenant: tenant.to_string() }
+        ScopedSmsGateway {
+            inner,
+            tenant: tenant.to_string(),
+        }
     }
 
     pub async fn send(&self, to: &str, body: &str) -> Result<String, RsError> {
@@ -270,7 +315,10 @@ pub struct ScopedQueryStore {
 
 impl ScopedQueryStore {
     pub fn new(inner: Arc<dyn QueryStore>, tenant: &str) -> Self {
-        ScopedQueryStore { inner, tenant: tenant.to_string() }
+        ScopedQueryStore {
+            inner,
+            tenant: tenant.to_string(),
+        }
     }
 
     pub async fn run_query(
@@ -280,7 +328,9 @@ impl ScopedQueryStore {
         take: usize,
         skip: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), RsError> {
-        self.inner.run_query(&self.tenant, query, params, take, skip).await
+        self.inner
+            .run_query(&self.tenant, query, params, take, skip)
+            .await
     }
 
     pub fn quote(&self, value: &serde_json::Value) -> Result<String, RsError> {
@@ -299,7 +349,10 @@ pub struct PrefixedFileStore {
 impl PrefixedFileStore {
     pub fn new(inner: Arc<dyn FileStore>, prefix: impl Into<String>) -> Self {
         let prefix = prefix.into();
-        PrefixedFileStore { inner, prefix: prefix.trim_matches('/').to_string() }
+        PrefixedFileStore {
+            inner,
+            prefix: prefix.trim_matches('/').to_string(),
+        }
     }
 
     fn join(&self, path: &str) -> String {
@@ -318,7 +371,12 @@ impl FileStore for PrefixedFileStore {
         self.inner.head(tenant, &self.join(path)).await
     }
 
-    async fn read(&self, tenant: &str, path: &str, range: Option<ByteRange>) -> Result<Body, RsError> {
+    async fn read(
+        &self,
+        tenant: &str,
+        path: &str,
+        range: Option<ByteRange>,
+    ) -> Result<Body, RsError> {
         self.inner.read(tenant, &self.join(path), range).await
     }
 
@@ -337,7 +395,9 @@ impl FileStore for PrefixedFileStore {
         body: Body,
         precondition: WritePrecondition,
     ) -> Result<WriteOutcome, RsError> {
-        self.inner.write_cond(tenant, &self.join(path), body, precondition).await
+        self.inner
+            .write_cond(tenant, &self.join(path), body, precondition)
+            .await
     }
 
     fn conditional_write_atomic(&self) -> bool {
@@ -349,7 +409,9 @@ impl FileStore for PrefixedFileStore {
     }
 
     async fn rename(&self, tenant: &str, from: &str, to: &str) -> Result<bool, RsError> {
-        self.inner.rename(tenant, &self.join(from), &self.join(to)).await
+        self.inner
+            .rename(tenant, &self.join(from), &self.join(to))
+            .await
     }
 
     async fn delete_dir(&self, tenant: &str, path: &str) -> Result<(), RsError> {
@@ -360,7 +422,13 @@ impl FileStore for PrefixedFileStore {
         self.inner.delete_dir_all(tenant, &self.join(path)).await
     }
 
-    async fn list(&self, tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
+    async fn list(
+        &self,
+        tenant: &str,
+        path: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<DirEntry>, u64), RsError> {
         self.inner.list(tenant, &self.join(path), take, skip).await
     }
 }
@@ -431,7 +499,10 @@ pub struct ScopedFileStore {
 
 impl ScopedFileStore {
     pub fn new(inner: Arc<dyn FileStore>, tenant: &str) -> Self {
-        ScopedFileStore { inner, tenant: tenant.to_string() }
+        ScopedFileStore {
+            inner,
+            tenant: tenant.to_string(),
+        }
     }
 
     /// A view of this handle rooted under a path prefix (composing the
@@ -465,7 +536,9 @@ impl ScopedFileStore {
         body: Body,
         precondition: WritePrecondition,
     ) -> Result<WriteOutcome, RsError> {
-        self.inner.write_cond(&self.tenant, path, body, precondition).await
+        self.inner
+            .write_cond(&self.tenant, path, body, precondition)
+            .await
     }
 
     pub fn conditional_write_atomic(&self) -> bool {
@@ -488,7 +561,12 @@ impl ScopedFileStore {
         self.inner.delete_dir_all(&self.tenant, path).await
     }
 
-    pub async fn list(&self, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
+    pub async fn list(
+        &self,
+        path: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<DirEntry>, u64), RsError> {
         self.inner.list(&self.tenant, path, take, skip).await
     }
 }
@@ -502,14 +580,22 @@ pub struct ScopedDataStore {
 
 impl ScopedDataStore {
     pub fn new(inner: Arc<dyn DataStore>, tenant: &str) -> Self {
-        ScopedDataStore { inner, tenant: tenant.to_string() }
+        ScopedDataStore {
+            inner,
+            tenant: tenant.to_string(),
+        }
     }
 
     pub async fn get(&self, dataset: &str, key: &str) -> Result<serde_json::Value, RsError> {
         self.inner.get(&self.tenant, dataset, key).await
     }
 
-    pub async fn put(&self, dataset: &str, key: &str, value: serde_json::Value) -> Result<bool, RsError> {
+    pub async fn put(
+        &self,
+        dataset: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<bool, RsError> {
         self.inner.put(&self.tenant, dataset, key, value).await
     }
 
@@ -517,19 +603,34 @@ impl ScopedDataStore {
         self.inner.delete(&self.tenant, dataset, key).await
     }
 
-    pub async fn list_datasets(&self, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
+    pub async fn list_datasets(
+        &self,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError> {
         self.inner.list_datasets(&self.tenant, take, skip).await
     }
 
-    pub async fn list_keys(&self, dataset: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
-        self.inner.list_keys(&self.tenant, dataset, take, skip).await
+    pub async fn list_keys(
+        &self,
+        dataset: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError> {
+        self.inner
+            .list_keys(&self.tenant, dataset, take, skip)
+            .await
     }
 
     pub async fn get_schema(&self, dataset: &str) -> Result<Option<serde_json::Value>, RsError> {
         self.inner.get_schema(&self.tenant, dataset).await
     }
 
-    pub async fn put_schema(&self, dataset: &str, schema: serde_json::Value) -> Result<(), RsError> {
+    pub async fn put_schema(
+        &self,
+        dataset: &str,
+        schema: serde_json::Value,
+    ) -> Result<(), RsError> {
         self.inner.put_schema(&self.tenant, dataset, schema).await
     }
 

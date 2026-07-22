@@ -78,7 +78,13 @@ async fn ungranted_capability_is_denied() {
         })
     }));
     let err = engine
-        .invoke(&code, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &limits())
+        .invoke(
+            &code,
+            Message::request(Method::GET, "/x", "t1"),
+            &json!({}),
+            host,
+            &limits(),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code, codes::CAPABILITY_DENIED);
@@ -97,7 +103,13 @@ async fn wall_clock_limit_kills_invocation() {
         })
     }));
     let err = engine
-        .invoke(&code, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &limits())
+        .invoke(
+            &code,
+            Message::request(Method::GET, "/x", "t1"),
+            &json!({}),
+            host,
+            &limits(),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code, codes::LIMIT_EXCEEDED);
@@ -108,9 +120,8 @@ async fn wall_clock_limit_kills_invocation() {
 #[tokio::test]
 async fn outbound_call_budget_is_enforced() {
     let engine = NativeEngine::new();
-    let target: CapabilityTarget = Arc::new(|msg: Message| {
-        Box::pin(async move { Ok(msg.ok(None)) })
-    });
+    let target: CapabilityTarget =
+        Arc::new(|msg: Message| Box::pin(async move { Ok(msg.ok(None)) }));
     let grants = HashMap::from([("api".to_string(), target)]);
     let host: Arc<dyn HostApi> = Arc::new(GrantedHost::new(
         grants,
@@ -121,13 +132,20 @@ async fn outbound_call_budget_is_enforced() {
     let code = ServiceCode::Native(Arc::new(|msg: Message, _config, host: Arc<dyn HostApi>| {
         Box::pin(async move {
             for _ in 0..3 {
-                host.request("api", Message::request(Method::GET, "/up", &msg.tenant)).await?;
+                host.request("api", Message::request(Method::GET, "/up", &msg.tenant))
+                    .await?;
             }
             Ok(msg.ok(None))
         })
     }));
     let err = engine
-        .invoke(&code, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &limits())
+        .invoke(
+            &code,
+            Message::request(Method::GET, "/x", "t1"),
+            &json!({}),
+            host,
+            &limits(),
+        )
         .await
         .unwrap_err();
     assert_eq!(err.code, codes::LIMIT_EXCEEDED);
@@ -146,9 +164,14 @@ async fn body_materialization_respects_cap() {
             Ok(msg.ok(None))
         })
     }));
-    let msg = Message::request(Method::POST, "/x", "t1")
-        .with_body(Body::from_string("0123456789abcdef", MediaType::new("text/plain")));
-    let err = engine.invoke(&code, msg, &json!({}), host, &limits()).await.unwrap_err();
+    let msg = Message::request(Method::POST, "/x", "t1").with_body(Body::from_string(
+        "0123456789abcdef",
+        MediaType::new("text/plain"),
+    ));
+    let err = engine
+        .invoke(&code, msg, &json!({}), host, &limits())
+        .await
+        .unwrap_err();
     assert_eq!(err.code, codes::LIMIT_EXCEEDED);
 }
 
@@ -158,8 +181,12 @@ async fn body_materialization_respects_cap() {
 async fn state_capability_persists_across_invocations() {
     let engine = NativeEngine::new();
     let state = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let host: Arc<dyn HostApi> =
-        Arc::new(GrantedHost::new(HashMap::new(), 0, state.clone(), "counter"));
+    let host: Arc<dyn HostApi> = Arc::new(GrantedHost::new(
+        HashMap::new(),
+        0,
+        state.clone(),
+        "counter",
+    ));
     let code = ServiceCode::Native(Arc::new(|msg: Message, _config, host: Arc<dyn HostApi>| {
         Box::pin(async move {
             let n = host
@@ -175,7 +202,13 @@ async fn state_capability_persists_across_invocations() {
     }));
     for expected in 1..=3 {
         let mut resp = engine
-            .invoke(&code, Message::request(Method::GET, "/c", "t1"), &json!({}), host.clone(), &limits())
+            .invoke(
+                &code,
+                Message::request(Method::GET, "/c", "t1"),
+                &json!({}),
+                host.clone(),
+                &limits(),
+            )
             .await
             .unwrap();
         let v = resp.body.as_mut().unwrap().as_json(1024).await.unwrap();
@@ -249,7 +282,13 @@ mod js_engine {
         ));
         let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all("js-deny"));
         let err = engine
-            .invoke(&uncaught, Message::request(Method::GET, "/x", "t1"), &json!({}), host.clone(), &limits())
+            .invoke(
+                &uncaught,
+                Message::request(Method::GET, "/x", "t1"),
+                &json!({}),
+                host.clone(),
+                &limits(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, codes::CAPABILITY_DENIED);
@@ -270,7 +309,13 @@ mod js_engine {
             .to_string(),
         ));
         let mut resp = engine
-            .invoke(&caught, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &limits())
+            .invoke(
+                &caught,
+                Message::request(Method::GET, "/x", "t1"),
+                &json!({}),
+                host,
+                &limits(),
+            )
             .await
             .unwrap();
         let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
@@ -287,7 +332,13 @@ mod js_engine {
         ));
         let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all("js-spin"));
         let err = engine
-            .invoke(&code, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &limits())
+            .invoke(
+                &code,
+                Message::request(Method::GET, "/x", "t1"),
+                &json!({}),
+                host,
+                &limits(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, codes::LIMIT_EXCEEDED);
@@ -313,7 +364,13 @@ mod js_engine {
         lim.wall_clock = Duration::from_secs(30); // memory, not time, must trip
         lim.memory_bytes = 64 * 1024 * 1024;
         let err = engine
-            .invoke(&code, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &lim)
+            .invoke(
+                &code,
+                Message::request(Method::GET, "/x", "t1"),
+                &json!({}),
+                host,
+                &lim,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, codes::LIMIT_EXCEEDED);
@@ -344,7 +401,13 @@ mod js_engine {
             .to_string(),
         ));
         let err = engine
-            .invoke(&code, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &limits())
+            .invoke(
+                &code,
+                Message::request(Method::GET, "/x", "t1"),
+                &json!({}),
+                host,
+                &limits(),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code, codes::LIMIT_EXCEEDED);
@@ -356,8 +419,12 @@ mod js_engine {
     async fn state_capability_persists_across_invocations() {
         let engine = JsEngine::new();
         let state = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-        let host: Arc<dyn HostApi> =
-            Arc::new(GrantedHost::new(HashMap::new(), 0, state.clone(), "js-counter"));
+        let host: Arc<dyn HostApi> = Arc::new(GrantedHost::new(
+            HashMap::new(),
+            0,
+            state.clone(),
+            "js-counter",
+        ));
         let code = ServiceCode::JsBundle(Arc::new(
             r#"
             globalThis.leak = (globalThis.leak ?? 0) + 1; // must NOT persist
@@ -371,7 +438,13 @@ mod js_engine {
         ));
         for expected in 1..=3 {
             let mut resp = engine
-                .invoke(&code, Message::request(Method::GET, "/c", "t1"), &json!({}), host.clone(), &limits())
+                .invoke(
+                    &code,
+                    Message::request(Method::GET, "/c", "t1"),
+                    &json!({}),
+                    host.clone(),
+                    &limits(),
+                )
                 .await
                 .unwrap();
             let v = resp.body.as_mut().unwrap().as_json(1024).await.unwrap();
@@ -406,7 +479,13 @@ mod js_engine {
             .to_string(),
         ));
         let mut resp = engine
-            .invoke(&code, Message::request(Method::GET, "/x", "t1"), &json!({}), host, &limits())
+            .invoke(
+                &code,
+                Message::request(Method::GET, "/x", "t1"),
+                &json!({}),
+                host,
+                &limits(),
+            )
             .await
             .unwrap();
         let v = resp.body.as_mut().unwrap().as_json(1024).await.unwrap();
@@ -448,7 +527,10 @@ async fn wasm_engine_message_semantics() {
     // Invariant 2 inside the sandbox: an ungranted capability surfaces as
     // capability-denied to the guest.
     let msg = Message::request(Method::GET, "/echo/deny-check", "t1");
-    let mut resp = engine.invoke(&code, msg, &json!({}), host, &limits()).await.unwrap();
+    let mut resp = engine
+        .invoke(&code, msg, &json!({}), host, &limits())
+        .await
+        .unwrap();
     let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
     assert_eq!(&bytes[..], b"denied-as-expected");
 }

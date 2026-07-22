@@ -14,8 +14,7 @@ use rs2_core::tenant::{Adapters, Tenant, TenantConfig};
 use rs2_core::wrapper::LimitTable;
 
 pub fn migrate(input: &str, output: &str) -> Result<(), String> {
-    let text =
-        std::fs::read_to_string(input).map_err(|e| format!("cannot read {input}: {e}"))?;
+    let text = std::fs::read_to_string(input).map_err(|e| format!("cannot read {input}: {e}"))?;
     // Windows editors love UTF-8 BOMs; serde_json does not.
     let text = text.trim_start_matches('\u{feff}');
     let source: serde_json::Value =
@@ -57,9 +56,11 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
         // UI-visibility flag, not an auth concept).
         if let Some(access) = svc.get("access").and_then(|a| a.as_object()) {
             let mut out = serde_json::Map::new();
-            for (v1_key, v2_key) in
-                [("readRoles", "read"), ("writeRoles", "write"), ("createRoles", "invoke")]
-            {
+            for (v1_key, v2_key) in [
+                ("readRoles", "read"),
+                ("writeRoles", "write"),
+                ("createRoles", "invoke"),
+            ] {
                 if let Some(v) = access.get(v1_key) {
                     out.insert(v2_key.to_string(), v.clone());
                 }
@@ -76,7 +77,10 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
         // v1 caching ({maxAge?, cache?, sendETag?}) → the RS2 caching block.
         // sendETag is dropped: RS2 stores always emit ETags.
         if let Some(caching) = svc.get("caching").and_then(|c| c.as_object()) {
-            let cache_on = caching.get("cache").and_then(|v| v.as_bool()).unwrap_or(false)
+            let cache_on = caching
+                .get("cache")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
                 || caching.get("maxAge").is_some();
             let mut block = serde_json::Map::new();
             if cache_on {
@@ -117,7 +121,9 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
                     }
                 },
                 None => {
-                    warnings.push(format!("{base_path}: pipeline service has no spec — skipped"));
+                    warnings.push(format!(
+                        "{base_path}: pipeline service has no spec — skipped"
+                    ));
                     continue;
                 }
             }
@@ -178,11 +184,21 @@ pub fn migrate(input: &str, output: &str) -> Result<(), String> {
         Arc::new(LocalFsFileStore::new(&tmp)),
         Arc::new(MemDataStore::new()),
     );
-    Tenant::build("migrated", parsed, &adapters, &LimitTable::default(), None, None)
-        .map_err(|e| format!("migrated config failed validation: {e}"))?;
+    Tenant::build(
+        "migrated",
+        parsed,
+        &adapters,
+        &LimitTable::default(),
+        None,
+        None,
+    )
+    .map_err(|e| format!("migrated config failed validation: {e}"))?;
 
-    std::fs::write(output, serde_json::to_string_pretty(&tenant_config).unwrap())
-        .map_err(|e| format!("cannot write {output}: {e}"))?;
+    std::fs::write(
+        output,
+        serde_json::to_string_pretty(&tenant_config).unwrap(),
+    )
+    .map_err(|e| format!("cannot write {output}: {e}"))?;
 
     println!("migrated {} service(s) → {output}", mounts.len());
     for w in &warnings {

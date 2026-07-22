@@ -65,8 +65,19 @@ impl Body {
         Self::from_bytes(Bytes::from(value.to_string()), MediaType::json())
     }
 
-    pub fn from_stream(stream: ByteStream, media_type: MediaType, size: Option<u64>, provenance: Provenance) -> Self {
-        Body { payload: Payload::Stream(stream), media_type, size, last_modified: None, provenance }
+    pub fn from_stream(
+        stream: ByteStream,
+        media_type: MediaType,
+        size: Option<u64>,
+        provenance: Provenance,
+    ) -> Self {
+        Body {
+            payload: Payload::Stream(stream),
+            media_type,
+            size,
+            last_modified: None,
+            provenance,
+        }
     }
 
     pub fn with_last_modified(mut self, when: OffsetDateTime) -> Self {
@@ -91,12 +102,17 @@ impl Body {
             // Reject early when the declared size already exceeds the cap.
             if let Some(size) = self.size {
                 if size > max_bytes {
-                    return Err(RsError::limit_exceeded("materialized_body_bytes", size, max_bytes));
+                    return Err(RsError::limit_exceeded(
+                        "materialized_body_bytes",
+                        size,
+                        max_bytes,
+                    ));
                 }
             }
             let mut buf = BytesMut::new();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| RsError::internal(format!("body stream error: {e}")))?;
+                let chunk =
+                    chunk.map_err(|e| RsError::internal(format!("body stream error: {e}")))?;
                 if (buf.len() + chunk.len()) as u64 > max_bytes {
                     return Err(RsError::limit_exceeded(
                         "materialized_body_bytes",
@@ -113,9 +129,11 @@ impl Body {
         match &self.payload {
             // The cap applies uniformly: bytes already in memory still may
             // not cross an engine boundary above the host limit.
-            Payload::Bytes(b) if b.len() as u64 > max_bytes => {
-                Err(RsError::limit_exceeded("materialized_body_bytes", b.len() as u64, max_bytes))
-            }
+            Payload::Bytes(b) if b.len() as u64 > max_bytes => Err(RsError::limit_exceeded(
+                "materialized_body_bytes",
+                b.len() as u64,
+                max_bytes,
+            )),
             Payload::Bytes(b) => Ok(b),
             Payload::Stream(_) => unreachable!(),
         }
@@ -131,8 +149,13 @@ impl Body {
         }
         let bytes = self.materialize(max_bytes).await?;
         // Strip a UTF-8 BOM, which may appear on bodies read from files.
-        let slice: &[u8] = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { &bytes[3..] } else { bytes };
-        serde_json::from_slice(slice).map_err(|e| RsError::bad_request(format!("invalid JSON body: {e}")))
+        let slice: &[u8] = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            &bytes[3..]
+        } else {
+            bytes
+        };
+        serde_json::from_slice(slice)
+            .map_err(|e| RsError::bad_request(format!("invalid JSON body: {e}")))
     }
 
     /// Consume the body as a stream regardless of representation.

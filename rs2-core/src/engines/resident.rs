@@ -67,9 +67,14 @@ impl ResidentHandle {
     async fn call(&self, input: Value, config: Value) -> Result<Value, RsError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job { input, config, reply })
+            .send(Job {
+                input,
+                config,
+                reply,
+            })
             .map_err(|_| RsError::internal("resident adapter runtime is gone"))?;
-        rx.await.map_err(|_| RsError::internal("resident adapter runtime dropped the job"))?
+        rx.await
+            .map_err(|_| RsError::internal("resident adapter runtime dropped the job"))?
     }
 }
 
@@ -92,11 +97,15 @@ async fn spawn_resident(
     std::thread::Builder::new()
         .name("rs2-resident".into())
         .spawn(move || {
-            let local = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let local = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = ready_tx
-                        .send(Err(RsError::internal(format!("resident runtime build failed: {e}"))));
+                    let _ = ready_tx.send(Err(RsError::internal(format!(
+                        "resident runtime build failed: {e}"
+                    ))));
                     return;
                 }
             };
@@ -239,7 +248,11 @@ impl ResidentAdapter {
                 "{kind} store adapter '{adapter_ref}' must be 'code:<name>@<version>'"
             ))
         };
-        let (name, version) = adapter_ref.strip_prefix("code:").ok_or_else(invalid)?.split_once('@').ok_or_else(invalid)?;
+        let (name, version) = adapter_ref
+            .strip_prefix("code:")
+            .ok_or_else(invalid)?
+            .split_once('@')
+            .ok_or_else(invalid)?;
         if name.is_empty() || version.is_empty() || name.contains(['/', '\\', '.']) {
             return Err(RsError::bad_request(format!(
                 "invalid {kind} store adapter reference '{adapter_ref}'"
@@ -248,12 +261,20 @@ impl ResidentAdapter {
         // The adapter only needs its socket grant (enforced host-side via the
         // allowlist); request/fetch default-deny unless a later kind is added.
         let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all(adapter_ref));
-        let max_runtimes =
-            store_config.get("maxRuntimes").and_then(|v| v.as_u64()).unwrap_or(4).clamp(1, 64) as usize;
+        let max_runtimes = store_config
+            .get("maxRuntimes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(4)
+            .clamp(1, 64) as usize;
         let idle_ms = store_config
             .get("idleMs")
             .and_then(|v| v.as_u64())
-            .or_else(|| store_config.get("idleSeconds").and_then(|v| v.as_u64()).map(|s| s.saturating_mul(1000)))
+            .or_else(|| {
+                store_config
+                    .get("idleSeconds")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| s.saturating_mul(1000))
+            })
             .unwrap_or(60_000);
         Ok(ResidentAdapter {
             pool: Arc::new(Mutex::new(Vec::new())),
@@ -395,7 +416,10 @@ impl ResidentAdapter {
             req["mediaType"] = json!("application/json");
         }
         let envelope = handle.call(req, self.store_config.clone()).await?;
-        let status = envelope.get("status").and_then(|s| s.as_u64()).unwrap_or(200) as u16;
+        let status = envelope
+            .get("status")
+            .and_then(|s| s.as_u64())
+            .unwrap_or(200) as u16;
         let body = envelope.get("body").cloned().unwrap_or(Value::Null);
         Ok((status, body))
     }
@@ -420,11 +444,23 @@ impl GuestDataStore {
         limits: InvocationLimits,
     ) -> Result<Self, RsError> {
         Ok(GuestDataStore {
-            inner: ResidentAdapter::from_config("data", adapter_ref, store_config, files, tenant, limits)?,
+            inner: ResidentAdapter::from_config(
+                "data",
+                adapter_ref,
+                store_config,
+                files,
+                tenant,
+                limits,
+            )?,
         })
     }
 
-    async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<(u16, Value), RsError> {
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(u16, Value), RsError> {
         self.inner.call(method, path, body).await
     }
 }
@@ -446,7 +482,9 @@ fn store_error(status: u16, body: &Value) -> RsError {
         404 => RsError::not_found(detail),
         409 => RsError::conflict(detail),
         413 => RsError::payload_too_large(detail),
-        422 => RsError::validation_failed(detail, body.get("errors").cloned().unwrap_or(Value::Null)),
+        422 => {
+            RsError::validation_failed(detail, body.get("errors").cloned().unwrap_or(Value::Null))
+        }
         _ => RsError::contract_violation(detail),
     }
 }
@@ -483,8 +521,16 @@ impl DataStore for GuestDataStore {
         }
     }
 
-    async fn put(&self, _tenant: &str, dataset: &str, key: &str, value: Value) -> Result<bool, RsError> {
-        let (status, body) = self.call("PUT", &format!("/{dataset}/{key}"), Some(value)).await?;
+    async fn put(
+        &self,
+        _tenant: &str,
+        dataset: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<bool, RsError> {
+        let (status, body) = self
+            .call("PUT", &format!("/{dataset}/{key}"), Some(value))
+            .await?;
         match status {
             201 => Ok(true),
             200 => Ok(false),
@@ -493,7 +539,9 @@ impl DataStore for GuestDataStore {
     }
 
     async fn delete(&self, _tenant: &str, dataset: &str, key: &str) -> Result<(), RsError> {
-        let (status, body) = self.call("DELETE", &format!("/{dataset}/{key}"), None).await?;
+        let (status, body) = self
+            .call("DELETE", &format!("/{dataset}/{key}"), None)
+            .await?;
         if matches!(status, 200 | 204) {
             Ok(())
         } else {
@@ -501,17 +549,35 @@ impl DataStore for GuestDataStore {
         }
     }
 
-    async fn list_keys(&self, _tenant: &str, dataset: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
-        let (status, body) =
-            self.call("GET", &format!("/{dataset}/?$take={take}&$skip={skip}"), None).await?;
+    async fn list_keys(
+        &self,
+        _tenant: &str,
+        dataset: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError> {
+        let (status, body) = self
+            .call(
+                "GET",
+                &format!("/{dataset}/?$take={take}&$skip={skip}"),
+                None,
+            )
+            .await?;
         if !(200..300).contains(&status) {
             return Err(store_error(status, &body));
         }
         Ok((listing_names(&body, false), listing_total(&body)))
     }
 
-    async fn list_datasets(&self, _tenant: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
-        let (status, body) = self.call("GET", &format!("/?$take={take}&$skip={skip}"), None).await?;
+    async fn list_datasets(
+        &self,
+        _tenant: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError> {
+        let (status, body) = self
+            .call("GET", &format!("/?$take={take}&$skip={skip}"), None)
+            .await?;
         if !(200..300).contains(&status) {
             return Err(store_error(status, &body));
         }
@@ -519,7 +585,9 @@ impl DataStore for GuestDataStore {
     }
 
     async fn get_schema(&self, _tenant: &str, dataset: &str) -> Result<Option<Value>, RsError> {
-        let (status, body) = self.call("GET", &format!("/{dataset}/.schema.json"), None).await?;
+        let (status, body) = self
+            .call("GET", &format!("/{dataset}/.schema.json"), None)
+            .await?;
         match status {
             s if (200..300).contains(&s) => Ok(Some(body)),
             404 => Ok(None),
@@ -528,8 +596,9 @@ impl DataStore for GuestDataStore {
     }
 
     async fn put_schema(&self, _tenant: &str, dataset: &str, schema: Value) -> Result<(), RsError> {
-        let (status, body) =
-            self.call("PUT", &format!("/{dataset}/.schema.json"), Some(schema)).await?;
+        let (status, body) = self
+            .call("PUT", &format!("/{dataset}/.schema.json"), Some(schema))
+            .await?;
         if (200..300).contains(&status) {
             Ok(())
         } else {
@@ -538,8 +607,9 @@ impl DataStore for GuestDataStore {
     }
 
     async fn delete_dataset(&self, _tenant: &str, dataset: &str) -> Result<(), RsError> {
-        let (status, body) =
-            self.call("DELETE", &format!("/{dataset}/?confirm={dataset}"), None).await?;
+        let (status, body) = self
+            .call("DELETE", &format!("/{dataset}/?confirm={dataset}"), None)
+            .await?;
         if matches!(status, 200 | 204) {
             Ok(())
         } else {
@@ -567,7 +637,14 @@ impl GuestSmsGateway {
         limits: InvocationLimits,
     ) -> Result<Self, RsError> {
         Ok(GuestSmsGateway {
-            inner: ResidentAdapter::from_config("sms", adapter_ref, store_config, files, tenant, limits)?,
+            inner: ResidentAdapter::from_config(
+                "sms",
+                adapter_ref,
+                store_config,
+                files,
+                tenant,
+                limits,
+            )?,
         })
     }
 }
@@ -575,8 +652,10 @@ impl GuestSmsGateway {
 #[async_trait]
 impl SmsGateway for GuestSmsGateway {
     async fn send(&self, _tenant: &str, to: &str, body: &str) -> Result<String, RsError> {
-        let (status, resp) =
-            self.inner.call("POST", "/send", Some(json!({ "to": to, "body": body }))).await?;
+        let (status, resp) = self
+            .inner
+            .call("POST", "/send", Some(json!({ "to": to, "body": body })))
+            .await?;
         if !(200..300).contains(&status) {
             return Err(store_error(status, &resp));
         }
@@ -587,7 +666,10 @@ impl SmsGateway for GuestSmsGateway {
     }
 
     async fn status(&self, _tenant: &str, id: &str) -> Result<Value, RsError> {
-        let (status, resp) = self.inner.call("GET", &format!("/status/{id}"), None).await?;
+        let (status, resp) = self
+            .inner
+            .call("GET", &format!("/status/{id}"), None)
+            .await?;
         if (200..300).contains(&status) {
             Ok(resp)
         } else {
@@ -615,7 +697,14 @@ impl GuestQueryStore {
         limits: InvocationLimits,
     ) -> Result<Self, RsError> {
         Ok(GuestQueryStore {
-            inner: ResidentAdapter::from_config("query", adapter_ref, store_config, files, tenant, limits)?,
+            inner: ResidentAdapter::from_config(
+                "query",
+                adapter_ref,
+                store_config,
+                files,
+                tenant,
+                limits,
+            )?,
         })
     }
 }
@@ -635,8 +724,15 @@ impl QueryStore for GuestQueryStore {
         if !(200..300).contains(&status) {
             return Err(store_error(status, &resp));
         }
-        let rows = resp.get("rows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
-        let total = resp.get("total").and_then(|t| t.as_u64()).unwrap_or(rows.len() as u64);
+        let rows = resp
+            .get("rows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let total = resp
+            .get("total")
+            .and_then(|t| t.as_u64())
+            .unwrap_or(rows.len() as u64);
         Ok((rows, total))
     }
 
@@ -688,12 +784,20 @@ impl GuestFileStore {
         limits: InvocationLimits,
     ) -> Result<Self, RsError> {
         Ok(GuestFileStore {
-            inner: ResidentAdapter::from_config("file", adapter_ref, store_config, files, tenant, limits)?,
+            inner: ResidentAdapter::from_config(
+                "file",
+                adapter_ref,
+                store_config,
+                files,
+                tenant,
+                limits,
+            )?,
         })
     }
 }
 
-const B64: base64::engine::general_purpose::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+const B64: base64::engine::general_purpose::GeneralPurpose =
+    base64::engine::general_purpose::STANDARD;
 
 /// A stable content version (for the file service's ETags), hashed from bytes.
 fn content_version(bytes: &[u8]) -> String {
@@ -717,15 +821,23 @@ impl FileStore for GuestFileStore {
         })
     }
 
-    async fn read(&self, _tenant: &str, path: &str, range: Option<ByteRange>) -> Result<Body, RsError> {
+    async fn read(
+        &self,
+        _tenant: &str,
+        path: &str,
+        range: Option<ByteRange>,
+    ) -> Result<Body, RsError> {
         let (status, body) = self.inner.call("GET", path, None).await?;
         if !(200..300).contains(&status) {
             return Err(store_error(status, &body));
         }
-        let b64 = body.get("contentBase64").and_then(|c| c.as_str()).unwrap_or("");
-        let bytes = B64
-            .decode(b64)
-            .map_err(|e| RsError::contract_violation(format!("adapter returned invalid base64: {e}")))?;
+        let b64 = body
+            .get("contentBase64")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        let bytes = B64.decode(b64).map_err(|e| {
+            RsError::contract_violation(format!("adapter returned invalid base64: {e}"))
+        })?;
         let media_type = body
             .get("mediaType")
             .and_then(|m| m.as_str())
@@ -753,13 +865,18 @@ impl FileStore for GuestFileStore {
             }
         };
         let mut out = Body::from_bytes(slice, media_type);
-        out.provenance = Provenance::Replayable { url: path.to_string(), version };
+        out.provenance = Provenance::Replayable {
+            url: path.to_string(),
+            version,
+        };
         Ok(out)
     }
 
     async fn write(&self, _tenant: &str, path: &str, mut body: Body) -> Result<bool, RsError> {
         let media_type = body.media_type.to_string();
-        let bytes = body.materialize(self.inner.limits.materialized_body_bytes).await?;
+        let bytes = body
+            .materialize(self.inner.limits.materialized_body_bytes)
+            .await?;
         let payload = json!({ "contentBase64": B64.encode(bytes), "mediaType": media_type });
         let (status, resp) = self.inner.call("PUT", path, Some(payload)).await?;
         match status {
@@ -779,7 +896,10 @@ impl FileStore for GuestFileStore {
     }
 
     async fn rename(&self, _tenant: &str, from: &str, to: &str) -> Result<bool, RsError> {
-        let (status, body) = self.inner.call("MOVE", from, Some(json!({ "to": to }))).await?;
+        let (status, body) = self
+            .inner
+            .call("MOVE", from, Some(json!({ "to": to })))
+            .await?;
         match status {
             201 => Ok(true),
             200 => Ok(false),
@@ -797,7 +917,10 @@ impl FileStore for GuestFileStore {
     }
 
     async fn delete_dir_all(&self, _tenant: &str, path: &str) -> Result<(), RsError> {
-        let (status, body) = self.inner.call("DELETE", path, Some(json!({ "recursive": true }))).await?;
+        let (status, body) = self
+            .inner
+            .call("DELETE", path, Some(json!({ "recursive": true })))
+            .await?;
         if matches!(status, 200 | 204) {
             Ok(())
         } else {
@@ -805,10 +928,22 @@ impl FileStore for GuestFileStore {
         }
     }
 
-    async fn list(&self, _tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
+    async fn list(
+        &self,
+        _tenant: &str,
+        path: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<DirEntry>, u64), RsError> {
         let sep = if path.contains('?') { '&' } else { '?' };
-        let (status, body) =
-            self.inner.call("GET", &format!("{path}{sep}$take={take}&$skip={skip}"), None).await?;
+        let (status, body) = self
+            .inner
+            .call(
+                "GET",
+                &format!("{path}{sep}$take={take}&$skip={skip}"),
+                None,
+            )
+            .await?;
         if !(200..300).contains(&status) {
             return Err(store_error(status, &body));
         }
@@ -819,7 +954,11 @@ impl FileStore for GuestFileStore {
             .map(|arr| {
                 arr.iter()
                     .map(|e| DirEntry {
-                        name: e.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+                        name: e
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         size: e.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
                         last_modified: e
                             .get("lastModified")
@@ -855,8 +994,14 @@ mod tests {
         let h = spawn_resident(src, host, InvocationLimits::default(), "t".into(), vec![])
             .await
             .unwrap();
-        let a = h.call(json!({ "method": "GET", "url": "/" }), json!({})).await.unwrap();
-        let b = h.call(json!({ "method": "GET", "url": "/" }), json!({})).await.unwrap();
+        let a = h
+            .call(json!({ "method": "GET", "url": "/" }), json!({}))
+            .await
+            .unwrap();
+        let b = h
+            .call(json!({ "method": "GET", "url": "/" }), json!({}))
+            .await
+            .unwrap();
         assert_eq!(a["body"]["n"], 1, "first job sees N=1");
         assert_eq!(b["body"]["n"], 2, "second job reuses the same isolate: N=2");
     }

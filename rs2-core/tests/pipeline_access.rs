@@ -58,8 +58,10 @@ fn returns_constant() -> serde_json::Value {
 }
 
 fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(file_root)), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(file_root)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({
         // `A` is the operator role — only operators may set a spec's `access`.
         "operatorRoles": "A",
@@ -69,7 +71,12 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
               "config": { "access": { "invoke": "A", "write": "A" } } }
         ]
     })));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 #[tokio::test]
@@ -78,12 +85,13 @@ async fn a_spec_overrides_the_mount_floor_either_way() {
     let rt = rt(dir.path());
 
     // Author specs as admin (authoring is host-enforced via write = "A").
-    let put = |path: &str, doc: serde_json::Value| {
-        as_role(req(Method::PUT, path), "A").with_json(&doc)
-    };
+    let put =
+        |path: &str, doc: serde_json::Value| as_role(req(Method::PUT, path), "A").with_json(&doc);
     // `.root`: no per-spec access → inherits the mount floor (invoke "A").
     assert_eq!(
-        rt.handle(put("/p/.pipelines/.root", returns_constant())).await.status,
+        rt.handle(put("/p/.pipelines/.root", returns_constant()))
+            .await
+            .status,
         Some(StatusCode::CREATED)
     );
     // `/login`: loosened to public.
@@ -117,16 +125,18 @@ async fn a_spec_overrides_the_mount_floor_either_way() {
         denial(&rt, as_role(req(Method::POST, "/p/audit"), "U")).await,
         Some(StatusCode::FORBIDDEN)
     );
-    assert_eq!(denial(&rt, as_role(req(Method::POST, "/p/audit"), "E")).await, None);
+    assert_eq!(
+        denial(&rt, as_role(req(Method::POST, "/p/audit"), "E")).await,
+        None
+    );
 }
 
 #[tokio::test]
 async fn envelope_access_shape_is_validated() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt(dir.path());
-    let put = |path: &str, doc: serde_json::Value| {
-        as_role(req(Method::PUT, path), "A").with_json(&doc)
-    };
+    let put =
+        |path: &str, doc: serde_json::Value| as_role(req(Method::PUT, path), "A").with_json(&doc);
 
     // `manage` is not a spec action.
     let mut bad = returns_constant();

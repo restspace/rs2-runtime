@@ -234,7 +234,14 @@ impl Service for PipelineService {
             &spec,
             msg,
             ctx,
-            ExecInputs { peeled, base_segs, url_name, url_query, rest, envelope_retry },
+            ExecInputs {
+                peeled,
+                base_segs,
+                url_name,
+                url_query,
+                rest,
+                envelope_retry,
+            },
         )
         .await
     }
@@ -304,7 +311,13 @@ pub(crate) async fn run_inline(
             )
             .map(std::sync::Arc::new),
         )
-        .with_url(inputs.peeled, inputs.base_segs, inputs.url_name, inputs.url_query, inputs.rest);
+        .with_url(
+            inputs.peeled,
+            inputs.base_segs,
+            inputs.url_name,
+            inputs.url_query,
+            inputs.rest,
+        );
     // Bind the mount's granted secrets as `$<name>` variables (host-side),
     // so a transform can `$hmacVerify('sha256', $<name>, $_rawBody, $sig)`.
     if let Some(secrets) = &ctx.secrets {
@@ -333,7 +346,8 @@ pub(crate) async fn run_inline(
                 .cloned();
             if let Some(body) = &mut resp.body {
                 if body.media_type.is_json() {
-                    if let Ok(mut problem) = body.as_json(ctx.limits.materialized_body_bytes).await {
+                    if let Ok(mut problem) = body.as_json(ctx.limits.materialized_body_bytes).await
+                    {
                         if let Some(obj) = problem.as_object_mut() {
                             obj.insert(
                                 "pipeline".to_string(),

@@ -42,12 +42,19 @@ fn as_role(mut msg: Message, role: &str) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> Value {
-    msg.body.as_mut().expect("body").as_json(1 << 20).await.expect("json")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(1 << 20)
+        .await
+        .expect("json")
 }
 
 fn rt(dir: &std::path::Path, flag: bool) -> Arc<Runtime> {
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir)), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({
         "operatorRoles": "A",
         "mounts": [
@@ -55,7 +62,12 @@ fn rt(dir: &std::path::Path, flag: bool) -> Arc<Runtime> {
               "config": { "fieldLevelAuthz": flag, "access": { "read": "all", "write": "all" } } }
         ]
     })));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 /// `name` open; `roles` readable but admin-write-only; `ssn` admin-only both ways.
@@ -73,10 +85,17 @@ fn schema() -> Value {
 /// Seed schema (as operator A) + one record (A may write every field).
 async fn seed(rt: &Runtime) {
     let s = as_role(req(Method::PUT, "/data/people/.schema.json"), "A").with_json(&schema());
-    assert_eq!(rt.handle(s).await.status, Some(StatusCode::OK), "seed schema");
+    assert_eq!(
+        rt.handle(s).await.status,
+        Some(StatusCode::OK),
+        "seed schema"
+    );
     let r = as_role(req(Method::PUT, "/data/people/p1"), "A")
         .with_json(&json!({ "name": "Ada", "roles": "U", "ssn": "123" }));
-    assert!(rt.handle(r).await.status.unwrap().is_success(), "seed record");
+    assert!(
+        rt.handle(r).await.status.unwrap().is_success(),
+        "seed record"
+    );
 }
 
 #[tokio::test]
@@ -85,13 +104,20 @@ async fn reads_redact_unreadable_fields() {
     let rt = rt(dir.path(), true);
     seed(&rt).await;
 
-    let mut as_u = rt.handle(as_role(req(Method::GET, "/data/people/p1"), "U")).await;
+    let mut as_u = rt
+        .handle(as_role(req(Method::GET, "/data/people/p1"), "U"))
+        .await;
     let u_body = body_json(&mut as_u).await;
     assert_eq!(u_body["name"], "Ada");
-    assert_eq!(u_body["roles"], "U", "roles is readable (write-only restriction)");
+    assert_eq!(
+        u_body["roles"], "U",
+        "roles is readable (write-only restriction)"
+    );
     assert!(u_body.get("ssn").is_none(), "ssn redacted for U");
 
-    let mut as_a = rt.handle(as_role(req(Method::GET, "/data/people/p1"), "A")).await;
+    let mut as_a = rt
+        .handle(as_role(req(Method::GET, "/data/people/p1"), "A"))
+        .await;
     assert_eq!(body_json(&mut as_a).await["ssn"], "123", "admin sees ssn");
 }
 
@@ -104,14 +130,26 @@ async fn writes_to_unwritable_fields_are_rejected() {
     // U changing `roles` (readable, admin-write-only) → 403, by PUT and PATCH.
     let put = as_role(req(Method::PUT, "/data/people/p1"), "U")
         .with_json(&json!({ "name": "Ada", "roles": "U A" }));
-    assert_eq!(rt.handle(put).await.status, Some(StatusCode::FORBIDDEN), "PUT role escalation");
-    let patch = as_role(req(Method::PATCH, "/data/people/p1"), "U")
-        .with_json(&json!({ "roles": "U A" }));
-    assert_eq!(rt.handle(patch).await.status, Some(StatusCode::FORBIDDEN), "PATCH role escalation");
+    assert_eq!(
+        rt.handle(put).await.status,
+        Some(StatusCode::FORBIDDEN),
+        "PUT role escalation"
+    );
+    let patch =
+        as_role(req(Method::PATCH, "/data/people/p1"), "U").with_json(&json!({ "roles": "U A" }));
+    assert_eq!(
+        rt.handle(patch).await.status,
+        Some(StatusCode::FORBIDDEN),
+        "PATCH role escalation"
+    );
 
     // A may change roles.
-    let ok = as_role(req(Method::PATCH, "/data/people/p1"), "A").with_json(&json!({ "roles": "U E" }));
-    assert!(rt.handle(ok).await.status.unwrap().is_success(), "admin sets roles");
+    let ok =
+        as_role(req(Method::PATCH, "/data/people/p1"), "A").with_json(&json!({ "roles": "U E" }));
+    assert!(
+        rt.handle(ok).await.status.unwrap().is_success(),
+        "admin sets roles"
+    );
 }
 
 #[tokio::test]
@@ -121,17 +159,29 @@ async fn patch_round_trip_preserves_redacted_fields() {
     seed(&rt).await;
 
     // U reads (no ssn), edits a visible field, PATCHes it back.
-    let mut got = rt.handle(as_role(req(Method::GET, "/data/people/p1"), "U")).await;
+    let mut got = rt
+        .handle(as_role(req(Method::GET, "/data/people/p1"), "U"))
+        .await;
     assert!(body_json(&mut got).await.get("ssn").is_none());
-    let patch = as_role(req(Method::PATCH, "/data/people/p1"), "U").with_json(&json!({ "name": "Ada L" }));
+    let patch =
+        as_role(req(Method::PATCH, "/data/people/p1"), "U").with_json(&json!({ "name": "Ada L" }));
     let resp = rt.handle(patch).await;
-    assert!(resp.status.unwrap().is_success(), "PATCH visible field: {:?}", resp.status);
+    assert!(
+        resp.status.unwrap().is_success(),
+        "PATCH visible field: {:?}",
+        resp.status
+    );
 
     // ssn is intact; name updated.
-    let mut after = rt.handle(as_role(req(Method::GET, "/data/people/p1"), "A")).await;
+    let mut after = rt
+        .handle(as_role(req(Method::GET, "/data/people/p1"), "A"))
+        .await;
     let rec = body_json(&mut after).await;
     assert_eq!(rec["name"], "Ada L");
-    assert_eq!(rec["ssn"], "123", "redacted ssn preserved across the round-trip");
+    assert_eq!(
+        rec["ssn"], "123",
+        "redacted ssn preserved across the round-trip"
+    );
 }
 
 #[tokio::test]
@@ -141,14 +191,25 @@ async fn put_back_a_redacted_record_preserves_hidden_fields() {
     seed(&rt).await;
 
     // U GETs the redacted record and PUTs the exact body back (no ssn in it).
-    let mut got = rt.handle(as_role(req(Method::GET, "/data/people/p1"), "U")).await;
+    let mut got = rt
+        .handle(as_role(req(Method::GET, "/data/people/p1"), "U"))
+        .await;
     let redacted = body_json(&mut got).await;
     assert!(redacted.get("ssn").is_none());
     let put = as_role(req(Method::PUT, "/data/people/p1"), "U").with_json(&redacted);
-    assert!(rt.handle(put).await.status.unwrap().is_success(), "PUT redacted body back");
+    assert!(
+        rt.handle(put).await.status.unwrap().is_success(),
+        "PUT redacted body back"
+    );
 
-    let mut after = rt.handle(as_role(req(Method::GET, "/data/people/p1"), "A")).await;
-    assert_eq!(body_json(&mut after).await["ssn"], "123", "ssn not dropped by full PUT");
+    let mut after = rt
+        .handle(as_role(req(Method::GET, "/data/people/p1"), "A"))
+        .await;
+    assert_eq!(
+        body_json(&mut after).await["ssn"],
+        "123",
+        "ssn not dropped by full PUT"
+    );
 }
 
 #[tokio::test]
@@ -169,16 +230,30 @@ async fn schema_writes_require_an_operator() {
 async fn flag_off_is_back_compat() {
     let dir = tempfile::tempdir().unwrap();
     let rt = rt(dir.path(), false); // fieldLevelAuthz: false
-    // Seed schema as anyone (no operator gate when the flag is off).
+                                    // Seed schema as anyone (no operator gate when the flag is off).
     let s = req(Method::PUT, "/data/people/.schema.json").with_json(&schema());
-    assert_eq!(rt.handle(s).await.status, Some(StatusCode::OK), "schema write ungated");
+    assert_eq!(
+        rt.handle(s).await.status,
+        Some(StatusCode::OK),
+        "schema write ungated"
+    );
     let r = req(Method::PUT, "/data/people/p1")
         .with_json(&json!({ "name": "Ada", "roles": "U", "ssn": "123" }));
     assert!(rt.handle(r).await.status.unwrap().is_success());
 
     // No redaction, no field gate: U sees ssn and can change roles.
-    let mut got = rt.handle(as_role(req(Method::GET, "/data/people/p1"), "U")).await;
-    assert_eq!(body_json(&mut got).await["ssn"], "123", "no redaction when flag off");
-    let patch = as_role(req(Method::PATCH, "/data/people/p1"), "U").with_json(&json!({ "roles": "U A" }));
-    assert!(rt.handle(patch).await.status.unwrap().is_success(), "no field gate when flag off");
+    let mut got = rt
+        .handle(as_role(req(Method::GET, "/data/people/p1"), "U"))
+        .await;
+    assert_eq!(
+        body_json(&mut got).await["ssn"],
+        "123",
+        "no redaction when flag off"
+    );
+    let patch =
+        as_role(req(Method::PATCH, "/data/people/p1"), "U").with_json(&json!({ "roles": "U A" }));
+    assert!(
+        rt.handle(patch).await.status.unwrap().is_success(),
+        "no field gate when flag off"
+    );
 }

@@ -65,7 +65,11 @@ impl Default for InvocationLimits {
 }
 
 pub type NativeHandler = Arc<
-    dyn Fn(Message, serde_json::Value, Arc<dyn HostApi>) -> Pin<Box<dyn Future<Output = Result<Message, RsError>> + Send>>
+    dyn Fn(
+            Message,
+            serde_json::Value,
+            Arc<dyn HostApi>,
+        ) -> Pin<Box<dyn Future<Output = Result<Message, RsError>> + Send>>
         + Send
         + Sync,
 >;
@@ -152,7 +156,12 @@ impl GrantedHost {
 
     /// A host with no grants at all — the default-deny baseline.
     pub fn deny_all(service_name: &str) -> Self {
-        Self::new(HashMap::new(), 0, Arc::new(RwLock::new(HashMap::new())), service_name)
+        Self::new(
+            HashMap::new(),
+            0,
+            Arc::new(RwLock::new(HashMap::new())),
+            service_name,
+        )
     }
 }
 
@@ -165,7 +174,11 @@ impl HostApi for GrantedHost {
             .ok_or_else(|| RsError::capability_denied(capability))?;
         let used = self.outbound_used.fetch_add(1, Ordering::SeqCst) + 1;
         if used > self.outbound_budget {
-            return Err(RsError::limit_exceeded("outbound_calls", used, self.outbound_budget));
+            return Err(RsError::limit_exceeded(
+                "outbound_calls",
+                used,
+                self.outbound_budget,
+            ));
         }
         let mut msg = msg;
         msg.trace = msg.trace.child();
@@ -194,10 +207,17 @@ impl HostApi for GrantedHost {
     }
 
     async fn state_get(&self, key: &str) -> Option<Vec<u8>> {
-        self.state.read().await.get(&format!("{}:{key}", self.service_name)).cloned()
+        self.state
+            .read()
+            .await
+            .get(&format!("{}:{key}", self.service_name))
+            .cloned()
     }
 
     async fn state_put(&self, key: &str, value: Vec<u8>) {
-        self.state.write().await.insert(format!("{}:{key}", self.service_name), value);
+        self.state
+            .write()
+            .await
+            .insert(format!("{}:{key}", self.service_name), value);
     }
 }

@@ -44,7 +44,9 @@ fn test_runtime(file_root: &std::path::Path) -> Arc<Runtime> {
             "access": "open", "defaultResource": "index.html", "listings": false } }
     ]})));
     Runtime::new(
-        Tenancy::Single { tenant: "t1".into() },
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
         adapters,
         loader,
         LimitTable::default(),
@@ -63,11 +65,21 @@ fn req_accept(method: Method, path: &str, accept: &str) -> Message {
 
 async fn put_ok(rt: &Runtime, path: &str, content: &str, mt: &str) {
     let m = req(Method::PUT, path).with_body(Body::from_string(content, MediaType::new(mt)));
-    assert_eq!(rt.handle(m).await.status, Some(StatusCode::CREATED), "{path}");
+    assert_eq!(
+        rt.handle(m).await.status,
+        Some(StatusCode::CREATED),
+        "{path}"
+    );
 }
 
 async fn body_of(resp: &mut Message) -> Vec<u8> {
-    resp.body.as_mut().unwrap().materialize(65536).await.unwrap().to_vec()
+    resp.body
+        .as_mut()
+        .unwrap()
+        .materialize(65536)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -89,7 +101,10 @@ async fn explicit_dir_json_accept_forces_listing() {
         .iter()
         .map(|e| e["name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"index.html") && names.contains(&"data.json"), "{names:?}");
+    assert!(
+        names.contains(&"index.html") && names.contains(&"data.json"),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]
@@ -100,7 +115,10 @@ async fn no_accept_serves_default_doc_with_vary() {
 
     let mut resp = rt.handle(req(Method::GET, "/site/")).await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.body.as_ref().unwrap().media_type.essence(), "text/html");
+    assert_eq!(
+        resp.body.as_ref().unwrap().media_type.essence(),
+        "text/html"
+    );
     // Negotiation is in play here, so the default-doc response advertises Vary too.
     assert_eq!(resp.header("vary"), Some("accept"));
     assert_eq!(&body_of(&mut resp).await[..], b"<html>home</html>");
@@ -121,7 +139,10 @@ async fn browser_wildcard_accept_serves_default_doc() {
         ))
         .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.body.as_ref().unwrap().media_type.essence(), "text/html");
+    assert_eq!(
+        resp.body.as_ref().unwrap().media_type.essence(),
+        "text/html"
+    );
     assert_eq!(&body_of(&mut resp).await[..], b"<html>home</html>");
 }
 
@@ -133,7 +154,9 @@ async fn listings_false_suppresses_even_explicit_dir_json() {
     put_ok(&rt, "/locked/secret.json", "{}", "application/json").await;
 
     // `listings: false` is a hard suppression negotiation cannot bypass.
-    let resp = rt.handle(req_accept(Method::GET, "/locked/", DIR_JSON)).await;
+    let resp = rt
+        .handle(req_accept(Method::GET, "/locked/", DIR_JSON))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::NOT_FOUND));
 
     // The default doc is still served to a normal request.
@@ -148,7 +171,9 @@ async fn listing_available_at_subdirs_too() {
     put_ok(&rt, "/site/docs/a.md", "# a", "text/markdown").await;
     put_ok(&rt, "/site/docs/b.md", "# b", "text/markdown").await;
 
-    let mut resp = rt.handle(req_accept(Method::GET, "/site/docs/", DIR_JSON)).await;
+    let mut resp = rt
+        .handle(req_accept(Method::GET, "/site/docs/", DIR_JSON))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     assert_eq!(resp.header("x-total-count"), Some("2"));
     let listing: serde_json::Value = serde_json::from_slice(&body_of(&mut resp).await).unwrap();

@@ -39,7 +39,10 @@ struct HostState {
 
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -52,7 +55,10 @@ fn level_from_wit(level: wit_types::LogLevel) -> LogLevel {
     }
 }
 
-async fn message_to_wit(msg: &mut RsMessage, materialize_cap: u64) -> Result<wit_types::Message, RsError> {
+async fn message_to_wit(
+    msg: &mut RsMessage,
+    materialize_cap: u64,
+) -> Result<wit_types::Message, RsError> {
     let body = match &mut msg.body {
         None => None,
         Some(b) => {
@@ -69,7 +75,11 @@ async fn message_to_wit(msg: &mut RsMessage, materialize_cap: u64) -> Result<wit
         url: format!(
             "{}{}",
             msg.url.path,
-            if msg.url.query.is_empty() { String::new() } else { format!("?{}", msg.url.query) }
+            if msg.url.query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", msg.url.query)
+            }
         ),
         headers: msg
             .headers
@@ -131,11 +141,19 @@ impl rs2::service::host::Host for HostState {
             }
             out.body = Some(Body::from_bytes(b.bytes, mt));
         }
-        let mut result = self.api.request(&capability, out).await.map_err(|e| match e.code {
-            crate::error::codes::CAPABILITY_DENIED => wit_types::HostError::CapabilityDenied(e.detail),
-            crate::error::codes::LIMIT_EXCEEDED => wit_types::HostError::LimitExceeded(e.detail),
-            _ => wit_types::HostError::Failed(e.detail),
-        })?;
+        let mut result = self
+            .api
+            .request(&capability, out)
+            .await
+            .map_err(|e| match e.code {
+                crate::error::codes::CAPABILITY_DENIED => {
+                    wit_types::HostError::CapabilityDenied(e.detail)
+                }
+                crate::error::codes::LIMIT_EXCEEDED => {
+                    wit_types::HostError::LimitExceeded(e.detail)
+                }
+                _ => wit_types::HostError::Failed(e.detail),
+            })?;
         message_to_wit(&mut result, self.limits.materialized_body_bytes)
             .await
             .map_err(|e| wit_types::HostError::Failed(e.detail))
@@ -185,8 +203,11 @@ impl WasmEngine {
         let mut linker: Linker<HostState> = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| RsError::internal(format!("wasi linker: {e}")))?;
-        rs2::service::host::add_to_linker::<_, HasSelf<HostState>>(&mut linker, |s: &mut HostState| s)
-            .map_err(|e| RsError::internal(format!("host linker: {e}")))?;
+        rs2::service::host::add_to_linker::<_, HasSelf<HostState>>(
+            &mut linker,
+            |s: &mut HostState| s,
+        )
+        .map_err(|e| RsError::internal(format!("host linker: {e}")))?;
         // One dedicated ticker thread per engine: a tokio timer can be starved
         // by the very guests the ticks are meant to preempt. Stopped via flag
         // on drop (tenant rebuilds drop the engine with its CodeService).
@@ -225,21 +246,28 @@ impl WasmEngine {
         if let Some((_, pre)) = self.instantiable.read().await.get(&key) {
             return Ok(pre.clone());
         }
-        let component = Component::new(&self.engine, bytes.as_slice())
-            .map_err(|e| RsError::contract_violation(format!("component failed to compile: {e}")))?;
+        let component = Component::new(&self.engine, bytes.as_slice()).map_err(|e| {
+            RsError::contract_violation(format!("component failed to compile: {e}"))
+        })?;
         let pre = self
             .linker
             .instantiate_pre(&component)
             .and_then(ServicePre::new)
-            .map_err(|e| RsError::contract_violation(format!("component imports unresolved: {e}")))?;
-        self.instantiable.write().await.insert(key, (bytes.clone(), pre.clone()));
+            .map_err(|e| {
+                RsError::contract_violation(format!("component imports unresolved: {e}"))
+            })?;
+        self.instantiable
+            .write()
+            .await
+            .insert(key, (bytes.clone(), pre.clone()));
         Ok(pre)
     }
 }
 
 impl Drop for WasmEngine {
     fn drop(&mut self) {
-        self.ticker_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.ticker_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -255,7 +283,11 @@ impl RsEngine for WasmEngine {
     ) -> Result<RsMessage, RsError> {
         let bytes = match code {
             ServiceCode::WasmComponent(b) => b.clone(),
-            _ => return Err(RsError::engine_unavailable("wasm engine only runs wasm components")),
+            _ => {
+                return Err(RsError::engine_unavailable(
+                    "wasm engine only runs wasm components",
+                ))
+            }
         };
         let pre = self.instance_pre_for(&bytes).await?;
 

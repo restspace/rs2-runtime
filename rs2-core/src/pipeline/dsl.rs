@@ -40,9 +40,10 @@ pub fn convert(value: &Value) -> Result<PipelineSpec, RsError> {
                 }
                 first = false;
                 match s {
-                    "jsonSplit" => {
-                        spec.steps.push(Step { split: Some(Splitter::JsonSplit), ..Default::default() })
-                    }
+                    "jsonSplit" => spec.steps.push(Step {
+                        split: Some(Splitter::JsonSplit),
+                        ..Default::default()
+                    }),
                     "jsonObject" => spec.join = Some(Joiner::JsonObject),
                     "unzip" | "zip" | "multipart" => {
                         return Err(RsError::bad_request(format!(
@@ -61,7 +62,10 @@ pub fn convert(value: &Value) -> Result<PipelineSpec, RsError> {
             }
             Value::Object(_) => {
                 first = false;
-                spec.steps.push(Step { transform: Some(item.clone()), ..Default::default() });
+                spec.steps.push(Step {
+                    transform: Some(item.clone()),
+                    ..Default::default()
+                });
             }
             other => {
                 return Err(RsError::bad_request(format!(
@@ -147,10 +151,16 @@ fn parse_step(s: &str) -> Result<Step, RsError> {
         .split_once(' ')
         .map(|(m, u)| (m.trim(), u.trim()))
         .ok_or_else(|| {
-            RsError::bad_request(format!("step '{s}' must be 'METHOD url' (got '{call_part}')"))
+            RsError::bad_request(format!(
+                "step '{s}' must be 'METHOD url' (got '{call_part}')"
+            ))
         })?;
-    if http::Method::from_bytes(method.as_bytes()).is_err() || !method.chars().all(|c| c.is_ascii_uppercase()) {
-        return Err(RsError::bad_request(format!("invalid method '{method}' in step '{s}'")));
+    if http::Method::from_bytes(method.as_bytes()).is_err()
+        || !method.chars().all(|c| c.is_ascii_uppercase())
+    {
+        return Err(RsError::bad_request(format!(
+            "invalid method '{method}' in step '{s}'"
+        )));
     }
     step.call = Some(CallSpec {
         method: method.to_string(),
@@ -216,9 +226,15 @@ mod tests {
 
         assert_eq!(spec.steps.len(), 4);
         assert_eq!(spec.steps[0].capture.as_deref(), Some("$order"));
-        assert_eq!(spec.steps[0].call.as_ref().unwrap().url, "/data/orders/${id}");
+        assert_eq!(
+            spec.steps[0].call.as_ref().unwrap().url,
+            "/data/orders/${id}"
+        );
         assert!(spec.steps[1].try_mode);
-        assert_eq!(spec.steps[1].condition.as_deref(), Some("$order.status == 'open'"));
+        assert_eq!(
+            spec.steps[1].condition.as_deref(),
+            Some("$order.status == 'open'")
+        );
         assert!(spec.steps[2].transform.is_some());
         let sub = spec.steps[3].pipeline.as_ref().unwrap();
         assert_eq!(sub.mode, Mode::Parallel);
@@ -239,8 +255,13 @@ mod tests {
 
     #[test]
     fn split_and_join_tokens() {
-        let spec = convert(&json!(["GET /list", "jsonSplit", "GET /detail/${id}", "jsonObject"]))
-            .unwrap();
+        let spec = convert(&json!([
+            "GET /list",
+            "jsonSplit",
+            "GET /detail/${id}",
+            "jsonObject"
+        ]))
+        .unwrap();
         assert_eq!(spec.steps.len(), 3);
         assert_eq!(spec.steps[1].split, Some(Splitter::JsonSplit));
         assert_eq!(spec.join, Some(Joiner::JsonObject));

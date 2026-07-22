@@ -19,7 +19,10 @@ fn prelude_snapshot_is_current() {
         return;
     }
 
-    let current = format!("{:016x}", rs2_core::engines::js::prelude_snapshot_source_hash());
+    let current = format!(
+        "{:016x}",
+        rs2_core::engines::js::prelude_snapshot_source_hash()
+    );
     assert_eq!(
         committed, current,
         "prelude snapshot is stale — bootstrap/js_prelude.js changed since it was generated.\n\

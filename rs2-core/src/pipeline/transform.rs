@@ -85,10 +85,7 @@ pub fn validate_expr(expr: &str) -> Result<(), RsError> {
         .map_err(|e| RsError::bad_request(format!("invalid JSONata expression '{expr}': {e}")))
 }
 
-fn json_to_value<'a>(
-    arena: &'a bumpalo::Bump,
-    json: &Value,
-) -> &'a jsonata_rs::Value<'a> {
+fn json_to_value<'a>(arena: &'a bumpalo::Bump, json: &Value) -> &'a jsonata_rs::Value<'a> {
     match json {
         Value::Null => jsonata_rs::Value::null(arena),
         Value::Bool(b) => arena.alloc(jsonata_rs::Value::Bool(*b)),
@@ -141,7 +138,10 @@ fn apply_inner(
             Ok(Value::Object(out))
         }
         Value::Array(items) => Ok(Value::Array(
-            items.iter().map(|v| apply_inner(v, input_text, vars)).collect::<Result<_, _>>()?,
+            items
+                .iter()
+                .map(|v| apply_inner(v, input_text, vars))
+                .collect::<Result<_, _>>()?,
         )),
         other => Ok(other.clone()),
     }
@@ -177,9 +177,13 @@ fn jsonata_hmac<'a>(
     ctx: jsonata_rs::FunctionContext<'a, '_>,
     args: &[&'a J<'a>],
 ) -> jsonata_rs::Result<&'a J<'a>> {
-    let hex = hmac_bytes(&arg_str(args, 0), arg_str(args, 1).as_bytes(), arg_str(args, 2).as_bytes())
-        .map(|b| to_hex(&b))
-        .unwrap_or_default();
+    let hex = hmac_bytes(
+        &arg_str(args, 0),
+        arg_str(args, 1).as_bytes(),
+        arg_str(args, 2).as_bytes(),
+    )
+    .map(|b| to_hex(&b))
+    .unwrap_or_default();
     Ok(jsonata_rs::Value::string(ctx.arena, &hex))
 }
 
@@ -218,7 +222,6 @@ fn jsonata_verify_password<'a>(
     Ok(jsonata_rs::Value::bool(ok))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,7 +247,10 @@ mod tests {
             vars,
         )
         .unwrap();
-        assert_eq!(out, json!({ "total": 5, "customer": "c1", "charged": true, "fixed": 42 }));
+        assert_eq!(
+            out,
+            json!({ "total": 5, "customer": "c1", "charged": true, "fixed": 42 })
+        );
     }
 
     #[test]
@@ -256,7 +262,12 @@ mod tests {
 
     #[test]
     fn invalid_expression_is_a_structured_error() {
-        let err = apply(&json!("$$$nonsense((("), &json!({}), &serde_json::Map::new()).unwrap_err();
+        let err = apply(
+            &json!("$$$nonsense((("),
+            &json!({}),
+            &serde_json::Map::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.status, 400);
     }
 
@@ -267,7 +278,11 @@ mod tests {
         assert!(validate_expr("$noSuchFunction(x)").is_ok());
         let err = validate_expr("$sum((").unwrap_err();
         assert_eq!(err.status, 400);
-        assert!(err.detail.contains("invalid JSONata expression"), "{}", err.detail);
+        assert!(
+            err.detail.contains("invalid JSONata expression"),
+            "{}",
+            err.detail
+        );
     }
 
     // RFC 4231 / well-known HMAC-SHA256 test vector.
@@ -297,12 +312,20 @@ mod tests {
             .unwrap()
         };
         assert_eq!(v(MAC), json!(true), "valid signature");
-        assert_eq!(v(&MAC.replace('f', "0")), json!(false), "tampered signature");
+        assert_eq!(
+            v(&MAC.replace('f', "0")),
+            json!(false),
+            "tampered signature"
+        );
         assert_eq!(v("not-hex!!"), json!(false), "malformed signature");
         assert_eq!(v(""), json!(false), "empty signature");
         // Unknown algorithm never verifies.
-        let bad_algo =
-            apply(&json!(format!("$hmacVerify('md5', '{KEY}', '{MSG}', '{MAC}')")), &json!(null), &serde_json::Map::new()).unwrap();
+        let bad_algo = apply(
+            &json!(format!("$hmacVerify('md5', '{KEY}', '{MSG}', '{MAC}')")),
+            &json!(null),
+            &serde_json::Map::new(),
+        )
+        .unwrap();
         assert_eq!(bad_algo, json!(false));
     }
 
@@ -316,7 +339,10 @@ mod tests {
         )
         .unwrap();
         let hash = hash.as_str().expect("hash is a string");
-        assert!(hash.starts_with("$argon2"), "argon2id PHC string, got {hash}");
+        assert!(
+            hash.starts_with("$argon2"),
+            "argon2id PHC string, got {hash}"
+        );
 
         let check = |password: &str| {
             apply(
@@ -344,12 +370,19 @@ mod tests {
     #[test]
     fn gate_pattern_passes_or_errors() {
         // The G3 gate: valid → pass the body through; invalid → 400.
-        let expr = format!("$hmacVerify('sha256', '{KEY}', '{MSG}', '{MAC}') ? $ : $error('bad sig')");
+        let expr =
+            format!("$hmacVerify('sha256', '{KEY}', '{MSG}', '{MAC}') ? $ : $error('bad sig')");
         let ok = apply(&json!(expr), &json!({ "ok": 1 }), &serde_json::Map::new()).unwrap();
         assert_eq!(ok, json!({ "ok": 1 }));
 
-        let bad_expr = format!("$hmacVerify('sha256', 'wrong', '{MSG}', '{MAC}') ? $ : $error('bad sig')");
-        let err = apply(&json!(bad_expr), &json!({ "ok": 1 }), &serde_json::Map::new()).unwrap_err();
+        let bad_expr =
+            format!("$hmacVerify('sha256', 'wrong', '{MSG}', '{MAC}') ? $ : $error('bad sig')");
+        let err = apply(
+            &json!(bad_expr),
+            &json!({ "ok": 1 }),
+            &serde_json::Map::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.status, 400, "a failed gate is a 400");
     }
 }

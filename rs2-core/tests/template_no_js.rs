@@ -31,15 +31,23 @@ impl ConfigLoader for StaticLoader {
 #[tokio::test]
 async fn template_mount_without_js_is_engine_unavailable() {
     let dir = tempfile::tempdir().unwrap();
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir.path())), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({
         "mounts": [{ "path": "/render", "service": "template" }]
     })));
-    let rt =
-        Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
-    let resp = rt.handle(Message::request(Method::GET, "/render/welcome", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::GET, "/render/welcome", "t"))
+        .await;
     assert_eq!(
         resp.status,
         Some(StatusCode::NOT_IMPLEMENTED),

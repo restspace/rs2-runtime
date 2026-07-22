@@ -68,13 +68,19 @@ pub fn store_root(default_kind_prefix: &str, base_path: &str, config: &Value) ->
     let root_of = |key: &str| {
         config
             .get(key)
-            .and_then(|s| serde_json::from_value::<crate::config_schema::StoreConfig>(s.clone()).ok())
+            .and_then(|s| {
+                serde_json::from_value::<crate::config_schema::StoreConfig>(s.clone()).ok()
+            })
             .and_then(|s| s.root)
     };
     root_of("specStore")
         .or_else(|| root_of("store"))
         .map(|r| r.trim_matches('/').to_string())
-        .unwrap_or_else(|| format!("{default_kind_prefix}{base_path}").trim_matches('/').to_string())
+        .unwrap_or_else(|| {
+            format!("{default_kind_prefix}{base_path}")
+                .trim_matches('/')
+                .to_string()
+        })
 }
 
 impl SpecStore {
@@ -144,7 +150,11 @@ impl SpecStore {
     /// Whether a request path enters the authoring subtree (its first
     /// service segment is the reserved dot-name).
     pub fn is_authoring(&self, msg: &Message) -> bool {
-        msg.url.service_segments().first().map(|s| *s == self.subtree).unwrap_or(false)
+        msg.url
+            .service_segments()
+            .first()
+            .map(|s| *s == self.subtree)
+            .unwrap_or(false)
     }
 
     /// Handle an authoring request: validate spec bodies on PUT and keyless
@@ -162,7 +172,10 @@ impl SpecStore {
             || (msg.method == http::Method::POST && msg.url.is_directory());
         if is_write {
             let doc = match &mut msg.body {
-                Some(b) => b.as_json(self.inner_ctx.limits.materialized_body_bytes).await?,
+                Some(b) => {
+                    b.as_json(self.inner_ctx.limits.materialized_body_bytes)
+                        .await?
+                }
                 None => return Err(RsError::bad_request("spec write requires a JSON body")),
             };
             // Authority gate: a spec's `access` field is operator-controlled
@@ -228,11 +241,15 @@ impl SpecStore {
         let files = self.inner_ctx.files.as_ref().unwrap();
         let Ok(mut body) = files.read(spec_path, None).await else {
             self.cache_insert(spec_path, None);
-            return Err(RsError::not_found(format!("no stored spec at '{spec_path}'")));
+            return Err(RsError::not_found(format!(
+                "no stored spec at '{spec_path}'"
+            )));
         };
         // Materialize/parse failures propagate uncached: they're transient
         // or corrupt-store conditions, not resolutions.
-        let bytes = body.materialize(self.inner_ctx.limits.materialized_body_bytes).await?;
+        let bytes = body
+            .materialize(self.inner_ctx.limits.materialized_body_bytes)
+            .await?;
         let doc: Arc<Value> = Arc::new(
             serde_json::from_slice(bytes)
                 .map_err(|e| RsError::internal(format!("stored spec is corrupt: {e}")))?,
@@ -244,7 +261,10 @@ impl SpecStore {
     /// Execution resolution: the longest stored prefix of `segments` wins
     /// (peeled segments become the caller's positional params); with no
     /// match, the `.root` spec governs. Returns `(doc, matched_len)`.
-    pub async fn resolve(&self, segments: &[String]) -> Result<Option<(Arc<Value>, usize)>, RsError> {
+    pub async fn resolve(
+        &self,
+        segments: &[String],
+    ) -> Result<Option<(Arc<Value>, usize)>, RsError> {
         let mut split = segments.len();
         while split >= 1 {
             let candidate = format!("/{}", segments[..split].join("/"));
@@ -272,10 +292,17 @@ mod tests {
     #[test]
     fn store_root_prefers_spec_store_then_store_then_default() {
         // Default: `.rs2-<kind><mount>`.
-        assert_eq!(store_root(".rs2-pipelines", "/p", &json!({})), ".rs2-pipelines/p");
+        assert_eq!(
+            store_root(".rs2-pipelines", "/p", &json!({})),
+            ".rs2-pipelines/p"
+        );
         // Legacy `store.root` still honored.
         assert_eq!(
-            store_root(".rs2-pipelines", "/p", &json!({ "store": { "root": "legacy" } })),
+            store_root(
+                ".rs2-pipelines",
+                "/p",
+                &json!({ "store": { "root": "legacy" } })
+            ),
             "legacy"
         );
         // `specStore.root` wins over `store.root`.

@@ -38,7 +38,11 @@ fn field<'a>(record: &'a serde_json::Value, path: &str) -> Option<&'a serde_json
     Some(current)
 }
 
-fn matches(record: &serde_json::Value, path: &str, clause: &serde_json::Value) -> Result<bool, RsError> {
+fn matches(
+    record: &serde_json::Value,
+    path: &str,
+    clause: &serde_json::Value,
+) -> Result<bool, RsError> {
     let (op, expected) = match clause {
         serde_json::Value::Object(o) if o.contains_key("op") => (
             o.get("op").and_then(|v| v.as_str()).unwrap_or("=="),
@@ -48,9 +52,10 @@ fn matches(record: &serde_json::Value, path: &str, clause: &serde_json::Value) -
     };
     let actual = field(record, path);
     let ord = match (actual, &expected) {
-        (Some(serde_json::Value::Number(a)), serde_json::Value::Number(b)) => {
-            a.as_f64().zip(b.as_f64()).and_then(|(a, b)| a.partial_cmp(&b))
-        }
+        (Some(serde_json::Value::Number(a)), serde_json::Value::Number(b)) => a
+            .as_f64()
+            .zip(b.as_f64())
+            .and_then(|(a, b)| a.partial_cmp(&b)),
         (Some(serde_json::Value::String(a)), serde_json::Value::String(b)) => Some(a.cmp(b).into()),
         _ => None,
     };
@@ -59,8 +64,14 @@ fn matches(record: &serde_json::Value, path: &str, clause: &serde_json::Value) -
         "!=" => actual != Some(&expected),
         "<" => ord == Some(std::cmp::Ordering::Less),
         ">" => ord == Some(std::cmp::Ordering::Greater),
-        "<=" => matches!(ord, Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
-        ">=" => matches!(ord, Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+        "<=" => matches!(
+            ord,
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ),
+        ">=" => matches!(
+            ord,
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        ),
         "contains" => match (actual, &expected) {
             (Some(serde_json::Value::String(s)), serde_json::Value::String(needle)) => {
                 s.contains(needle.as_str())
@@ -117,7 +128,8 @@ impl QueryStore for MemQueryStore {
             .into_iter()
             .map(|(key, mut record)| {
                 if let Some(obj) = record.as_object_mut() {
-                    obj.entry("_key".to_string()).or_insert(serde_json::json!(key));
+                    obj.entry("_key".to_string())
+                        .or_insert(serde_json::json!(key));
                 }
                 record
             })

@@ -84,7 +84,9 @@ impl QueryEnvelope {
             }
         };
         if language == Language::Text && !query.is_string() {
-            return Err(RsError::bad_request("a sql/text query must be a string template"));
+            return Err(RsError::bad_request(
+                "a sql/text query must be a string template",
+            ));
         }
         let params_validator = match obj.get("params") {
             Some(schema) => Some(jsonschema::validator_for(schema).map_err(|e| {
@@ -111,7 +113,10 @@ impl QueryEnvelope {
     }
 
     /// Apply schema `default`s for missing top-level params, then validate.
-    pub fn prepare_params(&self, mut params: Map<String, Value>) -> Result<Map<String, Value>, RsError> {
+    pub fn prepare_params(
+        &self,
+        mut params: Map<String, Value>,
+    ) -> Result<Map<String, Value>, RsError> {
         if let Some(schema) = &self.params_schema {
             if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
                 for (name, prop) in props {
@@ -150,7 +155,9 @@ impl QueryEnvelope {
 /// validation reports them). `$`-prefixed keys (`$take`, `$skip`, …) are
 /// runtime controls, not params.
 pub fn url_params(query: &str, schema: Option<&Value>) -> Map<String, Value> {
-    let props = schema.and_then(|s| s.get("properties")).and_then(|p| p.as_object());
+    let props = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(|p| p.as_object());
     let mut out = Map::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -168,8 +175,14 @@ pub fn url_params(query: &str, schema: Option<&Value>) -> Map<String, Value> {
             .and_then(|prop| prop.get("type"))
             .and_then(|t| t.as_str());
         let value = match declared {
-            Some("number") => raw.parse::<f64>().map(Value::from).unwrap_or(Value::String(raw)),
-            Some("integer") => raw.parse::<i64>().map(Value::from).unwrap_or(Value::String(raw)),
+            Some("number") => raw
+                .parse::<f64>()
+                .map(Value::from)
+                .unwrap_or(Value::String(raw)),
+            Some("integer") => raw
+                .parse::<i64>()
+                .map(Value::from)
+                .unwrap_or(Value::String(raw)),
             Some("boolean") => match raw.as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
@@ -197,7 +210,10 @@ fn parse_exact(s: &str) -> Option<Placeholder> {
         Some(name) => (name, true),
         None => (inner, false),
     };
-    Some(Placeholder { name: name.to_string(), optional })
+    Some(Placeholder {
+        name: name.to_string(),
+        optional,
+    })
 }
 
 /// Scan a JSON template for malformed placeholders (write-time check).
@@ -372,22 +388,25 @@ fn splice(
                 RsError::bad_request(format!("unterminated placeholder in '{s}'"))
             })?;
             let raw = &body[..end];
-            let (name, optional) =
-                match raw.strip_suffix('?') {
-                    Some(n) => (n, true),
-                    None => (raw, false),
-                };
+            let (name, optional) = match raw.strip_suffix('?') {
+                Some(n) => (n, true),
+                None => (raw, false),
+            };
             match params.get(name) {
                 Some(v) => out.push_str(&quote(v)?),
                 None if optional => {}
                 None => {
-                    return Err(RsError::bad_request(format!("missing query parameter '{name}'")))
+                    return Err(RsError::bad_request(format!(
+                        "missing query parameter '{name}'"
+                    )))
                 }
             }
             rest = &body[end + 1..];
         } else {
-            let digits: String =
-                after[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let digits: String = after[1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             if digits.is_empty() {
                 out.push('$');
                 rest = &after[1..];
@@ -442,8 +461,12 @@ mod tests {
     #[test]
     fn structural_substitution_keeps_types() {
         let template = json!({ "where": { "status": "${status}", "min": "${min}" } });
-        let out = substitute_json(&template, &params(json!({ "status": "open", "min": 5 })), &q)
-            .unwrap();
+        let out = substitute_json(
+            &template,
+            &params(json!({ "status": "open", "min": 5 })),
+            &q,
+        )
+        .unwrap();
         assert_eq!(out, json!({ "where": { "status": "open", "min": 5 } }));
     }
 
@@ -488,9 +511,18 @@ mod tests {
 
         // Required key absent → 400; non-string key parameter → 400.
         let required = json!({ "$sort": { "${sortField}": 1 } });
-        assert_eq!(substitute_json(&required, &params(json!({})), &q).unwrap_err().status, 400);
-        let err = substitute_json(&template, &params(json!({ "sortField": 3, "sortDir": 1 })), &q)
-            .unwrap_err();
+        assert_eq!(
+            substitute_json(&required, &params(json!({})), &q)
+                .unwrap_err()
+                .status,
+            400
+        );
+        let err = substitute_json(
+            &template,
+            &params(json!({ "sortField": 3, "sortDir": 1 })),
+            &q,
+        )
+        .unwrap_err();
         assert_eq!(err.status, 400, "key params must be strings");
     }
 
@@ -515,9 +547,13 @@ mod tests {
         );
 
         // Absent or empty flag values drop the clause entirely.
-        for absent in [json!({}), json!({ "onlyMissingCost": null }),
-                       json!({ "onlyMissingCost": "" }), json!({ "onlyMissingCost": [] }),
-                       json!({ "onlyMissingCost": false })] {
+        for absent in [
+            json!({}),
+            json!({ "onlyMissingCost": null }),
+            json!({ "onlyMissingCost": "" }),
+            json!({ "onlyMissingCost": [] }),
+            json!({ "onlyMissingCost": false }),
+        ] {
             let mut p = params(absent);
             p.insert("accountId".into(), json!("a1"));
             let out = substitute_json(&template, &p, &q).unwrap();
@@ -531,9 +567,19 @@ mod tests {
         // A required (non-`?`) $if with no param is an error, and a
         // non-placeholder $if is malformed.
         let strict = json!({ "$if": "${must}", "x": 1 });
-        assert_eq!(substitute_json(&strict, &params(json!({})), &q).unwrap_err().status, 400);
+        assert_eq!(
+            substitute_json(&strict, &params(json!({})), &q)
+                .unwrap_err()
+                .status,
+            400
+        );
         let bad = json!({ "$if": true, "x": 1 });
-        assert_eq!(substitute_json(&bad, &params(json!({})), &q).unwrap_err().status, 400);
+        assert_eq!(
+            substitute_json(&bad, &params(json!({})), &q)
+                .unwrap_err()
+                .status,
+            400
+        );
     }
 
     #[test]
@@ -550,8 +596,12 @@ mod tests {
     #[test]
     fn embedded_and_positional_splice_through_quote() {
         let template = json!({ "q": "name:${who} AND idx-$0", "plain": "$ 5 cost" });
-        let out =
-            substitute_json(&template, &params(json!({ "who": "ada", "0": "seven" })), &q).unwrap();
+        let out = substitute_json(
+            &template,
+            &params(json!({ "who": "ada", "0": "seven" })),
+            &q,
+        )
+        .unwrap();
         assert_eq!(out["q"], "name:ada AND idx-seven");
         assert_eq!(out["plain"], "$ 5 cost", "a bare $ is not a placeholder");
     }
@@ -561,7 +611,10 @@ mod tests {
         let schema = json!({ "properties": {
             "min": { "type": "number" }, "n": { "type": "integer" },
             "active": { "type": "boolean" }, "name": { "type": "string" } } });
-        let out = url_params("min=2.5&n=7&active=true&name=a+b%21&$take=5&loose=x", Some(&schema));
+        let out = url_params(
+            "min=2.5&n=7&active=true&name=a+b%21&$take=5&loose=x",
+            Some(&schema),
+        );
         assert_eq!(out["min"], json!(2.5));
         assert_eq!(out["n"], json!(7));
         assert_eq!(out["active"], json!(true));
@@ -582,7 +635,9 @@ mod tests {
                                         "min": { "type": "number", "default": 0 } } }
         }))
         .unwrap();
-        let prepared = env.prepare_params(params(json!({ "status": "open" }))).unwrap();
+        let prepared = env
+            .prepare_params(params(json!({ "status": "open" })))
+            .unwrap();
         assert_eq!(prepared.get("min"), Some(&json!(0)), "default applied");
         let err = env.prepare_params(params(json!({ "min": 3 }))).unwrap_err();
         assert_eq!(err.status, 422);

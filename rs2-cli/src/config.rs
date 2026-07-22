@@ -78,11 +78,18 @@ pub fn load() -> Result<Loaded, String> {
                 .map_err(|e| format!("cannot read {}: {e}", candidate.display()))?;
             let config: RsConfig = serde_json::from_str(text.trim_start_matches('\u{feff}'))
                 .map_err(|e| format!("{} is not valid JSON: {e}", candidate.display()))?;
-            Ok(Loaded { config, path: candidate })
+            Ok(Loaded {
+                config,
+                path: candidate,
+            })
         }
         None => {
-            let cwd = std::env::current_dir().map_err(|e| format!("cannot read current dir: {e}"))?;
-            Ok(Loaded { config: RsConfig::default(), path: cwd.join(FILE_NAME) })
+            let cwd =
+                std::env::current_dir().map_err(|e| format!("cannot read current dir: {e}"))?;
+            Ok(Loaded {
+                config: RsConfig::default(),
+                path: cwd.join(FILE_NAME),
+            })
         }
     }
 }

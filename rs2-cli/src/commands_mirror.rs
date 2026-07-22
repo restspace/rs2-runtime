@@ -60,7 +60,10 @@ pub fn pull(host: Option<&str>, dir: Option<&str>) -> Result<(), String> {
         version: 1,
         host: host.clone(),
         tenant: disc.tenant.clone(),
-        control: ControlPaths { config: control.config.clone(), code: control.code.clone() },
+        control: ControlPaths {
+            config: control.config.clone(),
+            code: control.code.clone(),
+        },
         config: ConfigBaseline::default(),
         specs: BTreeMap::new(),
         code: CodeSection::default(),
@@ -69,25 +72,36 @@ pub fn pull(host: Option<&str>, dir: Option<&str>) -> Result<(), String> {
     // Config (secrets already redacted by the server as "<secret>").
     let cfg_resp = client.get(&control.config)?;
     if cfg_resp.status != 200 {
-        return Err(format!("cannot read tenant config: {}", cfg_resp.error_detail()));
+        return Err(format!(
+            "cannot read tenant config: {}",
+            cfg_resp.error_detail()
+        ));
     }
     let cfg_value: Value = serde_json::from_str(&cfg_resp.body)
         .map_err(|e| format!("tenant config was not JSON: {e}"))?;
-    write_file(&dir.join("tenant.json"), &mirror::canonical_json(&cfg_resp.body))?;
+    write_file(
+        &dir.join("tenant.json"),
+        &mirror::canonical_json(&cfg_resp.body),
+    )?;
     state.config.etag = cfg_resp.etag;
 
     // Specs: remote is the source of truth, so rebuild the tree from scratch
     // (a remotely-deleted spec disappears locally; warn before clobbering).
     let specs_root = dir.join("specs");
     if specs_root.exists() {
-        eprintln!("note: overwriting local specs under {} (remote is source of truth — commit first)", specs_root.display());
+        eprintln!(
+            "note: overwriting local specs under {} (remote is source of truth — commit first)",
+            specs_root.display()
+        );
         std::fs::remove_dir_all(&specs_root)
             .map_err(|e| format!("cannot refresh {}: {e}", specs_root.display()))?;
     }
     let mut spec_count = 0usize;
     let mut store_count = 0usize;
     for svc in &disc.services {
-        let Some(subtree) = &svc.spec_subtree else { continue };
+        let Some(subtree) = &svc.spec_subtree else {
+            continue;
+        };
         store_count += 1;
         for spec in mirror::walk_store(&client, &svc.path, subtree)? {
             let local_rel = mirror::local_spec_path(&svc.path, subtree, &spec.rel);
@@ -95,7 +109,10 @@ pub fn pull(host: Option<&str>, dir: Option<&str>) -> Result<(), String> {
             write_file(&dir.join(&local_rel), &pretty)?;
             state.specs.insert(
                 local_rel,
-                SpecBaseline { etag: spec.etag, hash: mirror::content_hash(pretty.as_bytes()) },
+                SpecBaseline {
+                    etag: spec.etag,
+                    hash: mirror::content_hash(pretty.as_bytes()),
+                },
             );
             spec_count += 1;
         }
@@ -192,7 +209,8 @@ pub fn push(dir: Option<&str>, dry_run: bool, allow_secret_rotation: bool) -> Re
     let mut seen = HashSet::new();
     for (local_rel, full) in &local_specs {
         seen.insert(local_rel.clone());
-        let bytes = std::fs::read(full).map_err(|e| format!("cannot read {}: {e}", full.display()))?;
+        let bytes =
+            std::fs::read(full).map_err(|e| format!("cannot read {}: {e}", full.display()))?;
         let remote = mirror::remote_spec_path(local_rel, &spec_mounts)
             .ok_or_else(|| format!("{local_rel}: no spec-store mount matches this path"))?;
         match state.specs.get(local_rel) {
@@ -211,7 +229,14 @@ pub fn push(dir: Option<&str>, dry_run: bool, allow_secret_rotation: bool) -> Re
 
     // --- Dry run: report and stop ---
     if dry_run {
-        println!("config: {}", if config_changed { "CHANGED → PUT" } else { "unchanged" });
+        println!(
+            "config: {}",
+            if config_changed {
+                "CHANGED → PUT"
+            } else {
+                "unchanged"
+            }
+        );
         for (_, remote, _) in &creates {
             println!("create  {remote}");
         }
@@ -235,7 +260,12 @@ pub fn push(dir: Option<&str>, dry_run: bool, allow_secret_rotation: bool) -> Re
     // --- Apply config first (server-enforced If-Match) ---
     if config_changed {
         let etag = state.config.etag.clone().or_else(|| cfg_resp.etag.clone());
-        let resp = client.put(&control.config, "application/json", tenant_text.as_bytes(), etag.as_deref())?;
+        let resp = client.put(
+            &control.config,
+            "application/json",
+            tenant_text.as_bytes(),
+            etag.as_deref(),
+        )?;
         match resp.status {
             204 => {
                 state.config.etag = resp.etag.clone();
@@ -244,7 +274,7 @@ pub fn push(dir: Option<&str>, dry_run: bool, allow_secret_rotation: bool) -> Re
             }
             409 => {
                 return Err(
-                    "config changed remotely since pull — run `rs2 pull` to reconcile".to_string()
+                    "config changed remotely since pull — run `rs2 pull` to reconcile".to_string(),
                 )
             }
             400 => return Err(format!("config rejected: {}", resp.error_detail())),
@@ -270,7 +300,10 @@ pub fn push(dir: Option<&str>, dry_run: bool, allow_secret_rotation: bool) -> Re
             200 | 201 => {
                 state.specs.insert(
                     local_rel.clone(),
-                    SpecBaseline { etag: resp.etag, hash: mirror::content_hash(bytes) },
+                    SpecBaseline {
+                        etag: resp.etag,
+                        hash: mirror::content_hash(bytes),
+                    },
                 );
                 println!("created {remote}");
             }
@@ -298,7 +331,10 @@ pub fn push(dir: Option<&str>, dry_run: bool, allow_secret_rotation: bool) -> Re
             200 | 201 => {
                 state.specs.insert(
                     local_rel.clone(),
-                    SpecBaseline { etag: resp.etag, hash: mirror::content_hash(bytes) },
+                    SpecBaseline {
+                        etag: resp.etag,
+                        hash: mirror::content_hash(bytes),
+                    },
                 );
                 println!("updated {remote}");
             }
@@ -356,7 +392,9 @@ fn collect_local_specs(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 fn collect_files(d: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<(), String> {
     let entries = std::fs::read_dir(d).map_err(|e| format!("cannot read {}: {e}", d.display()))?;
     for entry in entries {
-        let path = entry.map_err(|e| format!("cannot read dir entry: {e}"))?.path();
+        let path = entry
+            .map_err(|e| format!("cannot read dir entry: {e}"))?
+            .path();
         if path.is_dir() {
             collect_files(&path, base, out)?;
         } else {
@@ -373,7 +411,8 @@ fn collect_files(d: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) -> Res
 
 fn write_file(path: &Path, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     std::fs::write(path, contents).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }

@@ -168,8 +168,11 @@ pub fn expand_infra<'a>(
         .collect();
 
     // Reject any tenant-set infra-only field before merging it away.
-    let trespass: Vec<&String> =
-        def.infra_only.iter().filter(|f| merged.contains_key(f.as_str())).collect();
+    let trespass: Vec<&String> = def
+        .infra_only
+        .iter()
+        .filter(|f| merged.contains_key(f.as_str()))
+        .collect();
     if !trespass.is_empty() {
         let names: Vec<&str> = trespass.iter().map(|s| s.as_str()).collect();
         return Err(RsError::bad_request(format!(

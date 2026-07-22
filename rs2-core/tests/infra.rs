@@ -57,7 +57,9 @@ fn rt_with(
     .with_infra_loader(loader);
     let config = Arc::new(StaticLoader(json!({ "mounts": mounts })));
     let rt = Runtime::new(
-        Tenancy::Single { tenant: tenant.into() },
+        Tenancy::Single {
+            tenant: tenant.into(),
+        },
         adapters,
         config,
         LimitTable::default(),
@@ -104,7 +106,9 @@ async fn infra_backed_data_mount_resolves_and_serves() {
     );
 
     // The infra resolved to builtin:mem; the mount serves a normal CRUD cycle.
-    let resp = rt.handle(req("t1", Method::PUT, "/d/things/x").with_json(&json!({ "v": 1 }))).await;
+    let resp = rt
+        .handle(req("t1", Method::PUT, "/d/things/x").with_json(&json!({ "v": 1 })))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.status);
     let mut got = rt.handle(req("t1", Method::GET, "/d/things/x")).await;
     assert_eq!(got.status, Some(StatusCode::OK));
@@ -172,7 +176,10 @@ async fn unknown_infra_is_a_config_400() {
     let mut resp = rt.handle(req("t1", Method::GET, "/d/x")).await;
     assert_eq!(resp.status, Some(StatusCode::BAD_REQUEST));
     let text = body_text(&mut resp).await;
-    assert!(text.contains("unknown infra") && text.contains("real"), "{text}");
+    assert!(
+        text.contains("unknown infra") && text.contains("real"),
+        "{text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -203,16 +210,29 @@ async fn pipeline_specs_stored_via_infra_backend() {
     let mut authored = rt.handle(put).await;
     let status = authored.status;
     let detail = body_text(&mut authored).await;
-    assert_eq!(status, Some(StatusCode::CREATED), "spec authored to infra store: {detail}");
+    assert_eq!(
+        status,
+        Some(StatusCode::CREATED),
+        "spec authored to infra store: {detail}"
+    );
     // It reads back as a store child (proving it landed in the infra-backed
     // store), and executes.
-    let read = rt.handle(req("t1", Method::GET, "/p/.pipelines/.root")).await;
+    let read = rt
+        .handle(req("t1", Method::GET, "/p/.pipelines/.root"))
+        .await;
     assert_eq!(read.status, Some(StatusCode::OK));
     let mut run = rt.handle(req("t1", Method::GET, "/p/run")).await;
     let run_status = run.status;
     let run_body = body_text(&mut run).await;
-    assert_eq!(run_status, Some(StatusCode::OK), "pipeline executed: {run_body}");
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&run_body).unwrap()["status"], "open");
+    assert_eq!(
+        run_status,
+        Some(StatusCode::OK),
+        "pipeline executed: {run_body}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&run_body).unwrap()["status"],
+        "open"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +279,10 @@ async fn infra_listing_filters_by_tenant_and_redacts_values() {
     let provided = s["providedKeys"].as_array().unwrap();
     assert!(provided.iter().any(|k| k == "region") && provided.iter().any(|k| k == "secretKey"));
     let whole = doc.to_string();
-    assert!(!whole.contains("shh") && !whole.contains("\"eu\""), "values redacted: {whole}");
+    assert!(
+        !whole.contains("shh") && !whole.contains("\"eu\""),
+        "values redacted: {whole}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +301,9 @@ async fn reload_infras_swaps_set_and_purges_tenants() {
     );
 
     // Works with infra "a".
-    let resp = rt.handle(req("t1", Method::PUT, "/d/things/x").with_json(&json!({ "v": 1 }))).await;
+    let resp = rt
+        .handle(req("t1", Method::PUT, "/d/things/x").with_json(&json!({ "v": 1 })))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED));
 
     // Operator edits infras.json: "a" gone, "b" added — then reload.
@@ -302,7 +327,9 @@ async fn reload_without_source_reports_unavailable() {
         Arc::new(MemDataStore::new()),
     );
     let rt = Runtime::new(
-        Tenancy::Single { tenant: "t1".into() },
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
         adapters,
         Arc::new(StaticLoader(json!({ "mounts": [] }))),
         LimitTable::default(),

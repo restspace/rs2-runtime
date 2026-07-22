@@ -33,7 +33,12 @@ pub const CODE_PREFIX: &str = ".rs2-code";
 pub fn version_of(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn code_path(name: &str, version: &str) -> String {
@@ -74,7 +79,9 @@ impl CodeService {
             ))
         })?;
         if name.is_empty() || version.is_empty() || name.contains(['/', '\\', '.']) {
-            return Err(RsError::bad_request(format!("invalid code reference '{service_ref}'")));
+            return Err(RsError::bad_request(format!(
+                "invalid code reference '{service_ref}'"
+            )));
         }
         Ok(CodeService {
             name: name.to_string(),
@@ -96,13 +103,16 @@ impl CodeService {
                     .as_ref()
                     .ok_or_else(|| RsError::internal("code service has no file capability"))?;
                 let cap = ctx.limits.materialized_body_bytes;
-                if let Ok(mut body) = files.read(&code_path(&self.name, &self.version), None).await
+                if let Ok(mut body) = files
+                    .read(&code_path(&self.name, &self.version), None)
+                    .await
                 {
                     let bytes = body.materialize(cap).await?;
                     return Ok(LoadedCode::Wasm(Arc::new(bytes.to_vec())));
                 }
-                if let Ok(mut body) =
-                    files.read(&code_path_js(&self.name, &self.version), None).await
+                if let Ok(mut body) = files
+                    .read(&code_path_js(&self.name, &self.version), None)
+                    .await
                 {
                     let bytes = body.materialize(cap).await?;
                     let text = String::from_utf8(bytes.to_vec()).map_err(|_| {
@@ -137,7 +147,11 @@ impl CodeService {
                 let hosts: Vec<String> = grant
                     .get("hosts")
                     .and_then(|h| h.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 if hosts.is_empty() {
                     return Err(RsError::bad_request(format!(

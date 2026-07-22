@@ -25,8 +25,11 @@ use crate::message::Message;
 
 /// RFC 3986 unreserved set (`A-Z a-z 0-9 - _ . ~`) — everything else is
 /// percent-encoded. Used for query values and SigV4 canonicalization.
-const UNRESERVED: &AsciiSet =
-    &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 /// As [`UNRESERVED`] but keeps `/` literal — for a canonical URI path.
 const UNRESERVED_PATH: &AsciiSet = &UNRESERVED.remove(b'/');
 
@@ -58,9 +61,18 @@ pub enum AuthStrategy {
     /// Append `?<name>=<value>` to the query (e.g. `?api_key=…`).
     QueryParam { name: String, value: String },
     /// HMAC the request body and place the hex MAC in `header`.
-    Hmac { algorithm: String, secret: String, header: String },
+    Hmac {
+        algorithm: String,
+        secret: String,
+        header: String,
+    },
     /// AWS Signature Version 4 (`Authorization` + `X-Amz-Date`).
-    AwsSigV4 { access_key: String, secret_key: String, region: String, service: String },
+    AwsSigV4 {
+        access_key: String,
+        secret_key: String,
+        region: String,
+        service: String,
+    },
 }
 
 /// A resolved credential to apply to outbound messages.
@@ -92,9 +104,18 @@ impl CredentialInjector {
         };
         let strategy = match auth {
             "bearer" => AuthStrategy::Bearer { token: s("token")? },
-            "header" => AuthStrategy::Header { name: s("name")?, value: s("value")? },
-            "basic" => AuthStrategy::Basic { username: s("username")?, password: s("password")? },
-            "query" => AuthStrategy::QueryParam { name: s("name")?, value: s("value")? },
+            "header" => AuthStrategy::Header {
+                name: s("name")?,
+                value: s("value")?,
+            },
+            "basic" => AuthStrategy::Basic {
+                username: s("username")?,
+                password: s("password")?,
+            },
+            "query" => AuthStrategy::QueryParam {
+                name: s("name")?,
+                value: s("value")?,
+            },
             "hmac" => AuthStrategy::Hmac {
                 algorithm: merged
                     .get("algorithm")
@@ -147,14 +168,23 @@ impl CredentialInjector {
                 }
                 Ok(())
             }
-            AuthStrategy::Hmac { algorithm, secret, header } => {
+            AuthStrategy::Hmac {
+                algorithm,
+                secret,
+                header,
+            } => {
                 let body = materialize(msg, max_body_bytes).await?;
                 let mac = hmac_bytes(algorithm, secret.as_bytes(), &body).ok_or_else(|| {
                     RsError::bad_request(format!("hmac: unsupported algorithm '{algorithm}'"))
                 })?;
                 set_header(msg, header, &to_hex(&mac))
             }
-            AuthStrategy::AwsSigV4 { access_key, secret_key, region, service } => {
+            AuthStrategy::AwsSigV4 {
+                access_key,
+                secret_key,
+                region,
+                service,
+            } => {
                 let body = materialize(msg, max_body_bytes).await?;
                 let (host, path) = split_url(&msg.url.path)?;
                 let (authorization, amz_date) = sign_aws_sigv4(
@@ -205,7 +235,14 @@ fn split_url(url: &str) -> Result<(String, String), RsError> {
         None => (rest, "/"),
     };
     let path = path.split(['?', '#']).next().unwrap_or("/");
-    Ok((authority.to_string(), if path.is_empty() { "/".into() } else { path.to_string() }))
+    Ok((
+        authority.to_string(),
+        if path.is_empty() {
+            "/".into()
+        } else {
+            path.to_string()
+        },
+    ))
 }
 
 /// Compute an AWS SigV4 `Authorization` header (signing `host` + `x-amz-date`).
@@ -249,7 +286,10 @@ fn sign_aws_sigv4(
         sha256_hex(canonical_request.as_bytes())
     );
 
-    let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
@@ -293,7 +333,11 @@ fn canonical_query_string(query: &str) -> String {
         })
         .collect();
     pairs.sort();
-    pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 #[cfg(test)]
@@ -321,33 +365,39 @@ mod tests {
     #[tokio::test]
     async fn header_and_basic_and_query() {
         let mut msg = req();
-        CredentialInjector::from_config(&json!({ "auth": "header", "name": "X-Api-Key", "value": "k" }))
-            .unwrap()
-            .unwrap()
-            .apply(&mut msg, 1 << 20)
-            .await
-            .unwrap();
+        CredentialInjector::from_config(
+            &json!({ "auth": "header", "name": "X-Api-Key", "value": "k" }),
+        )
+        .unwrap()
+        .unwrap()
+        .apply(&mut msg, 1 << 20)
+        .await
+        .unwrap();
         assert_eq!(msg.header("x-api-key"), Some("k"));
 
         let mut msg = req();
-        CredentialInjector::from_config(&json!({ "auth": "basic", "username": "u", "password": "p" }))
-            .unwrap()
-            .unwrap()
-            .apply(&mut msg, 1 << 20)
-            .await
-            .unwrap();
+        CredentialInjector::from_config(
+            &json!({ "auth": "basic", "username": "u", "password": "p" }),
+        )
+        .unwrap()
+        .unwrap()
+        .apply(&mut msg, 1 << 20)
+        .await
+        .unwrap();
         assert_eq!(msg.header("authorization"), Some("Basic dTpw")); // base64("u:p")
     }
 
     #[tokio::test]
     async fn query_param_appends() {
         let mut msg = req();
-        CredentialInjector::from_config(&json!({ "auth": "query", "name": "api_key", "value": "a b" }))
-            .unwrap()
-            .unwrap()
-            .apply(&mut msg, 1 << 20)
-            .await
-            .unwrap();
+        CredentialInjector::from_config(
+            &json!({ "auth": "query", "name": "api_key", "value": "a b" }),
+        )
+        .unwrap()
+        .unwrap()
+        .apply(&mut msg, 1 << 20)
+        .await
+        .unwrap();
         assert_eq!(msg.url.query, "b=2&a=1&api_key=a%20b");
     }
 
@@ -368,7 +418,9 @@ mod tests {
 
     #[test]
     fn no_auth_key_yields_none() {
-        assert!(CredentialInjector::from_config(&json!({ "adapter": "x" })).unwrap().is_none());
+        assert!(CredentialInjector::from_config(&json!({ "adapter": "x" }))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -387,8 +439,14 @@ mod tests {
         // Wire path is single-encoded (`%20`); the canonical URI for a non-S3
         // service double-encodes it (`%2520`, matching AWS's `get-space`
         // vector), while S3 signs the single-encoded path unchanged.
-        assert_eq!(canonical_path("/example%20space/", "execute-api"), "/example%2520space/");
-        assert_eq!(canonical_path("/example%20space/", "s3"), "/example%20space/");
+        assert_eq!(
+            canonical_path("/example%20space/", "execute-api"),
+            "/example%2520space/"
+        );
+        assert_eq!(
+            canonical_path("/example%20space/", "s3"),
+            "/example%20space/"
+        );
         // A literal space in the decoded path canonicalizes identically.
         assert_eq!(canonical_path("/a b", "execute-api"), "/a%2520b");
         assert_eq!(canonical_path("/a b", "s3"), "/a%20b");

@@ -150,14 +150,20 @@ pub fn find_mirror(dir: Option<&str>) -> Result<Option<Mirror>, String> {
         let dir = PathBuf::from(d);
         let marker = dir.join(STATE_FILE);
         if marker.is_file() {
-            return Ok(Some(Mirror { state: load_state(&marker)?, dir }));
+            return Ok(Some(Mirror {
+                state: load_state(&marker)?,
+                dir,
+            }));
         }
         return Ok(None);
     }
     match config::find_up(&format!("{MIRROR_DIR}/{STATE_FILE}"))? {
         Some(marker) => {
             let dir = marker.parent().map(Path::to_path_buf).unwrap_or_default();
-            Ok(Some(Mirror { state: load_state(&marker)?, dir }))
+            Ok(Some(Mirror {
+                state: load_state(&marker)?,
+                dir,
+            }))
         }
         None => Ok(None),
     }
@@ -185,7 +191,10 @@ pub fn save_state(marker: &Path, state: &MirrorState) -> Result<(), String> {
 pub fn discover(client: &Client) -> Result<Discovery, String> {
     let resp = client.get("/.well-known/rs2/services")?;
     if resp.status != 200 {
-        return Err(format!("cannot read discovery surface: {}", resp.error_detail()));
+        return Err(format!(
+            "cannot read discovery surface: {}",
+            resp.error_detail()
+        ));
     }
     let disc: Discovery = serde_json::from_str(&resp.body)
         .map_err(|e| format!("discovery surface was not the expected JSON: {e}"))?;
@@ -225,7 +234,11 @@ fn list_dir_all(client: &Client, container: &str) -> Result<Vec<DirEntry>, Strin
 
 /// Recursively walk a spec store's authoring subtree, returning every stored
 /// spec with its path relative to the subtree root.
-pub fn walk_store(client: &Client, mount_path: &str, subtree: &str) -> Result<Vec<RemoteSpec>, String> {
+pub fn walk_store(
+    client: &Client,
+    mount_path: &str,
+    subtree: &str,
+) -> Result<Vec<RemoteSpec>, String> {
     let root = join_path(mount_path, subtree); // e.g. "/q/.queries"
     let mut out = Vec::new();
     walk_into(client, &format!("{root}/"), &root, &mut out)?;
@@ -256,7 +269,11 @@ fn walk_into(
                 .unwrap_or(&child)
                 .trim_start_matches('/')
                 .to_string();
-            out.push(RemoteSpec { rel, body: resp.body, etag: resp.etag });
+            out.push(RemoteSpec {
+                rel,
+                body: resp.body,
+                etag: resp.etag,
+            });
         }
     }
     Ok(())
@@ -280,7 +297,12 @@ pub fn mount_slug(mount_path: &str) -> String {
 /// Local mirror-relative path for a spec, e.g.
 /// `specs/q/.queries/reports/top.json`.
 pub fn local_spec_path(mount_path: &str, subtree: &str, rel: &str) -> String {
-    format!("specs/{}/{}/{}", mount_slug(mount_path), subtree.trim_matches('/'), rel)
+    format!(
+        "specs/{}/{}/{}",
+        mount_slug(mount_path),
+        subtree.trim_matches('/'),
+        rel
+    )
 }
 
 /// Reverse a local spec path to its remote store path using the discovered
@@ -371,13 +393,21 @@ pub fn code_pins(config: &Value) -> BTreeMap<String, CodePin> {
         return pins;
     };
     for m in mounts {
-        let Some(service) = m.get("service").and_then(Value::as_str) else { continue };
-        let Some(rest) = service.strip_prefix("code:") else { continue };
+        let Some(service) = m.get("service").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(rest) = service.strip_prefix("code:") else {
+            continue;
+        };
         let (name, version) = match rest.split_once('@') {
             Some((n, v)) => (n.to_string(), v.to_string()),
             None => (rest.to_string(), String::new()),
         };
-        let path = m.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        let path = m
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let pin = pins.entry(name).or_default();
         pin.version = version;
         if !path.is_empty() {
@@ -432,7 +462,8 @@ mod tests {
 
     #[test]
     fn secret_guard_flags_only_real_values() {
-        let clean = json!({ "auth": { "jwtSecret": "<secret>" }, "secrets": { "hook": "<secret>" } });
+        let clean =
+            json!({ "auth": { "jwtSecret": "<secret>" }, "secrets": { "hook": "<secret>" } });
         assert!(real_secret_locations(&clean).is_empty());
         let dirty = json!({
             "auth": { "jwtSecret": "deadbeef" },

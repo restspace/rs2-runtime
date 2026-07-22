@@ -17,9 +17,15 @@ fn main() {
     std::fs::write(format!("{dir}/js_prelude.snapshot.bin"), &blob).expect("write snapshot");
     // Sidecar hash so a test can detect a stale blob after a prelude edit.
     let hash = rs2_core::engines::js::prelude_snapshot_source_hash();
-    std::fs::write(format!("{dir}/js_prelude.snapshot.hash"), format!("{hash:016x}\n"))
-        .expect("write hash");
-    println!("wrote js_prelude.snapshot.bin ({} bytes), hash {hash:016x}", blob.len());
+    std::fs::write(
+        format!("{dir}/js_prelude.snapshot.hash"),
+        format!("{hash:016x}\n"),
+    )
+    .expect("write hash");
+    println!(
+        "wrote js_prelude.snapshot.bin ({} bytes), hash {hash:016x}",
+        blob.len()
+    );
 }
 
 #[cfg(not(feature = "js"))]

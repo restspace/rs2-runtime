@@ -39,9 +39,9 @@ impl StoredResponse {
     pub fn into_message(self, template: &Message) -> Message {
         let status = http::StatusCode::from_u16(self.status)
             .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-        let body = self.body.map(|(bytes, mt)| {
-            Body::from_bytes(bytes, MediaType::parse(&mt))
-        });
+        let body = self
+            .body
+            .map(|(bytes, mt)| Body::from_bytes(bytes, MediaType::parse(&mt)));
         let mut resp = template.response(status, body);
         for (k, v) in &self.headers {
             if let (Ok(name), Ok(value)) = (
@@ -70,8 +70,18 @@ pub enum Begin {
 
 #[async_trait]
 pub trait IdempotencyStore: Send + Sync {
-    async fn begin(&self, scope: &str, key: &str, payload_hash: Option<&str>) -> Result<Begin, RsError>;
-    async fn complete(&self, scope: &str, key: &str, response: StoredResponse) -> Result<(), RsError>;
+    async fn begin(
+        &self,
+        scope: &str,
+        key: &str,
+        payload_hash: Option<&str>,
+    ) -> Result<Begin, RsError>;
+    async fn complete(
+        &self,
+        scope: &str,
+        key: &str,
+        response: StoredResponse,
+    ) -> Result<(), RsError>;
     /// Drop an in-flight registration (host-side failure: nothing to replay).
     async fn abandon(&self, scope: &str, key: &str) -> Result<(), RsError>;
 }
@@ -153,8 +163,15 @@ impl Default for MemIdempotencyStore {
 
 #[async_trait]
 impl IdempotencyStore for MemIdempotencyStore {
-    async fn begin(&self, scope: &str, key: &str, payload_hash: Option<&str>) -> Result<Begin, RsError> {
-        let n = self.begins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    async fn begin(
+        &self,
+        scope: &str,
+        key: &str,
+        payload_hash: Option<&str>,
+    ) -> Result<Begin, RsError> {
+        let n = self
+            .begins
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap();
         if n % SWEEP_EVERY == 0 || entries.len() >= self.max_entries {
             self.sweep(&mut entries, true);
@@ -172,7 +189,10 @@ impl IdempotencyStore for MemIdempotencyStore {
             None => {
                 entries.insert(
                     slot,
-                    Entry { payload_hash: payload_hash.map(String::from), state: EntryState::InFlight },
+                    Entry {
+                        payload_hash: payload_hash.map(String::from),
+                        state: EntryState::InFlight,
+                    },
                 );
                 Ok(Begin::Fresh)
             }
@@ -192,7 +212,12 @@ impl IdempotencyStore for MemIdempotencyStore {
         }
     }
 
-    async fn complete(&self, scope: &str, key: &str, response: StoredResponse) -> Result<(), RsError> {
+    async fn complete(
+        &self,
+        scope: &str,
+        key: &str,
+        response: StoredResponse,
+    ) -> Result<(), RsError> {
         let mut entries = self.entries.lock().unwrap();
         if let Some(entry) = entries.get_mut(&(scope.to_string(), key.to_string())) {
             entry.state = EntryState::Done(response, Instant::now());
@@ -201,14 +226,20 @@ impl IdempotencyStore for MemIdempotencyStore {
     }
 
     async fn abandon(&self, scope: &str, key: &str) -> Result<(), RsError> {
-        self.entries.lock().unwrap().remove(&(scope.to_string(), key.to_string()));
+        self.entries
+            .lock()
+            .unwrap()
+            .remove(&(scope.to_string(), key.to_string()));
         Ok(())
     }
 }
 
 /// Scope a key per tenant + mount + method + path (PRD §7.2).
 pub fn scope_for(msg: &Message, mount_base: &str) -> String {
-    format!("{}|{}|{}|{}", msg.tenant, mount_base, msg.method, msg.url.path)
+    format!(
+        "{}|{}|{}|{}",
+        msg.tenant, mount_base, msg.method, msg.url.path
+    )
 }
 
 /// SHA-256 hex of a materialized request payload; `None` for streams.
@@ -266,7 +297,11 @@ pub async fn capture_response(
             }
         }
     };
-    let stored = StoredResponse { status, headers, body };
+    let stored = StoredResponse {
+        status,
+        headers,
+        body,
+    };
     (resp, Some(stored))
 }
 
@@ -277,10 +312,24 @@ mod tests {
     #[tokio::test]
     async fn fresh_then_replay_then_mismatch() {
         let store = MemIdempotencyStore::default();
-        assert!(matches!(store.begin("s", "k1", Some("h1")).await.unwrap(), Begin::Fresh));
-        assert!(matches!(store.begin("s", "k1", Some("h1")).await.unwrap(), Begin::InFlight));
+        assert!(matches!(
+            store.begin("s", "k1", Some("h1")).await.unwrap(),
+            Begin::Fresh
+        ));
+        assert!(matches!(
+            store.begin("s", "k1", Some("h1")).await.unwrap(),
+            Begin::InFlight
+        ));
         store
-            .complete("s", "k1", StoredResponse { status: 201, headers: vec![], body: None })
+            .complete(
+                "s",
+                "k1",
+                StoredResponse {
+                    status: 201,
+                    headers: vec![],
+                    body: None,
+                },
+            )
             .await
             .unwrap();
         match store.begin("s", "k1", Some("h1")).await.unwrap() {
@@ -292,19 +341,36 @@ mod tests {
             Begin::PayloadMismatch
         ));
         // Different scope is independent.
-        assert!(matches!(store.begin("s2", "k1", Some("h1")).await.unwrap(), Begin::Fresh));
+        assert!(matches!(
+            store.begin("s2", "k1", Some("h1")).await.unwrap(),
+            Begin::Fresh
+        ));
     }
 
     #[tokio::test]
     async fn window_expiry_frees_the_key() {
         let store = MemIdempotencyStore::new(Duration::ZERO);
-        assert!(matches!(store.begin("s", "k", None).await.unwrap(), Begin::Fresh));
+        assert!(matches!(
+            store.begin("s", "k", None).await.unwrap(),
+            Begin::Fresh
+        ));
         store
-            .complete("s", "k", StoredResponse { status: 200, headers: vec![], body: None })
+            .complete(
+                "s",
+                "k",
+                StoredResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: None,
+                },
+            )
             .await
             .unwrap();
         // Window elapsed (zero): fresh again, not a replay.
-        assert!(matches!(store.begin("s", "k", None).await.unwrap(), Begin::Fresh));
+        assert!(matches!(
+            store.begin("s", "k", None).await.unwrap(),
+            Begin::Fresh
+        ));
     }
 
     #[tokio::test]
@@ -312,9 +378,20 @@ mod tests {
         let store = MemIdempotencyStore::with_capacity(Duration::from_secs(3600), 16);
         for i in 0..64 {
             let key = format!("k{i}");
-            assert!(matches!(store.begin("s", &key, None).await.unwrap(), Begin::Fresh));
+            assert!(matches!(
+                store.begin("s", &key, None).await.unwrap(),
+                Begin::Fresh
+            ));
             store
-                .complete("s", &key, StoredResponse { status: 200, headers: vec![], body: None })
+                .complete(
+                    "s",
+                    &key,
+                    StoredResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: None,
+                    },
+                )
                 .await
                 .unwrap();
         }

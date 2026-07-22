@@ -47,9 +47,9 @@ impl Schedule {
         let every = v.get("every").and_then(|x| x.as_str());
         let cron = v.get("cron").and_then(|x| x.as_str());
         match (every, cron) {
-            (Some(_), Some(_)) => {
-                Err(RsError::bad_request("schedule has both 'every' and 'cron' — set exactly one"))
-            }
+            (Some(_), Some(_)) => Err(RsError::bad_request(
+                "schedule has both 'every' and 'cron' — set exactly one",
+            )),
             (Some(e), None) => Ok(Schedule::Interval(parse_every(e)?)),
             (None, Some(c)) => Ok(Schedule::Cron(parse_cron(c)?)),
             (None, None) => Err(RsError::bad_request(
@@ -62,7 +62,11 @@ impl Schedule {
 /// `"500ms" | "30s" | "5m" | "2h"` → [`Duration`]. Rejects 0, empty, unknown
 /// units, and overflow.
 pub fn parse_every(s: &str) -> Result<Duration, RsError> {
-    let bad = || RsError::bad_request(format!("invalid interval '{s}' (use e.g. 500ms, 30s, 5m, 2h)"));
+    let bad = || {
+        RsError::bad_request(format!(
+            "invalid interval '{s}' (use e.g. 500ms, 30s, 5m, 2h)"
+        ))
+    };
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
     let (num, unit) = s.split_at(split);
@@ -77,7 +81,9 @@ pub fn parse_every(s: &str) -> Result<Duration, RsError> {
         "h" => 3_600_000,
         _ => return Err(bad()),
     };
-    n.checked_mul(mult_ms).map(Duration::from_millis).ok_or_else(bad)
+    n.checked_mul(mult_ms)
+        .map(Duration::from_millis)
+        .ok_or_else(bad)
 }
 
 /// The epoch-aligned occurrence bucket for an interval at `now` — the same
@@ -124,7 +130,10 @@ impl CronField {
             let (lo, hi) = if base == "*" {
                 (min, max)
             } else if let Some((a, b)) = base.split_once('-') {
-                (a.parse::<u8>().map_err(|_| bad())?, b.parse::<u8>().map_err(|_| bad())?)
+                (
+                    a.parse::<u8>().map_err(|_| bad())?,
+                    b.parse::<u8>().map_err(|_| bad())?,
+                )
             } else {
                 let v: u8 = base.parse().map_err(|_| bad())?;
                 (v, v)
@@ -215,8 +224,8 @@ impl CronSchedule {
     /// with a 366-day bound. `None` if unreachable within the bound. Computed
     /// only when (re)arming a schedule, so the linear scan is cheap.
     pub fn next_occurrence_after(&self, after: OffsetDateTime) -> Option<OffsetDateTime> {
-        let mut t = after.replace_second(0).ok()?.replace_nanosecond(0).ok()?
-            + time::Duration::minutes(1);
+        let mut t =
+            after.replace_second(0).ok()?.replace_nanosecond(0).ok()? + time::Duration::minutes(1);
         let bound = after + time::Duration::days(366);
         while t <= bound {
             if self.matches(t) {
@@ -276,7 +285,8 @@ mod tests {
     use super::*;
 
     fn dt(y: i32, mo: u8, d: u8, h: u8, mi: u8) -> OffsetDateTime {
-        let date = time::Date::from_calendar_date(y, time::Month::try_from(mo).unwrap(), d).unwrap();
+        let date =
+            time::Date::from_calendar_date(y, time::Month::try_from(mo).unwrap(), d).unwrap();
         let time = time::Time::from_hms(h, mi, 0).unwrap();
         time::PrimitiveDateTime::new(date, time).assume_utc()
     }
@@ -294,10 +304,26 @@ mod tests {
 
     #[test]
     fn parse_cron_valid_and_invalid() {
-        for ok in ["* * * * *", "0 9 * * *", "0,30 * * * *", "0-15 * * * *", "*/5 * * * *", "0-30/10 * * * *", "0 0 * * 7"] {
+        for ok in [
+            "* * * * *",
+            "0 9 * * *",
+            "0,30 * * * *",
+            "0-15 * * * *",
+            "*/5 * * * *",
+            "0-30/10 * * * *",
+            "0 0 * * 7",
+        ] {
             assert!(parse_cron(ok).is_ok(), "should accept {ok:?}");
         }
-        for bad in ["* * * *", "60 * * * *", "* 24 * * *", "0 0 0 * *", "0 0 * 13 *", "a * * * *", "*/0 * * * *"] {
+        for bad in [
+            "* * * *",
+            "60 * * * *",
+            "* 24 * * *",
+            "0 0 0 * *",
+            "0 0 * 13 *",
+            "a * * * *",
+            "*/0 * * * *",
+        ] {
             assert!(parse_cron(bad).is_err(), "should reject {bad:?}");
         }
     }
@@ -306,15 +332,24 @@ mod tests {
     fn cron_next_occurrence_daily() {
         let c = parse_cron("0 9 * * *").unwrap();
         // 08:59 -> 09:00 today.
-        assert_eq!(c.next_occurrence_after(dt(2026, 6, 16, 8, 59)), Some(dt(2026, 6, 16, 9, 0)));
+        assert_eq!(
+            c.next_occurrence_after(dt(2026, 6, 16, 8, 59)),
+            Some(dt(2026, 6, 16, 9, 0))
+        );
         // exactly 09:00 -> tomorrow (strictly after).
-        assert_eq!(c.next_occurrence_after(dt(2026, 6, 16, 9, 0)), Some(dt(2026, 6, 17, 9, 0)));
+        assert_eq!(
+            c.next_occurrence_after(dt(2026, 6, 16, 9, 0)),
+            Some(dt(2026, 6, 17, 9, 0))
+        );
     }
 
     #[test]
     fn cron_year_rollover() {
         let c = parse_cron("0 0 1 1 *").unwrap(); // Jan 1 00:00
-        assert_eq!(c.next_occurrence_after(dt(2026, 12, 31, 23, 59)), Some(dt(2027, 1, 1, 0, 0)));
+        assert_eq!(
+            c.next_occurrence_after(dt(2026, 12, 31, 23, 59)),
+            Some(dt(2027, 1, 1, 0, 0))
+        );
     }
 
     #[test]
@@ -322,23 +357,41 @@ mod tests {
         // Both restricted -> OR. 2026-11-13 is a Friday.
         let both = parse_cron("0 0 13 * 5").unwrap();
         assert!(both.matches(dt(2026, 11, 13, 0, 0)), "13th matches");
-        assert!(both.matches(dt(2026, 11, 6, 0, 0)), "a Friday (the 6th) matches via DOW");
+        assert!(
+            both.matches(dt(2026, 11, 6, 0, 0)),
+            "a Friday (the 6th) matches via DOW"
+        );
         // Only DOM restricted.
         let dom_only = parse_cron("0 0 13 * *").unwrap();
         assert!(dom_only.matches(dt(2026, 11, 13, 0, 0)));
-        assert!(!dom_only.matches(dt(2026, 11, 6, 0, 0)), "non-13th day must not match");
+        assert!(
+            !dom_only.matches(dt(2026, 11, 6, 0, 0)),
+            "non-13th day must not match"
+        );
         // Only DOW restricted (Fridays).
         let dow_only = parse_cron("0 0 * * 5").unwrap();
         assert!(dow_only.matches(dt(2026, 11, 6, 0, 0)));
-        assert!(!dow_only.matches(dt(2026, 11, 5, 0, 0)), "Thursday must not match");
+        assert!(
+            !dow_only.matches(dt(2026, 11, 5, 0, 0)),
+            "Thursday must not match"
+        );
     }
 
     #[test]
     fn interval_bucket_is_epoch_aligned() {
         let every = Duration::from_secs(60);
-        let a = interval_bucket_ms(OffsetDateTime::from_unix_timestamp(1_000_000_030).unwrap(), every);
-        let b = interval_bucket_ms(OffsetDateTime::from_unix_timestamp(1_000_000_059).unwrap(), every);
-        let c = interval_bucket_ms(OffsetDateTime::from_unix_timestamp(1_000_000_081).unwrap(), every);
+        let a = interval_bucket_ms(
+            OffsetDateTime::from_unix_timestamp(1_000_000_030).unwrap(),
+            every,
+        );
+        let b = interval_bucket_ms(
+            OffsetDateTime::from_unix_timestamp(1_000_000_059).unwrap(),
+            every,
+        );
+        let c = interval_bucket_ms(
+            OffsetDateTime::from_unix_timestamp(1_000_000_081).unwrap(),
+            every,
+        );
         assert_eq!(a, b, "same minute bucket");
         assert_ne!(b, c, "next minute is a new bucket");
         assert_eq!(a % 60_000, 0, "bucket aligned to the period");
@@ -352,7 +405,11 @@ mod tests {
         assert!(msg.principal.is_none());
         assert_eq!(msg.header("x-rs2-trigger"), Some("schedule"));
         assert_eq!(msg.url.path, "/job");
-        assert_eq!(tick_message("t1", "").url.path, "/", "root mount fires at /");
+        assert_eq!(
+            tick_message("t1", "").url.path,
+            "/",
+            "root mount fires at /"
+        );
     }
 
     #[tokio::test]
@@ -360,8 +417,17 @@ mod tests {
         let store = MemScheduleStore::new();
         let ttl = Duration::from_secs(60);
         assert!(store.claim("t|/m", 1000, ttl).await.unwrap(), "first wins");
-        assert!(!store.claim("t|/m", 1000, ttl).await.unwrap(), "repeat loses");
-        assert!(store.claim("t|/m", 2000, ttl).await.unwrap(), "new occurrence wins");
-        assert!(store.claim("t|/other", 1000, ttl).await.unwrap(), "different key wins");
+        assert!(
+            !store.claim("t|/m", 1000, ttl).await.unwrap(),
+            "repeat loses"
+        );
+        assert!(
+            store.claim("t|/m", 2000, ttl).await.unwrap(),
+            "new occurrence wins"
+        );
+        assert!(
+            store.claim("t|/other", 1000, ttl).await.unwrap(),
+            "different key wins"
+        );
     }
 }

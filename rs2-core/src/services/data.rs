@@ -56,7 +56,11 @@ impl DataService {
         }
     }
 
-    async fn validator_for(&self, dataset: &str, schema: &Value) -> Result<Arc<jsonschema::Validator>, RsError> {
+    async fn validator_for(
+        &self,
+        dataset: &str,
+        schema: &Value,
+    ) -> Result<Arc<jsonschema::Validator>, RsError> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         schema.to_string().hash(&mut hasher);
         let version = hasher.finish();
@@ -64,14 +68,20 @@ impl DataService {
         if let Some(v) = self.validators.read().await.get(&key) {
             return Ok(v.clone());
         }
-        let validator = jsonschema::validator_for(schema)
-            .map_err(|e| RsError::bad_request(format!("dataset schema is not a valid JSON Schema: {e}")))?;
+        let validator = jsonschema::validator_for(schema).map_err(|e| {
+            RsError::bad_request(format!("dataset schema is not a valid JSON Schema: {e}"))
+        })?;
         let validator = Arc::new(validator);
         self.validators.write().await.insert(key, validator.clone());
         Ok(validator)
     }
 
-    async fn validate(&self, dataset: &str, schema: &Value, instance: &Value) -> Result<(), RsError> {
+    async fn validate(
+        &self,
+        dataset: &str,
+        schema: &Value,
+        instance: &Value,
+    ) -> Result<(), RsError> {
         let validator = self.validator_for(dataset, schema).await?;
         let errors: Vec<Value> = validator
             .iter_errors(instance)
@@ -126,8 +136,14 @@ fn field_rules(schema: &Value) -> Vec<(String, Option<String>, Option<String>)> 
     props
         .iter()
         .filter_map(|(name, def)| {
-            let read = def.get("x-rs-read").and_then(|v| v.as_str()).map(str::to_string);
-            let write = def.get("x-rs-write").and_then(|v| v.as_str()).map(str::to_string);
+            let read = def
+                .get("x-rs-read")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let write = def
+                .get("x-rs-write")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             (read.is_some() || write.is_some()).then(|| (name.clone(), read, write))
         })
         .collect()
@@ -171,10 +187,16 @@ fn enforce_write_rules(
     schema: &Value,
     msg: &Message,
 ) -> Result<(), RsError> {
-    let Value::Object(obj) = final_value else { return Ok(()) };
+    let Value::Object(obj) = final_value else {
+        return Ok(());
+    };
     for (name, read, write) in field_rules(schema) {
-        let readable = read.as_deref().map_or(true, |r| crate::wrapper::satisfies_role_spec(r, msg));
-        let writable = write.as_deref().map_or(true, |w| crate::wrapper::satisfies_role_spec(w, msg));
+        let readable = read
+            .as_deref()
+            .map_or(true, |r| crate::wrapper::satisfies_role_spec(r, msg));
+        let writable = write
+            .as_deref()
+            .map_or(true, |w| crate::wrapper::satisfies_role_spec(w, msg));
         if !readable {
             match stored.get(&name) {
                 Some(v) => {
@@ -196,10 +218,18 @@ fn enforce_write_rules(
 #[async_trait]
 impl Service for DataService {
     async fn handle(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
-        let data = ctx.data.as_ref().ok_or_else(|| RsError::capability_denied("data"))?;
+        let data = ctx
+            .data
+            .as_ref()
+            .ok_or_else(|| RsError::capability_denied("data"))?;
         let enforce_schema = self.enforce_schema;
         let field_authz = self.field_authz;
-        let segments: Vec<String> = msg.url.service_segments().iter().map(|s| s.to_string()).collect();
+        let segments: Vec<String> = msg
+            .url
+            .service_segments()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let schema_base = format!("{}", msg.url.base_path);
 
         match segments.as_slice() {
@@ -214,12 +244,16 @@ impl Service for DataService {
                         .map(|n| json!({ "name": format!("{n}/"), "dir": true }))
                         .collect();
                     let listing = json!({ "path": "/", "entries": entries, "total": total });
-                    let mut resp =
-                        msg.ok(Some(Body::from_bytes(listing.to_string(), MediaType::dir_json())));
+                    let mut resp = msg.ok(Some(Body::from_bytes(
+                        listing.to_string(),
+                        MediaType::dir_json(),
+                    )));
                     resp.set_header("x-total-count", &total.to_string());
                     Ok(resp)
                 }
-                _ => Err(RsError::bad_request("the mount root supports GET (dataset listing)")),
+                _ => Err(RsError::bad_request(
+                    "the mount root supports GET (dataset listing)",
+                )),
             },
 
             // ---- mount-level schema index: every dataset's installed schema
@@ -262,14 +296,19 @@ impl Service for DataService {
                             .map(|k| json!({ "name": k, "dir": false, "contentType": "application/json" }))
                             .collect();
                         if data.get_schema(&dataset).await?.is_some() {
-                            entries.push(json!({ "name": SCHEMA_RESOURCE, "dir": false, "fixed": true }));
+                            entries.push(
+                                json!({ "name": SCHEMA_RESOURCE, "dir": false, "fixed": true }),
+                            );
                         }
                         let listing = json!({
                             "path": format!("/{dataset}/"),
                             "entries": entries,
                             "total": total,
                         });
-                        let mut resp = msg.ok(Some(Body::from_bytes(listing.to_string(), MediaType::dir_json())));
+                        let mut resp = msg.ok(Some(Body::from_bytes(
+                            listing.to_string(),
+                            MediaType::dir_json(),
+                        )));
                         resp.set_header("x-total-count", &total.to_string());
                         Ok(resp)
                     }
@@ -331,7 +370,9 @@ impl Service for DataService {
                         data.delete_dataset(&dataset).await?;
                         Ok(msg.no_content())
                     }
-                    _ => Err(RsError::bad_request("dataset level supports GET, POST, DELETE")),
+                    _ => Err(RsError::bad_request(
+                        "dataset level supports GET, POST, DELETE",
+                    )),
                 }
             }
 
@@ -340,10 +381,9 @@ impl Service for DataService {
                 let dataset = dataset.clone();
                 match msg.method {
                     Method::GET => {
-                        let schema = data
-                            .get_schema(&dataset)
-                            .await?
-                            .ok_or_else(|| RsError::not_found(format!("dataset '{dataset}' has no schema")))?;
+                        let schema = data.get_schema(&dataset).await?.ok_or_else(|| {
+                            RsError::not_found(format!("dataset '{dataset}' has no schema"))
+                        })?;
                         Ok(msg.ok(Some(Body::from_bytes(
                             schema.to_string(),
                             MediaType::new(crate::message::media_type::SCHEMA_JSON),
@@ -370,8 +410,9 @@ impl Service for DataService {
                             .ok_or_else(|| RsError::bad_request("schema write requires a body"))?;
                         let schema = body.as_json(ctx.limits.materialized_body_bytes).await?;
                         // Refuse schemas that won't compile, before storing.
-                        jsonschema::validator_for(&schema)
-                            .map_err(|e| RsError::bad_request(format!("not a valid JSON Schema: {e}")))?;
+                        jsonschema::validator_for(&schema).map_err(|e| {
+                            RsError::bad_request(format!("not a valid JSON Schema: {e}"))
+                        })?;
                         data.put_schema(&dataset, schema).await?;
                         Ok(msg.ok(None))
                     }
@@ -402,7 +443,8 @@ impl Service for DataService {
                             }
                         }
                         let mut resp = msg.ok(Some(
-                            Body::from_bytes(value.to_string(), MediaType::json()).with_schema(schema_url.clone()),
+                            Body::from_bytes(value.to_string(), MediaType::json())
+                                .with_schema(schema_url.clone()),
                         ));
                         resp.set_header("link", &format!("<{schema_url}>; rel=\"describedby\""));
                         resp.set_header("etag", &etag);
@@ -469,7 +511,11 @@ impl Service for DataService {
                         // ETag over the stored (unredacted) record.
                         let etag = record_etag(&value);
                         let created = data.put(&dataset, &key, value.clone()).await?;
-                        let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+                        let status = if created {
+                            StatusCode::CREATED
+                        } else {
+                            StatusCode::OK
+                        };
                         let stored = if echo {
                             if field_authz {
                                 if let Some(schema) = &schema {
@@ -523,14 +569,17 @@ impl Service for DataService {
                             }
                         }
                         Ok(msg.ok(Some(
-                            Body::from_bytes(current.to_string(), MediaType::json()).with_schema(schema_url),
+                            Body::from_bytes(current.to_string(), MediaType::json())
+                                .with_schema(schema_url),
                         )))
                     }
                     Method::DELETE => {
                         data.delete(&dataset, &key).await?;
                         Ok(msg.no_content())
                     }
-                    _ => Err(RsError::bad_request("record level supports GET, PUT, POST, PATCH, DELETE")),
+                    _ => Err(RsError::bad_request(
+                        "record level supports GET, PUT, POST, PATCH, DELETE",
+                    )),
                 }
             }
 
@@ -546,7 +595,10 @@ mod tests {
     #[test]
     fn merge_patch_follows_rfc7386() {
         let mut target = json!({"a": 1, "b": {"c": 2, "d": 3}, "e": 4});
-        merge_patch(&mut target, &json!({"a": 9, "b": {"c": null}, "e": null, "f": 5}));
+        merge_patch(
+            &mut target,
+            &json!({"a": 9, "b": {"c": null}, "e": null, "f": 5}),
+        );
         assert_eq!(target, json!({"a": 9, "b": {"d": 3}, "f": 5}));
     }
 }

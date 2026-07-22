@@ -98,14 +98,26 @@ impl DataStore for FileDataStore {
             .map_err(|e| missing_record(e, dataset, key))?;
         let bytes = body.materialize(RECORD_CAP).await?.clone();
         serde_json::from_slice(&bytes).map_err(|e| {
-            RsError::internal(format!("record '{key}' in dataset '{dataset}' is not valid JSON: {e}"))
+            RsError::internal(format!(
+                "record '{key}' in dataset '{dataset}' is not valid JSON: {e}"
+            ))
         })
     }
 
-    async fn put(&self, tenant: &str, dataset: &str, key: &str, value: Value) -> Result<bool, RsError> {
+    async fn put(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<bool, RsError> {
         let bytes = serde_json::to_vec(&value).map_err(|e| RsError::internal(e.to_string()))?;
         self.inner
-            .write(tenant, &record_path(dataset, key), Body::from_bytes(bytes, MediaType::json()))
+            .write(
+                tenant,
+                &record_path(dataset, key),
+                Body::from_bytes(bytes, MediaType::json()),
+            )
             .await
     }
 
@@ -123,7 +135,11 @@ impl DataStore for FileDataStore {
         take: usize,
         skip: usize,
     ) -> Result<(Vec<String>, u64), RsError> {
-        match self.inner.list(tenant, &records_dir(dataset), take, skip).await {
+        match self
+            .inner
+            .list(tenant, &records_dir(dataset), take, skip)
+            .await
+        {
             Ok((entries, total)) => {
                 let keys = entries
                     .into_iter()
@@ -136,7 +152,12 @@ impl DataStore for FileDataStore {
             // exists (e.g. schema-only), else a genuine missing dataset — the
             // same distinction `MemDataStore` draws.
             Err(e) if e.code == codes::NOT_FOUND => {
-                if self.inner.list(tenant, &dataset_dir(dataset), 1, 0).await.is_ok() {
+                if self
+                    .inner
+                    .list(tenant, &dataset_dir(dataset), 1, 0)
+                    .await
+                    .is_ok()
+                {
                     Ok((vec![], 0))
                 } else {
                     Err(RsError::not_found(format!("no dataset '{dataset}'")))
@@ -166,7 +187,9 @@ impl DataStore for FileDataStore {
             Ok(mut body) => {
                 let bytes = body.materialize(RECORD_CAP).await?.clone();
                 let schema = serde_json::from_slice(&bytes).map_err(|e| {
-                    RsError::internal(format!("schema for dataset '{dataset}' is not valid JSON: {e}"))
+                    RsError::internal(format!(
+                        "schema for dataset '{dataset}' is not valid JSON: {e}"
+                    ))
                 })?;
                 Ok(Some(schema))
             }
@@ -178,19 +201,26 @@ impl DataStore for FileDataStore {
     async fn put_schema(&self, tenant: &str, dataset: &str, schema: Value) -> Result<(), RsError> {
         let bytes = serde_json::to_vec(&schema).map_err(|e| RsError::internal(e.to_string()))?;
         self.inner
-            .write(tenant, &schema_path(dataset), Body::from_bytes(bytes, MediaType::json()))
+            .write(
+                tenant,
+                &schema_path(dataset),
+                Body::from_bytes(bytes, MediaType::json()),
+            )
             .await?;
         Ok(())
     }
 
     async fn delete_dataset(&self, tenant: &str, dataset: &str) -> Result<(), RsError> {
-        self.inner.delete_dir_all(tenant, &dataset_dir(dataset)).await.map_err(|e| {
-            if e.code == codes::NOT_FOUND {
-                RsError::not_found(format!("no dataset '{dataset}'"))
-            } else {
-                e
-            }
-        })
+        self.inner
+            .delete_dir_all(tenant, &dataset_dir(dataset))
+            .await
+            .map_err(|e| {
+                if e.code == codes::NOT_FOUND {
+                    RsError::not_found(format!("no dataset '{dataset}'"))
+                } else {
+                    e
+                }
+            })
     }
 }
 
@@ -210,7 +240,15 @@ mod tests {
 
     #[test]
     fn keys_round_trip_through_encoding() {
-        for key in ["plain", "user@example.com", "a/b/c", "weird key!", "100%", "ünïcode", ".."] {
+        for key in [
+            "plain",
+            "user@example.com",
+            "a/b/c",
+            "weird key!",
+            "100%",
+            "ünïcode",
+            "..",
+        ] {
             assert_eq!(decode_key(&encode_key(key)), key, "round-trip {key:?}");
         }
     }

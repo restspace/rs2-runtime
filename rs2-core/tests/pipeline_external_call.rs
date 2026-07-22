@@ -145,9 +145,16 @@ fn fast_retry(max_attempts: u32) -> serde_json::Value {
 
 async fn put_spec(rt: &Runtime, name: &str, envelope: serde_json::Value) {
     let resp = rt
-        .handle(Message::request(Method::PUT, &format!("/p/.pipelines/{name}"), "t").with_json(&envelope))
+        .handle(
+            Message::request(Method::PUT, &format!("/p/.pipelines/{name}"), "t")
+                .with_json(&envelope),
+        )
         .await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT spec '{name}' failed");
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "PUT spec '{name}' failed"
+    );
 }
 
 fn stripe_grant() -> serde_json::Value {
@@ -161,16 +168,25 @@ async fn external_call_dispatches_through_http_out() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "charge", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "charge",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges?limit=3" } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let mut resp = rt.handle(Message::request(Method::POST, "/p/charge", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(Method::POST, "/p/charge", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     let body = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     assert_eq!(body["upstream"], true);
-    assert_eq!(http.urls.lock().unwrap().as_slice(), ["https://api.stripe.com/v1/charges?limit=3"]);
+    assert_eq!(
+        http.urls.lock().unwrap().as_slice(),
+        ["https://api.stripe.com/v1/charges?limit=3"]
+    );
 }
 
 #[tokio::test]
@@ -179,17 +195,28 @@ async fn external_call_denied_without_matching_grant() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "evil", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "evil",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "GET", "url": "https://evil.example.io/x" } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let mut resp = rt.handle(Message::request(Method::POST, "/p/evil", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(Method::POST, "/p/evil", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::FORBIDDEN), "{:?}", resp.body);
     // Denied before any I/O, and the problem lists the allowed patterns.
     assert_eq!(http.calls(), 0);
     let text = String::from_utf8_lossy(
-        resp.body.as_mut().unwrap().materialize(65536).await.unwrap(),
+        resp.body
+            .as_mut()
+            .unwrap()
+            .materialize(65536)
+            .await
+            .unwrap(),
     )
     .to_string();
     assert!(text.contains("api.stripe.com"), "{text}");
@@ -199,14 +226,25 @@ async fn external_call_denied_without_matching_grant() {
 async fn external_call_denied_with_no_grants_at_all() {
     let http = MockHttp::new();
     let dir = tempfile::tempdir().unwrap();
-    let rt = node(dir.path(), Some(http.clone()), json!({}), json!({ "access": "open" }));
+    let rt = node(
+        dir.path(),
+        Some(http.clone()),
+        json!({}),
+        json!({ "access": "open" }),
+    );
 
-    put_spec(&rt, "out", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "out",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let resp = rt.handle(Message::request(Method::POST, "/p/out", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/out", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::FORBIDDEN));
     assert_eq!(http.calls(), 0);
 }
@@ -216,12 +254,18 @@ async fn external_call_unavailable_without_adapter() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), None, json!({}), stripe_grant());
 
-    put_spec(&rt, "out", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "out",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let resp = rt.handle(Message::request(Method::POST, "/p/out", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/out", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::NOT_IMPLEMENTED));
 }
 
@@ -246,17 +290,26 @@ async fn external_call_injects_matching_grant_credentials() {
         } }),
     );
 
-    put_spec(&rt, "both", json!({ "pipeline": { "mode": "serial", "steps": [
+    put_spec(
+        &rt,
+        "both",
+        json!({ "pipeline": { "mode": "serial", "steps": [
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" }, "as": "$a" },
         { "call": { "method": "GET", "url": "https://sub.acme.io/v2/things" }, "as": "$b" },
         { "transform": { "ok": true } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let resp = rt.handle(Message::request(Method::POST, "/p/both", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/both", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     assert_eq!(http.calls(), 2);
-    assert_eq!(http.header(0, "authorization").as_deref(), Some("Bearer sk_live_42"));
+    assert_eq!(
+        http.header(0, "authorization").as_deref(),
+        Some("Bearer sk_live_42")
+    );
     assert_eq!(http.header(0, "x-api-key"), None);
     assert_eq!(http.header(1, "x-api-key").as_deref(), Some("acme_9"));
     assert_eq!(http.header(1, "authorization"), None);
@@ -268,15 +321,21 @@ async fn external_call_retries_retryable_status() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "flaky", json!({
-        "retry": fast_retry(3),
-        "pipeline": { "steps": [
-            { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
-        ] }
-    }))
+    put_spec(
+        &rt,
+        "flaky",
+        json!({
+            "retry": fast_retry(3),
+            "pipeline": { "steps": [
+                { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
+            ] }
+        }),
+    )
     .await;
 
-    let mut resp = rt.handle(Message::request(Method::POST, "/p/flaky", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(Method::POST, "/p/flaky", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     let body = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     assert_eq!(body["upstream"], true);
@@ -290,15 +349,21 @@ async fn external_call_retries_network_error() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "reset", json!({
-        "retry": fast_retry(3),
-        "pipeline": { "steps": [
-            { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
-        ] }
-    }))
+    put_spec(
+        &rt,
+        "reset",
+        json!({
+            "retry": fast_retry(3),
+            "pipeline": { "steps": [
+                { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
+            ] }
+        }),
+    )
     .await;
 
-    let resp = rt.handle(Message::request(Method::POST, "/p/reset", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/reset", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     assert_eq!(http.calls(), 2);
 }
@@ -309,16 +374,27 @@ async fn exhausted_transport_failure_shapes_the_step_report() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "down", json!({
-        "retry": fast_retry(2),
-        "pipeline": { "steps": [
-            { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
-        ] }
-    }))
+    put_spec(
+        &rt,
+        "down",
+        json!({
+            "retry": fast_retry(2),
+            "pipeline": { "steps": [
+                { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" } }
+            ] }
+        }),
+    )
     .await;
 
-    let mut resp = rt.handle(Message::request(Method::POST, "/p/down", "t")).await;
-    assert_eq!(resp.status, Some(StatusCode::BAD_GATEWAY), "{:?}", resp.body);
+    let mut resp = rt
+        .handle(Message::request(Method::POST, "/p/down", "t"))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::BAD_GATEWAY),
+        "{:?}",
+        resp.body
+    );
     assert_eq!(http.calls(), 2, "both attempts made before giving up");
     // The failure is a structured problem carrying the per-step report.
     let body = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
@@ -332,13 +408,17 @@ async fn keyed_external_post_carries_a_stable_idempotency_key() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "pay", json!({
-        "retry": fast_retry(3),
-        "pipeline": { "steps": [
-            { "call": { "method": "POST", "url": "https://api.stripe.com/v1/charges",
-                        "effect": "keyed" } }
-        ] }
-    }))
+    put_spec(
+        &rt,
+        "pay",
+        json!({
+            "retry": fast_retry(3),
+            "pipeline": { "steps": [
+                { "call": { "method": "POST", "url": "https://api.stripe.com/v1/charges",
+                            "effect": "keyed" } }
+            ] }
+        }),
+    )
     .await;
 
     let resp = rt
@@ -346,8 +426,12 @@ async fn keyed_external_post_carries_a_stable_idempotency_key() {
         .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     assert_eq!(http.calls(), 2);
-    let k0 = http.header(0, "idempotency-key").expect("keyed call carries a key");
-    let k1 = http.header(1, "idempotency-key").expect("retry carries the key too");
+    let k0 = http
+        .header(0, "idempotency-key")
+        .expect("keyed call carries a key");
+    let k1 = http
+        .header(1, "idempotency-key")
+        .expect("retry carries the key too");
     assert_eq!(k0, k1, "key must be stable across attempts");
 }
 
@@ -357,11 +441,15 @@ async fn external_request_carries_only_spec_headers() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "clean", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "clean",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges",
                     "headers": { "x-spec": "yes" } },
           "elevate": true }
-    ] } }))
+    ] } }),
+    )
     .await;
 
     // The inbound request carries credentials to *this* node; none of them may
@@ -392,17 +480,26 @@ async fn spec_headers_interpolate_captured_variables() {
         .await;
     assert!(resp.is_ok(), "{:?}", resp.status);
 
-    put_spec(&rt, "charge", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "charge",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "GET", "url": "/data/conns/stripe" }, "as": "$conn" },
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges",
                     "headers": { "authorization": "Bearer ${conn.accessToken}",
                                  "x-static": "plain" } } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let resp = rt.handle(Message::request(Method::POST, "/p/charge", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/charge", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
-    assert_eq!(http.header(0, "authorization").as_deref(), Some("Bearer sek_12345"));
+    assert_eq!(
+        http.header(0, "authorization").as_deref(),
+        Some("Bearer sek_12345")
+    );
     assert_eq!(http.header(0, "x-static").as_deref(), Some("plain"));
 }
 
@@ -412,9 +509,13 @@ async fn external_request_defaults_standard_headers() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "typed", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "typed",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "POST", "url": "https://api.stripe.com/v1/things" } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
     let resp = rt
@@ -424,13 +525,17 @@ async fn external_request_defaults_standard_headers() {
     // Content-Type from the forwarded body's media type; Accept and
     // User-Agent defaulted so picky upstreams don't reject the request.
     assert!(
-        http.header(0, "content-type").unwrap_or_default().starts_with("application/json"),
+        http.header(0, "content-type")
+            .unwrap_or_default()
+            .starts_with("application/json"),
         "{:?}",
         http.header(0, "content-type")
     );
     assert_eq!(http.header(0, "accept").as_deref(), Some("*/*"));
     assert!(
-        http.header(0, "user-agent").unwrap_or_default().starts_with("rs2/"),
+        http.header(0, "user-agent")
+            .unwrap_or_default()
+            .starts_with("rs2/"),
         "{:?}",
         http.header(0, "user-agent")
     );
@@ -442,21 +547,31 @@ async fn spec_headers_override_the_standard_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "xml", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "xml",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "POST", "url": "https://api.stripe.com/v1/things",
                     "headers": { "content-type": "application/xml",
                                  "accept": "text/plain",
                                  "user-agent": "custom-agent/1.0" } } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
     let resp = rt
         .handle(Message::request(Method::POST, "/p/xml", "t").with_json(&json!({ "a": 1 })))
         .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
-    assert_eq!(http.header(0, "content-type").as_deref(), Some("application/xml"));
+    assert_eq!(
+        http.header(0, "content-type").as_deref(),
+        Some("application/xml")
+    );
     assert_eq!(http.header(0, "accept").as_deref(), Some("text/plain"));
-    assert_eq!(http.header(0, "user-agent").as_deref(), Some("custom-agent/1.0"));
+    assert_eq!(
+        http.header(0, "user-agent").as_deref(),
+        Some("custom-agent/1.0")
+    );
 }
 
 #[tokio::test]
@@ -467,13 +582,19 @@ async fn header_interpolation_failure_aborts_before_any_io() {
 
     // `${conn.accessToken}` never captured: the step must fail at resolution
     // time — the request must not go out with a missing/mangled auth header.
-    put_spec(&rt, "noauth", json!({ "pipeline": { "steps": [
+    put_spec(
+        &rt,
+        "noauth",
+        json!({ "pipeline": { "steps": [
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges",
                     "headers": { "authorization": "Bearer ${conn.accessToken}" } } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let resp = rt.handle(Message::request(Method::POST, "/p/noauth", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::POST, "/p/noauth", "t"))
+        .await;
     assert!(!resp.is_ok(), "{:?}", resp.status);
     assert_eq!(http.calls(), 0);
 }
@@ -503,11 +624,16 @@ async fn wrapper_inline_spec_calls_externally_through_its_grants() {
         LimitTable::default(),
     );
 
-    let mut resp = rt.handle(Message::request(Method::GET, "/w/charges", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(Method::GET, "/w/charges", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     let body = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     assert_eq!(body["upstream"], true);
-    assert_eq!(http.urls.lock().unwrap().as_slice(), ["https://api.stripe.com/v1/charges"]);
+    assert_eq!(
+        http.urls.lock().unwrap().as_slice(),
+        ["https://api.stripe.com/v1/charges"]
+    );
 }
 
 #[tokio::test]
@@ -516,16 +642,25 @@ async fn plan_warns_on_uncovered_external_hosts() {
     let dir = tempfile::tempdir().unwrap();
     let rt = node(dir.path(), Some(http.clone()), json!({}), stripe_grant());
 
-    put_spec(&rt, "mixed", json!({ "pipeline": { "mode": "serial", "steps": [
+    put_spec(
+        &rt,
+        "mixed",
+        json!({ "pipeline": { "mode": "serial", "steps": [
         { "call": { "method": "GET", "url": "https://api.stripe.com/v1/charges" }, "as": "$a" },
         { "call": { "method": "GET", "url": "https://uncovered.example.io/x" }, "as": "$b" },
         { "call": { "method": "GET", "url": "/data/orders/1" }, "as": "$c" },
         { "transform": { "ok": true } }
-    ] } }))
+    ] } }),
+    )
     .await;
 
-    let mut resp =
-        rt.handle(Message::request(Method::GET, "/p/.pipelines/mixed?$plan", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(
+            Method::GET,
+            "/p/.pipelines/mixed?$plan",
+            "t",
+        ))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     let body = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     let warnings: Vec<String> = body["plan"]["warnings"]
@@ -539,5 +674,8 @@ async fn plan_warns_on_uncovered_external_hosts() {
         warnings.iter().any(|w| w.contains("uncovered.example.io")),
         "{warnings:?}"
     );
-    assert!(!warnings.iter().any(|w| w.contains("api.stripe.com")), "{warnings:?}");
+    assert!(
+        !warnings.iter().any(|w| w.contains("api.stripe.com")),
+        "{warnings:?}"
+    );
 }

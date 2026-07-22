@@ -47,7 +47,12 @@ fn as_role(mut msg: Message, role: &str) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 #[tokio::test]
@@ -69,23 +74,42 @@ async fn elevate_lets_a_pipeline_front_a_locked_service() {
         { "path": "/plain", "service": "pipeline",
           "config": { "access": { "invoke": "all", "write": "A" } } }
     ]})));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
     // Author the fronting pipelines (`.root` governs the mount).
     let gate = as_role(req(Method::PUT, "/gate/.pipelines/.root"), "A")
         .with_json(&json!({ "pipeline": ["elevate GET /secret/things/x"] }));
-    assert_eq!(rt.handle(gate).await.status, Some(StatusCode::CREATED), "author /gate");
+    assert_eq!(
+        rt.handle(gate).await.status,
+        Some(StatusCode::CREATED),
+        "author /gate"
+    );
     let plain = as_role(req(Method::PUT, "/plain/.pipelines/.root"), "A")
         .with_json(&json!({ "pipeline": ["GET /secret/things/x"] }));
-    assert_eq!(rt.handle(plain).await.status, Some(StatusCode::CREATED), "author /plain");
+    assert_eq!(
+        rt.handle(plain).await.status,
+        Some(StatusCode::CREATED),
+        "author /plain"
+    );
 
     // Seed the locked dataset (admins only).
     let seed = as_role(req(Method::PUT, "/secret/things/x"), "A").with_json(&json!({ "v": 1 }));
-    assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED), "seed");
+    assert_eq!(
+        rt.handle(seed).await.status,
+        Some(StatusCode::CREATED),
+        "seed"
+    );
 
     // A U user is refused direct access to the locked service.
     assert_eq!(
-        rt.handle(as_role(req(Method::GET, "/secret/things/x"), "U")).await.status,
+        rt.handle(as_role(req(Method::GET, "/secret/things/x"), "U"))
+            .await
+            .status,
         Some(StatusCode::FORBIDDEN),
         "direct access without the `svc` role is forbidden"
     );
@@ -93,18 +117,30 @@ async fn elevate_lets_a_pipeline_front_a_locked_service() {
     // …but reaches it through the elevating pipeline: the U principal gains
     // `svc` for the inner call (its `U` identity is kept).
     let mut resp = rt.handle(as_role(req(Method::GET, "/gate"), "U")).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "elevating pipeline reaches it: {:?}", resp.body);
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "elevating pipeline reaches it: {:?}",
+        resp.body
+    );
     assert_eq!(body_json(&mut resp).await["v"], 1, "and returns the record");
 
     // The login-gateway case: even an anonymous caller is given a synthetic
     // principal carrying `svc`, so the gate reaches the locked service.
     let mut anon = rt.handle(req(Method::GET, "/gate")).await;
-    assert_eq!(anon.status, Some(StatusCode::OK), "anonymous reaches it via elevate: {:?}", anon.body);
+    assert_eq!(
+        anon.status,
+        Some(StatusCode::OK),
+        "anonymous reaches it via elevate: {:?}",
+        anon.body
+    );
     assert_eq!(body_json(&mut anon).await["v"], 1);
 
     // The non-elevating pipeline forwards the U principal → still forbidden.
     assert_eq!(
-        rt.handle(as_role(req(Method::GET, "/plain"), "U")).await.status,
+        rt.handle(as_role(req(Method::GET, "/plain"), "U"))
+            .await
+            .status,
         Some(StatusCode::FORBIDDEN),
         "without elevate, the forwarded principal is re-checked and rejected"
     );
@@ -128,13 +164,26 @@ async fn anonymous_pipeline_cannot_reach_a_locked_mount() {
         { "path": "/open", "service": "pipeline",
           "config": { "access": { "invoke": "all", "write": "A" } } }
     ]})));
-    let rt = Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
     let seed = as_role(req(Method::PUT, "/secret/things/x"), "A").with_json(&json!({ "v": 1 }));
-    assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED), "seed");
+    assert_eq!(
+        rt.handle(seed).await.status,
+        Some(StatusCode::CREATED),
+        "seed"
+    );
     let author = as_role(req(Method::PUT, "/open/.pipelines/.root"), "A")
         .with_json(&json!({ "pipeline": ["GET /secret/things/x"] }));
-    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author /open");
+    assert_eq!(
+        rt.handle(author).await.status,
+        Some(StatusCode::CREATED),
+        "author /open"
+    );
 
     // Anonymous trigger: the pipeline runs, but its no-principal internal call
     // to the locked mount is refused — no ambient trust.

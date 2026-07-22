@@ -90,7 +90,8 @@ fn now_secs() -> u64 {
 /// Sign claims as a HS512 JWT.
 pub fn sign(claims: &Claims, secret: &str) -> Result<String, RsError> {
     let header = B64.encode(br#"{"alg":"HS512","typ":"JWT"}"#);
-    let payload = B64.encode(serde_json::to_vec(claims).map_err(|e| RsError::internal(e.to_string()))?);
+    let payload =
+        B64.encode(serde_json::to_vec(claims).map_err(|e| RsError::internal(e.to_string()))?);
     let signing_input = format!("{header}.{payload}");
     let mut mac = HmacSha512::new_from_slice(secret.as_bytes())
         .map_err(|e| RsError::internal(format!("bad signing key: {e}")))?;
@@ -107,7 +108,8 @@ pub fn verify(token: &str, secret: &str) -> Result<Claims, RsError> {
         _ => return Err(RsError::unauthorized("malformed token")),
     };
     let header_json: serde_json::Value = serde_json::from_slice(
-        &B64.decode(header).map_err(|_| RsError::unauthorized("malformed token header"))?,
+        &B64.decode(header)
+            .map_err(|_| RsError::unauthorized("malformed token header"))?,
     )
     .map_err(|_| RsError::unauthorized("malformed token header"))?;
     if header_json.get("alg").and_then(|a| a.as_str()) != Some("HS512") {
@@ -116,10 +118,14 @@ pub fn verify(token: &str, secret: &str) -> Result<Claims, RsError> {
     let mut mac = HmacSha512::new_from_slice(secret.as_bytes())
         .map_err(|e| RsError::internal(format!("bad signing key: {e}")))?;
     mac.update(format!("{header}.{payload}").as_bytes());
-    let sig_bytes = B64.decode(sig).map_err(|_| RsError::unauthorized("malformed signature"))?;
-    mac.verify_slice(&sig_bytes).map_err(|_| RsError::unauthorized("invalid token signature"))?;
+    let sig_bytes = B64
+        .decode(sig)
+        .map_err(|_| RsError::unauthorized("malformed signature"))?;
+    mac.verify_slice(&sig_bytes)
+        .map_err(|_| RsError::unauthorized("invalid token signature"))?;
     let claims: Claims = serde_json::from_slice(
-        &B64.decode(payload).map_err(|_| RsError::unauthorized("malformed token payload"))?,
+        &B64.decode(payload)
+            .map_err(|_| RsError::unauthorized("malformed token payload"))?,
     )
     .map_err(|_| RsError::unauthorized("malformed token payload"))?;
     if claims.exp < now_secs() {
@@ -148,7 +154,9 @@ pub fn extract_token(msg: &Message) -> Option<String> {
 
 /// Verify the request's token (if any) into a [`Principal`].
 pub fn principal_from_token(msg: &Message, secret: &str) -> Result<Option<Principal>, RsError> {
-    let Some(token) = extract_token(msg) else { return Ok(None) };
+    let Some(token) = extract_token(msg) else {
+        return Ok(None);
+    };
     let claims = verify(&token, secret)?;
     Ok(Some(Principal {
         id: claims.sub,
@@ -175,7 +183,9 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
         use argon2::password_hash::{PasswordHash, PasswordVerifier};
         PasswordHash::new(hash)
             .map(|parsed| {
-                argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()
+                argon2::Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
             })
             .unwrap_or(false)
     } else if hash.starts_with("$2") {
@@ -219,7 +229,10 @@ impl AuthService {
                 "auth requires a 'jwtSecret' in the tenant config's auth settings",
             ));
         }
-        Ok(AuthService { settings, lockouts: Mutex::new(HashMap::new()) })
+        Ok(AuthService {
+            settings,
+            lockouts: Mutex::new(HashMap::new()),
+        })
     }
 
     fn check_lockout(&self, user: &str) -> Result<(), RsError> {
@@ -282,7 +295,9 @@ impl AuthService {
     /// v1's login-origin allowlist: when configured, cross-origin browser
     /// calls to login/refresh must come from a listed origin.
     fn check_login_origin(&self, msg: &Message) -> Result<(), RsError> {
-        let Some(origin) = msg.header("origin") else { return Ok(()) };
+        let Some(origin) = msg.header("origin") else {
+            return Ok(());
+        };
         if crate::wrapper::is_same_origin(origin, msg.header("host")) {
             return Ok(());
         }
@@ -295,7 +310,9 @@ impl AuthService {
         {
             Ok(())
         } else {
-            Err(RsError::forbidden(format!("login origin '{origin}' is not allowed")))
+            Err(RsError::forbidden(format!(
+                "login origin '{origin}' is not allowed"
+            )))
         }
     }
 
@@ -303,18 +320,22 @@ impl AuthService {
     /// non-browser) → `SameSite=Strict`; trusted cross-origin →
     /// `SameSite=None; Secure`; untrusted origin → no cookie, the body
     /// token is the credential.
-    fn token_response(&self, msg: &Message, ctx: &ServiceContext, token: &str, exp: u64) -> Message {
+    fn token_response(
+        &self,
+        msg: &Message,
+        ctx: &ServiceContext,
+        token: &str,
+        exp: u64,
+    ) -> Message {
         let mut resp = msg.ok_json(&serde_json::json!({ "token": token, "exp": exp }));
         let max_age = self.settings.session_minutes * 60;
         let cookie = match msg.header("origin") {
             None => Some(format!(
                 "rs-auth={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
             )),
-            Some(origin) if crate::wrapper::is_same_origin(origin, msg.header("host")) => {
-                Some(format!(
-                    "rs-auth={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"
-                ))
-            }
+            Some(origin) if crate::wrapper::is_same_origin(origin, msg.header("host")) => Some(
+                format!("rs-auth={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}"),
+            ),
             Some(origin) if ctx.cors.is_trusted(origin) => Some(format!(
                 "rs-auth={token}; HttpOnly; SameSite=None; Secure; Path=/; Max-Age={max_age}"
             )),
@@ -356,14 +377,21 @@ impl AuthService {
             Err(_) => {
                 // Indistinguishable from a bad password (no user enumeration).
                 self.record_failure(&email);
-                ctx.logger.at(&msg.trace).warn(format!("login failed for '{email}' (unknown user)"));
+                ctx.logger
+                    .at(&msg.trace)
+                    .warn(format!("login failed for '{email}' (unknown user)"));
                 return Err(RsError::unauthorized("invalid credentials"));
             }
         };
-        let hash = user.get("passwordHash").and_then(|v| v.as_str()).unwrap_or("");
+        let hash = user
+            .get("passwordHash")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if !verify_password(&password, hash) {
             self.record_failure(&email);
-            ctx.logger.at(&msg.trace).warn(format!("login failed for '{email}' (bad password)"));
+            ctx.logger
+                .at(&msg.trace)
+                .warn(format!("login failed for '{email}' (bad password)"));
             return Err(RsError::unauthorized("invalid credentials"));
         }
         self.clear_failures(&email);
@@ -394,8 +422,8 @@ impl AuthService {
     /// (PRD §10.5).
     fn refresh(&self, msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
         self.check_login_origin(&msg)?;
-        let token = extract_token(&msg)
-            .ok_or_else(|| RsError::unauthorized("refresh requires a token"))?;
+        let token =
+            extract_token(&msg).ok_or_else(|| RsError::unauthorized("refresh requires a token"))?;
         let claims = verify(&token, &self.settings.jwt_secret)?;
         let now = now_secs();
         let halfway = claims.iat + (claims.exp - claims.iat) / 2;
@@ -403,16 +431,20 @@ impl AuthService {
             // Not yet refreshable: return the existing token unchanged.
             return Ok(msg.ok_json(&serde_json::json!({ "token": token, "exp": claims.exp })));
         }
-        let (token, exp) =
-            self.issue(&claims.sub, &claims.roles, &claims.kind, claims.extra.clone())?;
+        let (token, exp) = self.issue(
+            &claims.sub,
+            &claims.roles,
+            &claims.kind,
+            claims.extra.clone(),
+        )?;
         Ok(self.token_response(&msg, ctx, &token, exp))
     }
 
     fn logout(&self, msg: Message) -> Message {
         let mut resp = msg.no_content();
-        if let Ok(v) = http::HeaderValue::from_str(
-            "rs-auth=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
-        ) {
+        if let Ok(v) =
+            http::HeaderValue::from_str("rs-auth=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+        {
             resp.headers.insert(http::header::SET_COOKIE, v);
         }
         resp
@@ -422,8 +454,12 @@ impl AuthService {
 #[async_trait]
 impl Service for AuthService {
     async fn handle(&self, msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
-        let segments: Vec<String> =
-            msg.url.service_segments().iter().map(|s| s.to_string()).collect();
+        let segments: Vec<String> = msg
+            .url
+            .service_segments()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let segments: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
         match (&msg.method, segments.as_slice()) {
             (&http::Method::POST, ["login"]) => self.login(msg, ctx).await,
@@ -473,7 +509,10 @@ mod tests {
         let tampered = format!("{}x", token);
         assert!(verify(&tampered, "secret-key").is_err());
         // Expired token.
-        let expired = Claims { exp: now_secs() - 10, ..claims };
+        let expired = Claims {
+            exp: now_secs() - 10,
+            ..claims
+        };
         let token = sign(&expired, "secret-key").unwrap();
         assert!(verify(&token, "secret-key").is_err());
     }
@@ -496,11 +535,17 @@ mod tests {
 
         // With no extra claims the payload omits the field entirely, so the
         // token bytes match the pre-`extra` format and old tokens verify.
-        let old = Claims { extra: serde_json::Map::new(), ..claims };
+        let old = Claims {
+            extra: serde_json::Map::new(),
+            ..claims
+        };
         let token = sign(&old, "secret-key").unwrap();
         let payload =
             String::from_utf8(B64.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
-        assert!(!payload.contains("extra"), "empty extra must not appear in the payload");
+        assert!(
+            !payload.contains("extra"),
+            "empty extra must not appear in the payload"
+        );
         let back = verify(&token, "secret-key").unwrap();
         assert!(back.extra.is_empty());
     }

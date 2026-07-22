@@ -92,7 +92,11 @@ impl RetryPolicy {
     /// A policy that never retries (the runtime default when no policy is
     /// configured anywhere — retries are opt-in per PRD §7.3 resolution).
     pub fn no_retry() -> Self {
-        RetryPolicy { enabled: false, max_attempts: 1, ..Default::default() }
+        RetryPolicy {
+            enabled: false,
+            max_attempts: 1,
+            ..Default::default()
+        }
     }
 
     /// Resolve the effective policy from the override chain: first present
@@ -127,7 +131,9 @@ impl RetryPolicy {
             }
         }
         let raw = self.base_delay_ms as f64
-            * self.backoff_multiplier.powi(failed_attempt.saturating_sub(1) as i32);
+            * self
+                .backoff_multiplier
+                .powi(failed_attempt.saturating_sub(1) as i32);
         let capped = (raw as u64).min(self.max_delay_ms);
         match self.jitter {
             Jitter::None => Duration::from_millis(capped),
@@ -148,11 +154,8 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
         }
         return None;
     }
-    let date = time::OffsetDateTime::parse(
-        trimmed,
-        &time::format_description::well_known::Rfc2822,
-    )
-    .ok()?;
+    let date = time::OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc2822)
+        .ok()?;
     let now = time::OffsetDateTime::now_utc();
     if date > now {
         Some(Duration::try_from(date - now).unwrap_or(Duration::ZERO))
@@ -190,9 +193,7 @@ where
                 if attempt >= max_attempts || !policy.retryable_status(status) {
                     return Ok(resp);
                 }
-                let retry_after = resp
-                    .header("retry-after")
-                    .and_then(parse_retry_after);
+                let retry_after = resp.header("retry-after").and_then(parse_retry_after);
                 tokio::time::sleep(policy.delay(attempt, retry_after)).await;
             }
             Err(err) => {
@@ -221,14 +222,26 @@ mod tests {
 
     #[test]
     fn effect_defaults_follow_method() {
-        assert_eq!(EffectClass::default_for_method(&Method::GET), EffectClass::Pure);
-        assert_eq!(EffectClass::default_for_method(&Method::PUT), EffectClass::Idempotent);
-        assert_eq!(EffectClass::default_for_method(&Method::POST), EffectClass::Unsafe);
+        assert_eq!(
+            EffectClass::default_for_method(&Method::GET),
+            EffectClass::Pure
+        );
+        assert_eq!(
+            EffectClass::default_for_method(&Method::PUT),
+            EffectClass::Idempotent
+        );
+        assert_eq!(
+            EffectClass::default_for_method(&Method::POST),
+            EffectClass::Unsafe
+        );
     }
 
     #[test]
     fn resolution_chain_prefers_first_present() {
-        let mount = RetryPolicy { max_attempts: 2, ..Default::default() };
+        let mount = RetryPolicy {
+            max_attempts: 2,
+            ..Default::default()
+        };
         let resolved = RetryPolicy::resolve(&[None, Some(&mount), None]);
         assert_eq!(resolved.max_attempts, 2);
         // Nothing configured → no retry.
@@ -237,12 +250,21 @@ mod tests {
 
     #[test]
     fn delay_backs_off_and_respects_retry_after() {
-        let p = RetryPolicy { jitter: Jitter::None, ..Default::default() };
+        let p = RetryPolicy {
+            jitter: Jitter::None,
+            ..Default::default()
+        };
         assert_eq!(p.delay(1, None), Duration::from_millis(250));
         assert_eq!(p.delay(2, None), Duration::from_millis(500));
         assert_eq!(p.delay(10, None), Duration::from_millis(5000)); // capped
-        assert_eq!(p.delay(1, Some(Duration::from_secs(1))), Duration::from_secs(1));
-        assert_eq!(p.delay(1, Some(Duration::from_secs(60))), Duration::from_millis(5000));
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(1))),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(60))),
+            Duration::from_millis(5000)
+        );
     }
 
     #[tokio::test]
@@ -266,7 +288,11 @@ mod tests {
 
     #[tokio::test]
     async fn unsafe_effect_is_never_retried() {
-        let policy = RetryPolicy { base_delay_ms: 1, jitter: Jitter::None, ..Default::default() };
+        let policy = RetryPolicy {
+            base_delay_ms: 1,
+            jitter: Jitter::None,
+            ..Default::default()
+        };
         let calls = AtomicU32::new(0);
         let out = retry_request(&policy, EffectClass::Unsafe, false, |_| {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -280,7 +306,11 @@ mod tests {
 
     #[tokio::test]
     async fn keyed_effect_retries_only_with_key() {
-        let policy = RetryPolicy { base_delay_ms: 1, jitter: Jitter::None, ..Default::default() };
+        let policy = RetryPolicy {
+            base_delay_ms: 1,
+            jitter: Jitter::None,
+            ..Default::default()
+        };
         let calls = AtomicU32::new(0);
         let _ = retry_request(&policy, EffectClass::Keyed, true, |_| {
             calls.fetch_add(1, Ordering::SeqCst);

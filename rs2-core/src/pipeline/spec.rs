@@ -182,7 +182,9 @@ impl PipelineSpec {
             errors.push(format!("{at}: parallel mode must stop on fail"));
         }
         if self.on_succeed == Some(Action::Stop) {
-            errors.push(format!("{at}: cannot stop on success or the pipeline always fails"));
+            errors.push(format!(
+                "{at}: cannot stop on success or the pipeline always fails"
+            ));
         }
         for (i, step) in self.steps.iter().enumerate() {
             let here = format!("{at}/steps[{i}]");
@@ -207,7 +209,9 @@ impl PipelineSpec {
             }
             if let Some(capture) = &step.capture {
                 if !capture.starts_with('$') {
-                    errors.push(format!("{here}: 'as' must name a variable starting with '$'"));
+                    errors.push(format!(
+                        "{here}: 'as' must name a variable starting with '$'"
+                    ));
                 }
             }
             if let Some(call) = &step.call {
@@ -315,11 +319,17 @@ mod tests {
         .unwrap();
         assert_eq!(spec.steps.len(), 4);
         assert_eq!(spec.on_fail, Some(Action::Stop));
-        assert_eq!(spec.steps[1].call.as_ref().unwrap().effect_class(), EffectClass::Keyed);
+        assert_eq!(
+            spec.steps[1].call.as_ref().unwrap().effect_class(),
+            EffectClass::Keyed
+        );
         assert!(spec.steps[1].try_mode);
         assert!(spec.validate().is_empty());
         // Method-inferred effects.
-        assert_eq!(spec.steps[0].call.as_ref().unwrap().effect_class(), EffectClass::Pure);
+        assert_eq!(
+            spec.steps[0].call.as_ref().unwrap().effect_class(),
+            EffectClass::Pure
+        );
     }
 
     #[test]
@@ -338,7 +348,10 @@ mod tests {
         .unwrap();
         let errors = spec.validate();
         assert_eq!(errors.len(), 3, "{errors:?}");
-        assert!(errors[0].contains("/steps[0]") && errors[0].contains("$sum(("), "{errors:?}");
+        assert!(
+            errors[0].contains("/steps[0]") && errors[0].contains("$sum(("),
+            "{errors:?}"
+        );
         assert!(errors[1].contains("/steps[1]"), "{errors:?}");
         assert!(errors[2].contains("/steps[2]/steps[0]"), "{errors:?}");
     }

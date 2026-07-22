@@ -31,7 +31,10 @@ struct MockHttp {
 #[async_trait]
 impl HttpOut for MockHttp {
     async fn request(&self, msg: Message) -> Result<Message, RsError> {
-        self.auth.lock().unwrap().push(msg.header("authorization").map(String::from));
+        self.auth
+            .lock()
+            .unwrap()
+            .push(msg.header("authorization").map(String::from));
         self.query.lock().unwrap().push(msg.url.query.clone());
         Ok(msg.ok_json(&json!({ "ok": true })))
     }
@@ -67,7 +70,10 @@ const BUNDLE: &str = r#"
 
 #[tokio::test]
 async fn infra_bearer_is_injected_host_side_and_secret_never_leaks() {
-    let http = Arc::new(MockHttp { auth: Mutex::new(Vec::new()), query: Mutex::new(Vec::new()) });
+    let http = Arc::new(MockHttp {
+        auth: Mutex::new(Vec::new()),
+        query: Mutex::new(Vec::new()),
+    });
     let dir = tempfile::tempdir().unwrap();
 
     // The operator infra carries the strategy + secret; `adapter` is required by
@@ -108,12 +114,16 @@ async fn infra_bearer_is_injected_host_side_and_secret_never_leaks() {
         LimitTable::default(),
     );
 
-    let deploy = Message::request(Method::POST, "/services/code/send/", "t").with_body(
-        Body::from_bytes(BUNDLE.as_bytes().to_vec(), MediaType::new("application/javascript")),
-    );
+    let deploy =
+        Message::request(Method::POST, "/services/code/send/", "t").with_body(Body::from_bytes(
+            BUNDLE.as_bytes().to_vec(),
+            MediaType::new("application/javascript"),
+        ));
     assert_eq!(rt.handle(deploy).await.status, Some(StatusCode::CREATED));
 
-    let mut resp = rt.handle(Message::request(Method::GET, "/send/go", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(Method::GET, "/send/go", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     let out = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
     assert_eq!(out["ok"], true);
@@ -131,17 +141,31 @@ async fn infra_bearer_is_injected_host_side_and_secret_never_leaks() {
     );
 
     // …nor the tenant config round-trip (`GET /services/raw`).
-    let mut raw = rt.handle(Message::request(Method::GET, "/services/raw", "t")).await;
+    let mut raw = rt
+        .handle(Message::request(Method::GET, "/services/raw", "t"))
+        .await;
     assert_eq!(raw.status, Some(StatusCode::OK));
-    let raw_text =
-        String::from_utf8_lossy(raw.body.as_mut().unwrap().materialize(1 << 20).await.unwrap())
-            .to_string();
-    assert!(!raw_text.contains("sk_secret_123"), "secret leaked into /services/raw");
+    let raw_text = String::from_utf8_lossy(
+        raw.body
+            .as_mut()
+            .unwrap()
+            .materialize(1 << 20)
+            .await
+            .unwrap(),
+    )
+    .to_string();
+    assert!(
+        !raw_text.contains("sk_secret_123"),
+        "secret leaked into /services/raw"
+    );
 }
 
 #[tokio::test]
 async fn inline_strategy_draws_token_from_granted_secret() {
-    let http = Arc::new(MockHttp { auth: Mutex::new(Vec::new()), query: Mutex::new(Vec::new()) });
+    let http = Arc::new(MockHttp {
+        auth: Mutex::new(Vec::new()),
+        query: Mutex::new(Vec::new()),
+    });
     let dir = tempfile::tempdir().unwrap();
 
     let adapters = Adapters::new(
@@ -173,12 +197,16 @@ async fn inline_strategy_draws_token_from_granted_secret() {
         LimitTable::default(),
     );
 
-    let deploy = Message::request(Method::POST, "/services/code/send/", "t").with_body(
-        Body::from_bytes(BUNDLE.as_bytes().to_vec(), MediaType::new("application/javascript")),
-    );
+    let deploy =
+        Message::request(Method::POST, "/services/code/send/", "t").with_body(Body::from_bytes(
+            BUNDLE.as_bytes().to_vec(),
+            MediaType::new("application/javascript"),
+        ));
     assert_eq!(rt.handle(deploy).await.status, Some(StatusCode::CREATED));
 
-    let resp = rt.handle(Message::request(Method::GET, "/send/go", "t")).await;
+    let resp = rt
+        .handle(Message::request(Method::GET, "/send/go", "t"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
 
     // The secret was spliced into the query string host-side, after the guest's

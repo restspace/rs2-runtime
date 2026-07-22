@@ -87,7 +87,10 @@ async fn guest_backed_sms_gateway_sends_and_reports_status() {
 
     // POST /send → 201 with a provider message id.
     let mut resp = rt
-        .handle(req(Method::POST, "/sms/send").with_json(&json!({ "to": "+15551234567", "body": "hi" })))
+        .handle(
+            req(Method::POST, "/sms/send")
+                .with_json(&json!({ "to": "+15551234567", "body": "hi" })),
+        )
         .await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
     let sent = body_json(&mut resp).await;
@@ -95,7 +98,9 @@ async fn guest_backed_sms_gateway_sends_and_reports_status() {
     assert!(id.starts_with("sm_"), "provider id: {id}");
 
     // GET /status/{id} → delivery status mapped back through the trait.
-    let mut resp = rt.handle(req(Method::GET, &format!("/sms/status/{id}"))).await;
+    let mut resp = rt
+        .handle(req(Method::GET, &format!("/sms/status/{id}")))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     let st = body_json(&mut resp).await;
     assert_eq!(st["status"], "delivered");
@@ -106,7 +111,9 @@ async fn guest_backed_sms_gateway_sends_and_reports_status() {
     assert_eq!(resp.status, Some(StatusCode::NOT_FOUND));
 
     // A missing field is the service's own 400 (before the adapter is called).
-    let resp = rt.handle(req(Method::POST, "/sms/send").with_json(&json!({ "body": "no to" }))).await;
+    let resp = rt
+        .handle(req(Method::POST, "/sms/send").with_json(&json!({ "body": "no to" })))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::BAD_REQUEST));
 }
 

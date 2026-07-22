@@ -84,7 +84,11 @@ impl ExternalDispatch {
                 hosts: g
                     .get("hosts")
                     .and_then(|h| h.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 injector: injectors.get(name).cloned(),
             })
@@ -93,13 +97,19 @@ impl ExternalDispatch {
             return None;
         }
         grants.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(ExternalDispatch { http, grants, max_body_bytes })
+        Some(ExternalDispatch {
+            http,
+            grants,
+            max_body_bytes,
+        })
     }
 
     /// Whether `host` is covered by any grant's allowlist (no I/O, no errors —
     /// the `?$plan` static-coverage check).
     pub fn covers(&self, host: &str) -> bool {
-        self.grants.iter().any(|g| g.hosts.iter().any(|p| host_matches(p, host)))
+        self.grants
+            .iter()
+            .any(|g| g.hosts.iter().any(|p| host_matches(p, host)))
     }
 
     /// Allowlist check for an absolute URL — no I/O. Returns the index of the
@@ -114,8 +124,11 @@ impl ExternalDispatch {
             .iter()
             .position(|g| g.hosts.iter().any(|p| host_matches(p, &host)))
             .ok_or_else(|| {
-                let allowed: Vec<&str> =
-                    self.grants.iter().flat_map(|g| g.hosts.iter().map(String::as_str)).collect();
+                let allowed: Vec<&str> = self
+                    .grants
+                    .iter()
+                    .flat_map(|g| g.hosts.iter().map(String::as_str))
+                    .collect();
                 RsError::capability_denied(&format!(
                     "httpOut to '{host}' (this mount's httpOut grants allow: {})",
                     allowed.join(", ")
@@ -150,7 +163,8 @@ impl ExternalDispatch {
             }
         }
         if !msg.headers.contains_key(http::header::ACCEPT) {
-            msg.headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("*/*"));
+            msg.headers
+                .insert(http::header::ACCEPT, http::HeaderValue::from_static("*/*"));
         }
         if !msg.headers.contains_key(http::header::USER_AGENT) {
             msg.headers.insert(
@@ -171,8 +185,14 @@ mod tests {
 
     #[test]
     fn host_allowlist_matching() {
-        assert_eq!(url_host("https://api.stripe.com/v1/charges").as_deref(), Some("api.stripe.com"));
-        assert_eq!(url_host("https://api.x.com:8443/v1?q=1").as_deref(), Some("api.x.com"));
+        assert_eq!(
+            url_host("https://api.stripe.com/v1/charges").as_deref(),
+            Some("api.stripe.com")
+        );
+        assert_eq!(
+            url_host("https://api.x.com:8443/v1?q=1").as_deref(),
+            Some("api.x.com")
+        );
         assert_eq!(url_host("/relative/path"), None);
         assert!(host_matches("api.stripe.com", "api.stripe.com"));
         assert!(host_matches("*.stripe.com", "api.stripe.com"));
@@ -188,18 +208,26 @@ mod tests {
             "a-exact": { "type": "httpOut", "hosts": ["api.stripe.com"] },
             "internal": { "prefix": "/data" }
         }});
-        let ext =
-            ExternalDispatch::from_mount(&grants, None, &HashMap::new(), 1024).unwrap();
+        let ext = ExternalDispatch::from_mount(&grants, None, &HashMap::new(), 1024).unwrap();
         // Sorted by grant name: a-exact first.
         assert_eq!(ext.grants[0].name, "a-exact");
         assert!(ext.covers("api.stripe.com"));
         assert!(ext.covers("sub.example.com"));
         assert!(!ext.covers("evil.io"));
         // Match without an adapter ⇒ 501; no match ⇒ 403; relative ⇒ 400.
-        assert_eq!(ext.authorize("https://api.stripe.com/v1").unwrap_err().status, 501);
+        assert_eq!(
+            ext.authorize("https://api.stripe.com/v1")
+                .unwrap_err()
+                .status,
+            501
+        );
         let denied = ext.authorize("https://evil.io/x").unwrap_err();
         assert_eq!(denied.status, 403);
-        assert!(denied.detail.contains("api.stripe.com"), "{}", denied.detail);
+        assert!(
+            denied.detail.contains("api.stripe.com"),
+            "{}",
+            denied.detail
+        );
         assert_eq!(ext.authorize("/relative").unwrap_err().status, 400);
     }
 
@@ -212,12 +240,9 @@ mod tests {
             1024
         )
         .is_none());
-        assert!(ExternalDispatch::from_mount(
-            &serde_json::json!({}),
-            None,
-            &HashMap::new(),
-            1024
-        )
-        .is_none());
+        assert!(
+            ExternalDispatch::from_mount(&serde_json::json!({}), None, &HashMap::new(), 1024)
+                .is_none()
+        );
     }
 }

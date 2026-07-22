@@ -55,14 +55,26 @@ fn as_admin(mut msg: Message) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 fn runtime(dir: &std::path::Path, mounts: serde_json::Value) -> Arc<Runtime> {
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir)), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({ "mounts": mounts })));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 #[tokio::test]
@@ -84,7 +96,11 @@ async fn transforms_see_the_caller_as_dollar_user() {
             }
         ]
     }));
-    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author");
+    assert_eq!(
+        rt.handle(author).await.status,
+        Some(StatusCode::CREATED),
+        "author"
+    );
 
     let call = as_user(req(Method::POST, "/pipe"), "ada@example.com", "acc-42")
         .with_json(&json!({ "anything": true }));
@@ -92,8 +108,14 @@ async fn transforms_see_the_caller_as_dollar_user() {
     assert_eq!(resp.status, Some(StatusCode::OK), "run: {:?}", resp.body);
     let body = body_json(&mut resp).await;
     assert_eq!(body["account"], "acc-42", "extra claim flows into $_user");
-    assert_eq!(body["email"], "ada@example.com", "principal id binds as email");
-    assert_eq!(body["viaPrincipal"], "acc-42", "also bound under $principal");
+    assert_eq!(
+        body["email"], "ada@example.com",
+        "principal id binds as email"
+    );
+    assert_eq!(
+        body["viaPrincipal"], "acc-42",
+        "also bound under $principal"
+    );
 }
 
 #[tokio::test]
@@ -110,16 +132,34 @@ async fn step_urls_interpolate_user_fields() {
     );
 
     let seed = as_admin(req(Method::PUT, "/store/things/acc-42_p1")).with_json(&json!({ "v": 7 }));
-    assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED), "seed");
+    assert_eq!(
+        rt.handle(seed).await.status,
+        Some(StatusCode::CREATED),
+        "seed"
+    );
 
     // Compound-key pattern: scope a record key to the caller's principal claim.
     let author = as_admin(req(Method::PUT, "/pipe/.pipelines/.root"))
         .with_json(&json!({ "pipeline": ["GET /store/things/${_user.accountId}_p1"] }));
-    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author");
+    assert_eq!(
+        rt.handle(author).await.status,
+        Some(StatusCode::CREATED),
+        "author"
+    );
 
-    let mut resp = rt.handle(as_user(req(Method::GET, "/pipe"), "ada@example.com", "acc-42")).await;
+    let mut resp = rt
+        .handle(as_user(
+            req(Method::GET, "/pipe"),
+            "ada@example.com",
+            "acc-42",
+        ))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "run: {:?}", resp.body);
-    assert_eq!(body_json(&mut resp).await["v"], 7, "URL interpolated the extra claim");
+    assert_eq!(
+        body_json(&mut resp).await["v"],
+        7,
+        "URL interpolated the extra claim"
+    );
 }
 
 #[tokio::test]
@@ -135,7 +175,11 @@ async fn the_triggering_url_binds_as_dollar_url() {
         "pipeline": [ { "first": "$_url.path[0]", "second": "$_url.path[1]",
                         "q": "$_url.query.q" } ]
     }));
-    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author");
+    assert_eq!(
+        rt.handle(author).await.status,
+        Some(StatusCode::CREATED),
+        "author"
+    );
 
     let call = req(Method::POST, "/pipe/report/blocks?q=hi").with_json(&json!({}));
     let mut resp = rt.handle(call).await;
@@ -158,10 +202,21 @@ async fn anonymous_callers_have_no_user_binding() {
     let author = as_admin(req(Method::PUT, "/pipe/.pipelines/.root")).with_json(&json!({
         "pipeline": [ { "account": "$_user.accountId", "ok": "true" } ]
     }));
-    assert_eq!(rt.handle(author).await.status, Some(StatusCode::CREATED), "author");
+    assert_eq!(
+        rt.handle(author).await.status,
+        Some(StatusCode::CREATED),
+        "author"
+    );
 
-    let mut resp = rt.handle(req(Method::POST, "/pipe").with_json(&json!({}))).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "no 500 for anonymous: {:?}", resp.body);
+    let mut resp = rt
+        .handle(req(Method::POST, "/pipe").with_json(&json!({})))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "no 500 for anonymous: {:?}",
+        resp.body
+    );
     let body = body_json(&mut resp).await;
     assert_eq!(body["ok"], true);
     assert!(

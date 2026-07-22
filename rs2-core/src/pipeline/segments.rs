@@ -43,7 +43,11 @@ pub fn plan(spec: &PipelineSpec) -> SegmentPlan {
     if spec.mode != Mode::Serial || spec.steps.is_empty() {
         collect_warnings(spec, "", &mut warnings);
         return SegmentPlan {
-            segments: vec![Segment { start: 0, end: spec.steps.len(), checkpoint_eligible: false }],
+            segments: vec![Segment {
+                start: 0,
+                end: spec.steps.len(),
+                checkpoint_eligible: false,
+            }],
             warnings,
         };
     }
@@ -97,7 +101,12 @@ fn collect_warnings(spec: &PipelineSpec, at: &str, warnings: &mut Vec<String>) {
         if let Some(sub) = &step.pipeline {
             let here = format!("{at}/steps[{i}]/pipeline");
             let sub_plan = plan(sub);
-            warnings.extend(sub_plan.warnings.into_iter().map(|w| format!("{here}: {w}")));
+            warnings.extend(
+                sub_plan
+                    .warnings
+                    .into_iter()
+                    .map(|w| format!("{here}: {w}")),
+            );
         }
     }
 }
@@ -113,13 +122,22 @@ mod tests {
     }
 
     fn transform() -> Step {
-        Step { transform: Some(json!({"a": "$"})), ..Default::default() }
+        Step {
+            transform: Some(json!({"a": "$"})),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn transforms_partition_segments() {
         let spec = PipelineSpec {
-            steps: vec![call("GET"), call("PUT"), transform(), call("GET"), transform()],
+            steps: vec![
+                call("GET"),
+                call("PUT"),
+                transform(),
+                call("GET"),
+                transform(),
+            ],
             ..Default::default()
         };
         let plan = plan(&spec);

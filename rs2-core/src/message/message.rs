@@ -83,7 +83,12 @@ impl MsgUrl {
             Some((p, q)) => (p.to_string(), q.to_string()),
             None => (path_and_query.to_string(), String::new()),
         };
-        MsgUrl { service_path: path.clone(), path, query, base_path: String::new() }
+        MsgUrl {
+            service_path: path.clone(),
+            path,
+            query,
+            base_path: String::new(),
+        }
     }
 
     /// First value of a query parameter, percent-decoded.
@@ -113,12 +118,18 @@ impl MsgUrl {
 
     /// Non-empty segments of the service path.
     pub fn service_segments(&self) -> Vec<&str> {
-        self.service_path.split('/').filter(|s| !s.is_empty()).collect()
+        self.service_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     /// Non-empty segments of the mount prefix (`base_path`).
     pub fn base_segments(&self) -> Vec<&str> {
-        self.base_path.split('/').filter(|s| !s.is_empty()).collect()
+        self.base_path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     /// The resource name: the last service-path segment, if any.
@@ -210,7 +221,10 @@ impl Message {
         let problem = err.to_problem_json(&self.tenant, &self.trace.trace_id);
         let mut resp = self.response(
             StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Some(Body::from_string(problem.to_string(), super::MediaType::new(PROBLEM_JSON))),
+            Some(Body::from_string(
+                problem.to_string(),
+                super::MediaType::new(PROBLEM_JSON),
+            )),
         );
         if let Some(ms) = err.retry_after_ms {
             let secs = ms.div_ceil(1000).to_string();

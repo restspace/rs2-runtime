@@ -61,8 +61,12 @@ pub async fn handle(tenant: &Tenant, msg: Message) -> Result<Message, RsError> {
 /// envelope contributes its schemas/metadata to the surface. Respects the
 /// mount's `"store": {"root"}` override via [`spec_store::store_root`].
 async fn stored_specs(tenant: &Tenant, mount: &Mount, kind_prefix: &str) -> Vec<(String, Value)> {
-    let Some((_, ctx)) = tenant.instance(&mount.base_path) else { return vec![] };
-    let Some(files) = &ctx.files else { return vec![] };
+    let Some((_, ctx)) = tenant.instance(&mount.base_path) else {
+        return vec![];
+    };
+    let Some(files) = &ctx.files else {
+        return vec![];
+    };
     let root =
         crate::services::spec_store::store_root(kind_prefix, &mount.base_path, &mount.config);
     let Ok((entries, _)) = files.list(&format!("{root}/"), 100, 0).await else {
@@ -74,8 +78,12 @@ async fn stored_specs(tenant: &Tenant, mount: &Mount, kind_prefix: &str) -> Vec<
             continue;
         }
         let name = entry.name.clone();
-        let Ok(mut body) = files.read(&format!("{root}/{name}"), None).await else { continue };
-        let Ok(bytes) = body.materialize(1024 * 1024).await else { continue };
+        let Ok(mut body) = files.read(&format!("{root}/{name}"), None).await else {
+            continue;
+        };
+        let Ok(bytes) = body.materialize(1024 * 1024).await else {
+            continue;
+        };
         if let Ok(doc) = serde_json::from_slice::<Value>(bytes) {
             out.push((name, doc));
         }
@@ -97,7 +105,10 @@ async fn code_manifest(tenant: &Tenant, mount: &Mount) -> Option<Value> {
     let (name, version) = code_ref_parts(&mount.service)?;
     let (_, ctx) = tenant.instance(&mount.base_path)?;
     let files = ctx.files.as_ref()?;
-    let path = format!("{}/{name}/{version}.manifest.json", crate::services::code::CODE_PREFIX);
+    let path = format!(
+        "{}/{name}/{version}.manifest.json",
+        crate::services::code::CODE_PREFIX
+    );
     let mut body = files.read(&path, None).await.ok()?;
     let bytes = body.materialize(1024 * 1024).await.ok()?;
     serde_json::from_slice(bytes).ok()
@@ -159,8 +170,11 @@ fn meta(mount: &Mount) -> Map<String, Value> {
     }
     // Surface the selected storage backend so a client can tell a `builtin:`
     // or `code:` adapter from the node default without reading the raw config.
-    if let Some(adapter) =
-        mount.config.get("store").and_then(|s| s.get("adapter")).filter(|a| a.is_string())
+    if let Some(adapter) = mount
+        .config
+        .get("store")
+        .and_then(|s| s.get("adapter"))
+        .filter(|a| a.is_string())
     {
         out.insert("adapter".to_string(), adapter.clone());
     }
@@ -242,7 +256,11 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
             .config
             .get("facets")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         return (pattern, facets);
     }
@@ -258,10 +276,14 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
         }
         "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
         "pipeline" => ("store-transform", vec!["any-verb"]),
-        "query" => ("store-view", vec!["positional-params", "url-params", "any-verb"]),
-        "template" => {
-            ("store-view", vec!["positional-params", "url-params", "json-props", "any-verb"])
-        }
+        "query" => (
+            "store-view",
+            vec!["positional-params", "url-params", "any-verb"],
+        ),
+        "template" => (
+            "store-view",
+            vec!["positional-params", "url-params", "json-props", "any-verb"],
+        ),
         "log" => ("view", vec!["url-params", "time-range", "trace-scoped"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
@@ -295,7 +317,11 @@ fn with_pattern(mut entry: Value, mount: &Mount) -> Value {
 /// render any path from a single round trip instead of correlating the path
 /// back to the services list itself.
 pub fn describe_mount(mount: &Mount) -> Value {
-    let base = if mount.base_path.is_empty() { "/" } else { mount.base_path.as_str() };
+    let base = if mount.base_path.is_empty() {
+        "/"
+    } else {
+        mount.base_path.as_str()
+    };
     let mut out = json!({ "path": base, "service": mount.service });
     for (k, v) in meta(mount) {
         out[k] = v;
@@ -351,19 +377,23 @@ fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
     // all). Surface its location explicitly so a generic admin client has
     // one stable entry point instead of scanning for `service ==
     // "services"`. `null` when the caller can't read such a mount.
-    let control = readable.iter().copied().find(|m| m.service == "services").map(|m| {
-        let base = m.base_path.as_str();
-        json!({
-            "path": if base.is_empty() { "/" } else { base },
-            "config": format!("{base}/raw"),
-            "catalogue": format!("{base}/catalogue"),
-            "catalogues": format!("{base}/catalogues"),
-            "available": format!("{base}/catalogue/available"),
-            "install": format!("{base}/catalogue/install"),
-            "mounts": format!("{base}/services"),
-            "code": format!("{base}/code/"),
-        })
-    });
+    let control = readable
+        .iter()
+        .copied()
+        .find(|m| m.service == "services")
+        .map(|m| {
+            let base = m.base_path.as_str();
+            json!({
+                "path": if base.is_empty() { "/" } else { base },
+                "config": format!("{base}/raw"),
+                "catalogue": format!("{base}/catalogue"),
+                "catalogues": format!("{base}/catalogues"),
+                "available": format!("{base}/catalogue/available"),
+                "install": format!("{base}/catalogue/install"),
+                "mounts": format!("{base}/services"),
+                "code": format!("{base}/code/"),
+            })
+        });
     json!({ "tenant": msg.tenant, "services": services, "control": control })
 }
 
@@ -381,7 +411,11 @@ async fn agent_surface_doc(
         if !exposed_on(mount, surface.as_deref()) {
             continue;
         }
-        let base = if mount.base_path.is_empty() { "/" } else { &mount.base_path };
+        let base = if mount.base_path.is_empty() {
+            "/"
+        } else {
+            &mount.base_path
+        };
         match mount.service.as_str() {
             "data" => {
                 let mut entry = json!({
@@ -469,8 +503,11 @@ async fn agent_surface_doc(
                     entities.push(with_pattern(entry, mount));
                 } else {
                     entry["kind"] = json!("action");
-                    entry["effect"] =
-                        mount.config.get("effect").cloned().unwrap_or(json!("unsafe"));
+                    entry["effect"] = mount
+                        .config
+                        .get("effect")
+                        .cloned()
+                        .unwrap_or(json!("unsafe"));
                     actions.push(with_pattern(entry, mount));
                 }
             }
@@ -503,7 +540,10 @@ async fn agent_surface_doc(
                 if let Some(p) = store_pattern {
                     entry["pattern"] = json!(p);
                 }
-                if store_pattern.map(|p| p.starts_with("store")).unwrap_or(false) {
+                if store_pattern
+                    .map(|p| p.starts_with("store"))
+                    .unwrap_or(false)
+                {
                     entry["kind"] = json!("entity");
                     entities.push(entry);
                 } else {
@@ -654,23 +694,38 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                 );
             }
             "auth" => {
-                paths.insert(format!("{base}/login"), json!({
-                    "post": op("Log in (sets the rs-auth cookie, returns a JWT)", "unsafe")
-                }));
-                paths.insert(format!("{base}/refresh"), json!({
-                    "post": op("Sliding session refresh", "idempotent")
-                }));
-                paths.insert(format!("{base}/logout"), json!({
-                    "post": op("Log out (clears the cookie)", "idempotent")
-                }));
-                paths.insert(format!("{base}/user"), json!({
-                    "get": op("The authenticated principal", "pure")
-                }));
+                paths.insert(
+                    format!("{base}/login"),
+                    json!({
+                        "post": op("Log in (sets the rs-auth cookie, returns a JWT)", "unsafe")
+                    }),
+                );
+                paths.insert(
+                    format!("{base}/refresh"),
+                    json!({
+                        "post": op("Sliding session refresh", "idempotent")
+                    }),
+                );
+                paths.insert(
+                    format!("{base}/logout"),
+                    json!({
+                        "post": op("Log out (clears the cookie)", "idempotent")
+                    }),
+                );
+                paths.insert(
+                    format!("{base}/user"),
+                    json!({
+                        "get": op("The authenticated principal", "pure")
+                    }),
+                );
             }
             "services" => {
-                paths.insert(format!("{base}/catalogue"), json!({
-                    "get": op("Available services and config schemas", "pure")
-                }));
+                paths.insert(
+                    format!("{base}/catalogue"),
+                    json!({
+                        "get": op("Available services and config schemas", "pure")
+                    }),
+                );
                 paths.insert(format!("{base}/raw"), json!({
                     "get": op("The tenant's raw config (ETag-versioned; secrets masked)", "pure"),
                     "put": op("Replace the tenant config (validated, atomic; If-Match)", "idempotent"),
@@ -691,7 +746,11 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                 );
             }
             "log" => {
-                let root = if base.is_empty() { "/".to_string() } else { base.clone() };
+                let root = if base.is_empty() {
+                    "/".to_string()
+                } else {
+                    base.clone()
+                };
                 paths.insert(
                     root,
                     json!({
@@ -723,8 +782,10 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                 let mut item = Map::new();
                 item.insert(
                     "description".to_string(),
-                    json!("Single inline pipeline fronting another mount; forwards the exact \
-                           path beyond the mount with ${url.rest}."),
+                    json!(
+                        "Single inline pipeline fronting another mount; forwards the exact \
+                           path beyond the mount with ${url.rest}."
+                    ),
                 );
                 for method in allowed_methods(mount) {
                     let (key, is_write, effect) = match method {
@@ -738,7 +799,14 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                     let req = if is_write { input } else { None };
                     item.insert(
                         key.to_string(),
-                        op_with_schemas("Run the wrapper pipeline", effect, req, output, JSON, JSON),
+                        op_with_schemas(
+                            "Run the wrapper pipeline",
+                            effect,
+                            req,
+                            output,
+                            JSON,
+                            JSON,
+                        ),
                     );
                 }
                 paths.insert(format!("{base}/{{path}}"), Value::Object(item));
@@ -765,8 +833,10 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                 let mut item = Map::new();
                 item.insert(
                     "description".to_string(),
-                    json!("Deployed custom-code service; the path beyond the mount is passed \
-                           to the guest. Schemas/media types come from the deploy manifest."),
+                    json!(
+                        "Deployed custom-code service; the path beyond the mount is passed \
+                           to the guest. Schemas/media types come from the deploy manifest."
+                    ),
                 );
                 for method in allowed_methods(mount) {
                     let (key, is_write, effect) = match method {
@@ -779,8 +849,14 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                     let req = if is_write { input } else { None };
                     item.insert(
                         key.to_string(),
-                        op_with_schemas("Invoke the custom-code service", effect, req, output,
-                                        req_media, resp_media),
+                        op_with_schemas(
+                            "Invoke the custom-code service",
+                            effect,
+                            req,
+                            output,
+                            req_media,
+                            resp_media,
+                        ),
                     );
                 }
                 paths.insert(format!("{base}/{{path}}"), Value::Object(item));
@@ -865,7 +941,13 @@ fn problem_schema() -> Value {
 fn schema_component_name(base: &str, dataset: &str) -> String {
     let sanitize = |s: &str| {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>()
     };
     format!("Dataset{}_{}", sanitize(base), sanitize(dataset))
@@ -905,8 +987,10 @@ fn op(summary: &str, effect: &str) -> Value {
 /// log view's JSON vs NDJSON).
 fn op_media(summary: &str, effect: &str, response_medias: &[&str]) -> Value {
     let mut op = op(summary, effect);
-    let content: Map<String, Value> =
-        response_medias.iter().map(|m| (m.to_string(), json!({}))).collect();
+    let content: Map<String, Value> = response_medias
+        .iter()
+        .map(|m| (m.to_string(), json!({})))
+        .collect();
     op["responses"]["200"] = json!({ "description": "Success", "content": content });
     op
 }

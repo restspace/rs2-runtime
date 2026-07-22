@@ -238,7 +238,11 @@ impl Executor {
         url.insert(
             "path".into(),
             Value::Array(
-                msg.url.service_segments().iter().map(|s| Value::String((*s).into())).collect(),
+                msg.url
+                    .service_segments()
+                    .iter()
+                    .map(|s| Value::String((*s).into()))
+                    .collect(),
             ),
         );
         let mut query = Map::new();
@@ -250,7 +254,10 @@ impl Executor {
         }
         url.insert("query".into(), Value::Object(query));
         vars.insert("_url".into(), Value::Object(url));
-        match self.run_pipeline(spec, msg, &mut vars, 0, "", to_step).await? {
+        match self
+            .run_pipeline(spec, msg, &mut vars, 0, "", to_step)
+            .await?
+        {
             Flow::Continue(m) | Flow::Exit(m) | Flow::Abort(m) => Ok(m),
         }
     }
@@ -276,11 +283,12 @@ impl Executor {
                 ));
             }
             match spec.mode {
-                Mode::Serial => self.run_serial(spec, msg, vars, depth, key_path, to_step).await,
-                Mode::Parallel => self.run_parallel(spec, msg, vars, depth, key_path).await,
-                Mode::Conditional => {
-                    self.run_conditional(spec, msg, vars, depth, key_path).await
+                Mode::Serial => {
+                    self.run_serial(spec, msg, vars, depth, key_path, to_step)
+                        .await
                 }
+                Mode::Parallel => self.run_parallel(spec, msg, vars, depth, key_path).await,
+                Mode::Conditional => self.run_conditional(spec, msg, vars, depth, key_path).await,
                 Mode::Tee | Mode::TeeWait => self.run_tee(spec, msg, vars, depth, key_path).await,
             }
         })
@@ -426,15 +434,27 @@ impl Executor {
             };
             match self.run_step(step, msg, vars, depth, &step_path).await? {
                 Flow::Exit(m) => {
-                    self.record(&step_path, kind, m.status.map(|s| s.as_u16()).unwrap_or(200));
+                    self.record(
+                        &step_path,
+                        kind,
+                        m.status.map(|s| s.as_u16()).unwrap_or(200),
+                    );
                     return Ok(Flow::Exit(m));
                 }
                 Flow::Abort(m) => {
-                    self.record(&step_path, kind, m.status.map(|s| s.as_u16()).unwrap_or(500));
+                    self.record(
+                        &step_path,
+                        kind,
+                        m.status.map(|s| s.as_u16()).unwrap_or(500),
+                    );
                     return Ok(Flow::Abort(m));
                 }
                 Flow::Continue(out) => {
-                    self.record(&step_path, kind, out.status.map(|s| s.as_u16()).unwrap_or(200));
+                    self.record(
+                        &step_path,
+                        kind,
+                        out.status.map(|s| s.as_u16()).unwrap_or(200),
+                    );
                     if !out.is_ok() && step.capture.is_none() && !step.try_mode {
                         match spec.fail_action() {
                             Action::Stop => return Ok(Flow::Abort(out)),
@@ -468,12 +488,14 @@ impl Executor {
         // eagerly below — so bound the aggregate footprint before fanning out.
         let body_size = msg.body.as_ref().and_then(|b| b.size).unwrap_or(0);
         self.check_fanout_budget(spec.steps.len(), body_size)?;
-        let concurrency = spec.concurrency.unwrap_or(self.limits.default_concurrency).max(1);
+        let concurrency = spec
+            .concurrency
+            .unwrap_or(self.limits.default_concurrency)
+            .max(1);
 
         // Clone branch inputs eagerly: the branch futures must not borrow
         // `msg` (`&Message` is not Sync because of stream bodies).
-        type BranchOut<'s> =
-            (usize, &'s Step, Result<Flow, RsError>, Map<String, Value>);
+        type BranchOut<'s> = (usize, &'s Step, Result<Flow, RsError>, Map<String, Value>);
         let mut branches: Vec<BoxFuture<'_, BranchOut<'_>>> = Vec::new();
         for (i, step) in spec.steps.iter().enumerate() {
             let branch_msg = try_clone(&msg);
@@ -487,13 +509,16 @@ impl Executor {
                         return (
                             i,
                             step,
-                            Err(RsError::internal("parallel branch over unmaterialized stream")),
+                            Err(RsError::internal(
+                                "parallel branch over unmaterialized stream",
+                            )),
                             branch_vars,
                         )
                     }
                 };
-                let flow =
-                    self.run_step(step, branch_msg, &mut branch_vars, depth, &step_path).await;
+                let flow = self
+                    .run_step(step, branch_msg, &mut branch_vars, depth, &step_path)
+                    .await;
                 (i, step, flow, branch_vars)
             }));
         }
@@ -525,7 +550,9 @@ impl Executor {
 
         let named: Vec<(String, Message)> = results.into_iter().flatten().collect();
         let template = clone_with_body(&msg, None);
-        let joined = self.join(spec.join.unwrap_or(Joiner::JsonObject), named, template).await?;
+        let joined = self
+            .join(spec.join.unwrap_or(Joiner::JsonObject), named, template)
+            .await?;
         Ok(Flow::Continue(joined))
     }
 
@@ -567,11 +594,21 @@ impl Executor {
         self.materialize_if_needed(&mut msg).await?;
         let branch_msg = try_clone(&msg)
             .ok_or_else(|| RsError::internal("tee branch over unmaterialized stream"))?;
-        let branch_spec = PipelineSpec { mode: Mode::Serial, ..spec.clone() };
+        let branch_spec = PipelineSpec {
+            mode: Mode::Serial,
+            ..spec.clone()
+        };
         if spec.mode == Mode::TeeWait {
             let mut branch_vars = vars.clone();
             let _ = self
-                .run_pipeline(&branch_spec, branch_msg, &mut branch_vars, depth + 1, key_path, None)
+                .run_pipeline(
+                    &branch_spec,
+                    branch_msg,
+                    &mut branch_vars,
+                    depth + 1,
+                    key_path,
+                    None,
+                )
                 .await?;
         } else {
             let executor = self.clone();
@@ -579,7 +616,14 @@ impl Executor {
             tokio::spawn(async move {
                 let mut branch_vars = Map::new();
                 let _ = executor
-                    .run_pipeline(&branch_spec, branch_msg, &mut branch_vars, depth + 1, &key_path, None)
+                    .run_pipeline(
+                        &branch_spec,
+                        branch_msg,
+                        &mut branch_vars,
+                        depth + 1,
+                        &key_path,
+                        None,
+                    )
                     .await;
             });
         }
@@ -645,7 +689,9 @@ impl Executor {
                 .headers
                 .iter()
                 .filter_map(|(k, v)| {
-                    v.to_str().ok().map(|s| (k.to_string(), Value::String(s.to_string())))
+                    v.to_str()
+                        .ok()
+                        .map(|s| (k.to_string(), Value::String(s.to_string())))
                 })
                 .collect();
             eval_vars.insert("_headers".into(), Value::Object(headers));
@@ -653,9 +699,11 @@ impl Executor {
             // the blocking pool so a heavy expression can occupy a blocking
             // thread instead of stalling a reactor worker.
             let template = template.clone();
-            let out = tokio::task::spawn_blocking(move || transform::apply(&template, &input, &eval_vars))
-                .await
-                .map_err(|e| RsError::internal(format!("transform task panicked: {e}")))??;
+            let out = tokio::task::spawn_blocking(move || {
+                transform::apply(&template, &input, &eval_vars)
+            })
+            .await
+            .map_err(|e| RsError::internal(format!("transform task panicked: {e}")))??;
             if let Some(capture) = &step.capture {
                 // Captured raw — a `$response` envelope is data here, keeping
                 // capture orthogonal to response shaping.
@@ -670,7 +718,9 @@ impl Executor {
         }
 
         if let Some(sub) = &step.pipeline {
-            let flow = self.run_pipeline(sub, msg, vars, depth + 1, key_path, None).await?;
+            let flow = self
+                .run_pipeline(sub, msg, vars, depth + 1, key_path, None)
+                .await?;
             return Ok(match flow {
                 // A subpipeline's `end` is local to it.
                 Flow::Exit(m) => Flow::Continue(m),
@@ -678,7 +728,9 @@ impl Executor {
             });
         }
 
-        Err(RsError::bad_request("step has no action (call/transform/pipeline/split)"))
+        Err(RsError::bad_request(
+            "step has no action (call/transform/pipeline/split)",
+        ))
     }
 
     async fn run_call(
@@ -766,7 +818,9 @@ impl Executor {
         let is_external = crate::outbound::is_external_url(&url);
         let target: Result<CallTarget, RsError> = if is_external {
             match &self.external {
-                Some(ext) => ext.authorize(&url).map(|g| CallTarget::External(ext.clone(), g)),
+                Some(ext) => ext
+                    .authorize(&url)
+                    .map(|g| CallTarget::External(ext.clone(), g)),
                 None => Err(RsError::capability_denied(&format!(
                     "httpOut to '{}' (this pipeline's mount has no httpOut grants)",
                     crate::outbound::url_host(&url).unwrap_or_default()
@@ -785,26 +839,26 @@ impl Executor {
         // a resolution failure aborts the step instead of being silently
         // dropped mid-flight (a dropped auth header would send the request
         // unauthenticated).
-        let headers: Option<Vec<(http::header::HeaderName, http::HeaderValue)>> =
-            match &call.headers {
-                None => None,
-                Some(spec_headers) => {
-                    let mut resolved = Vec::with_capacity(spec_headers.len());
-                    for (k, v) in spec_headers {
-                        let name = http::header::HeaderName::try_from(k.as_str()).map_err(|_| {
-                            RsError::bad_request(format!("invalid header name '{k}'"))
-                        })?;
-                        let value = path_pattern::resolve(v, &url_view, &interp_ctx)?;
-                        let value = http::HeaderValue::from_str(&value).map_err(|_| {
-                            RsError::bad_request(format!(
-                                "header '{k}' resolved to an invalid header value"
-                            ))
-                        })?;
-                        resolved.push((name, value));
-                    }
-                    Some(resolved)
+        let headers: Option<Vec<(http::header::HeaderName, http::HeaderValue)>> = match &call
+            .headers
+        {
+            None => None,
+            Some(spec_headers) => {
+                let mut resolved = Vec::with_capacity(spec_headers.len());
+                for (k, v) in spec_headers {
+                    let name = http::header::HeaderName::try_from(k.as_str())
+                        .map_err(|_| RsError::bad_request(format!("invalid header name '{k}'")))?;
+                    let value = path_pattern::resolve(v, &url_view, &interp_ctx)?;
+                    let value = http::HeaderValue::from_str(&value).map_err(|_| {
+                        RsError::bad_request(format!(
+                            "header '{k}' resolved to an invalid header value"
+                        ))
+                    })?;
+                    resolved.push((name, value));
                 }
-            };
+                Some(resolved)
+            }
+        };
         let result = match target {
             Err(e) => Err(e),
             Ok(target) => {
@@ -819,8 +873,11 @@ impl Executor {
                     if matches!(target, CallTarget::Internal(_)) {
                         req.principal = principal.clone();
                     }
-                    req.body =
-                        bodies.0.as_ref().and_then(clone_body).or_else(|| bodies.1.take());
+                    req.body = bodies
+                        .0
+                        .as_ref()
+                        .and_then(clone_body)
+                        .or_else(|| bodies.1.take());
                     if let Some(headers) = &headers {
                         for (name, value) in headers {
                             req.headers.insert(name.clone(), value.clone());
@@ -908,9 +965,11 @@ impl Executor {
             None => return Err(RsError::bad_request("jsonSplit requires a JSON body")),
         };
         let elements: Vec<(String, Value)> = match json {
-            Value::Array(items) => {
-                items.into_iter().enumerate().map(|(i, v)| (i.to_string(), v)).collect()
-            }
+            Value::Array(items) => items
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (i.to_string(), v))
+                .collect(),
             Value::Object(map) => map.into_iter().collect(),
             other => vec![("0".to_string(), other)],
         };
@@ -930,7 +989,10 @@ impl Executor {
             join: None,
             steps: spec.steps[split_index + 1..].to_vec(),
         };
-        let concurrency = spec.concurrency.unwrap_or(self.limits.default_concurrency).max(1);
+        let concurrency = spec
+            .concurrency
+            .unwrap_or(self.limits.default_concurrency)
+            .max(1);
 
         // Build element messages and futures eagerly: the element futures
         // must not borrow `msg` (`&Message` is not Sync).
@@ -947,7 +1009,14 @@ impl Executor {
                     return (name, Ok(Flow::Continue(element_msg)));
                 }
                 let flow = self
-                    .run_pipeline(rest, element_msg, &mut element_vars, depth + 1, &key_path, None)
+                    .run_pipeline(
+                        rest,
+                        element_msg,
+                        &mut element_vars,
+                        depth + 1,
+                        &key_path,
+                        None,
+                    )
                     .await;
                 (name, flow)
             }));
@@ -965,12 +1034,16 @@ impl Executor {
             named.push((name, out));
         }
         // Restore input order (buffer_unordered scrambles completion order).
-        named.sort_by(|(a, _), (b, _)| match (a.parse::<u64>(), b.parse::<u64>()) {
-            (Ok(x), Ok(y)) => x.cmp(&y),
-            _ => a.cmp(b),
-        });
+        named.sort_by(
+            |(a, _), (b, _)| match (a.parse::<u64>(), b.parse::<u64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            },
+        );
         let template = clone_with_body(&msg, None);
-        let joined = self.join(spec.join.unwrap_or(Joiner::JsonObject), named, template).await?;
+        let joined = self
+            .join(spec.join.unwrap_or(Joiner::JsonObject), named, template)
+            .await?;
         Ok(Flow::Exit(joined))
     }
 
@@ -1201,14 +1274,20 @@ mod tests {
         let msg = Message::request(http::Method::GET, "/users/ada@example.com", "t");
         let out = exec.run(&spec, msg, None).await.unwrap();
         assert!(out.is_ok());
-        assert_eq!(seen.lock().unwrap().as_slice(), &["/data/users/ada@example.com".to_string()]);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["/data/users/ada@example.com".to_string()]
+        );
     }
 
     fn parallel_transforms(n: usize) -> PipelineSpec {
         PipelineSpec {
             mode: Mode::Parallel,
             steps: (0..n)
-                .map(|_| Step { transform: Some(serde_json::json!("$_status")), ..Default::default() })
+                .map(|_| Step {
+                    transform: Some(serde_json::json!("$_status")),
+                    ..Default::default()
+                })
                 .collect(),
             ..Default::default()
         }
@@ -1223,18 +1302,30 @@ mod tests {
     #[tokio::test]
     async fn parallel_fanout_rejects_oversized_aggregate() {
         // 5 branches × a ~75-byte body = 375 bytes > the 100-byte budget.
-        let limits = PipelineLimits { max_fanout_bytes: 100, ..Default::default() };
+        let limits = PipelineLimits {
+            max_fanout_bytes: 100,
+            ..Default::default()
+        };
         let exec = Executor::new(Arc::new(NoRequester), limits, RetryPolicy::no_retry());
         let msg = body_msg(serde_json::json!({ "data": "x".repeat(60) }));
-        let err = exec.run(&parallel_transforms(5), msg, None).await.unwrap_err();
+        let err = exec
+            .run(&parallel_transforms(5), msg, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, crate::error::codes::LIMIT_EXCEEDED);
-        assert_eq!(err.extra.as_ref().unwrap()["limit"], "pipeline_fanout_bytes");
+        assert_eq!(
+            err.extra.as_ref().unwrap()["limit"],
+            "pipeline_fanout_bytes"
+        );
     }
 
     #[tokio::test]
     async fn parallel_fanout_within_budget_runs() {
-        let exec =
-            Executor::new(Arc::new(NoRequester), PipelineLimits::default(), RetryPolicy::no_retry());
+        let exec = Executor::new(
+            Arc::new(NoRequester),
+            PipelineLimits::default(),
+            RetryPolicy::no_retry(),
+        );
         let msg = body_msg(serde_json::json!({ "data": "small" }));
         let out = exec.run(&parallel_transforms(3), msg, None).await.unwrap();
         assert!(out.is_ok());

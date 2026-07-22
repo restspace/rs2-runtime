@@ -78,7 +78,12 @@ impl RsError {
     /// (the resource changed, is missing, or already exists). The standard
     /// optimistic-concurrency signal: re-read and reapply.
     pub fn precondition_failed(detail: impl Into<String>) -> Self {
-        Self::new(412, codes::PRECONDITION_FAILED, "Precondition Failed", detail)
+        Self::new(
+            412,
+            codes::PRECONDITION_FAILED,
+            "Precondition Failed",
+            detail,
+        )
     }
 
     pub fn payload_too_large(detail: impl Into<String>) -> Self {
@@ -93,7 +98,12 @@ impl RsError {
 
     /// Same `Idempotency-Key`, different request payload (PRD §7.2).
     pub fn idempotency_key_reuse(detail: impl Into<String>) -> Self {
-        Self::new(422, codes::IDEMPOTENCY_KEY_REUSE, "Idempotency Key Reuse", detail)
+        Self::new(
+            422,
+            codes::IDEMPOTENCY_KEY_REUSE,
+            "Idempotency Key Reuse",
+            detail,
+        )
     }
 
     pub fn path_unsafe(detail: impl Into<String>) -> Self {
@@ -116,7 +126,11 @@ impl RsError {
     }
 
     /// A resource limit was breached. Attributed to the tenant; retryable.
-    pub fn limit_exceeded(limit: &str, observed: impl Into<serde_json::Value>, cap: impl Into<serde_json::Value>) -> Self {
+    pub fn limit_exceeded(
+        limit: &str,
+        observed: impl Into<serde_json::Value>,
+        cap: impl Into<serde_json::Value>,
+    ) -> Self {
         let mut e = Self::new(
             503,
             codes::LIMIT_EXCEEDED,

@@ -38,7 +38,9 @@ fn runtime(file_root: &std::path::Path, mounts: serde_json::Value) -> Arc<Runtim
     );
     let loader = Arc::new(StaticLoader(json!({ "mounts": mounts })));
     Runtime::new(
-        Tenancy::Single { tenant: "t1".into() },
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
         adapters,
         loader,
         LimitTable::default(),
@@ -46,8 +48,10 @@ fn runtime(file_root: &std::path::Path, mounts: serde_json::Value) -> Arc<Runtim
 }
 
 fn put_html(path: &str, body: &str) -> Message {
-    Message::request(Method::PUT, path, "t1")
-        .with_body(Body::from_string(body.to_string(), MediaType::parse("text/html")))
+    Message::request(Method::PUT, path, "t1").with_body(Body::from_string(
+        body.to_string(),
+        MediaType::parse("text/html"),
+    ))
 }
 
 async fn get_text(rt: &Runtime, path: &str) -> (Option<StatusCode>, String) {
@@ -75,11 +79,15 @@ async fn builtin_local_file_mounts_with_different_roots_are_isolated() {
     );
 
     assert_eq!(
-        rt.handle(put_html("/html/index.html", "<h1>site</h1>")).await.status,
+        rt.handle(put_html("/html/index.html", "<h1>site</h1>"))
+            .await
+            .status,
         Some(StatusCode::CREATED)
     );
     assert_eq!(
-        rt.handle(put_html("/docs/index.html", "<h1>docs</h1>")).await.status,
+        rt.handle(put_html("/docs/index.html", "<h1>docs</h1>"))
+            .await
+            .status,
         Some(StatusCode::CREATED)
     );
 
@@ -104,6 +112,10 @@ async fn unsafe_or_missing_root_is_rejected_for_builtin_local() {
             json!([{ "path": "/f", "service": "file", "config": { "access": "open", "store": bad } }]),
         );
         let (status, _) = get_text(&rt, "/f/index.html").await;
-        assert_ne!(status, Some(StatusCode::OK), "unsafe root unexpectedly built a working mount");
+        assert_ne!(
+            status,
+            Some(StatusCode::OK),
+            "unsafe root unexpectedly built a working mount"
+        );
     }
 }

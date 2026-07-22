@@ -46,8 +46,13 @@ pub struct UrlView<'a> {
 
 impl<'a> UrlView<'a> {
     /// An empty view — for resolving data-only patterns (no URL plane).
-    pub const EMPTY: UrlView<'static> =
-        UrlView { path: &[], base: &[], name: None, query: "", rest: "" };
+    pub const EMPTY: UrlView<'static> = UrlView {
+        path: &[],
+        base: &[],
+        name: None,
+        query: "",
+        rest: "",
+    };
 }
 
 /// Resolve all `${…}` placeholders in `pattern`.
@@ -118,7 +123,10 @@ enum Expr<'a> {
 }
 
 enum UrlSel<'a> {
-    Segments { section: Section, index: Option<Index> },
+    Segments {
+        section: Section,
+        index: Option<Index>,
+    },
     Name,
     Rest,
     QueryAll,
@@ -169,9 +177,9 @@ fn parse_expr(s: &str) -> Result<Expr<'_>, String> {
 }
 
 fn parse_url_sel(s: &str) -> Result<UrlSel<'_>, String> {
-    let rest = s
-        .strip_prefix("url.")
-        .ok_or_else(|| format!("'{s}': use url.path / url.base / url.full / url.name / url.query"))?;
+    let rest = s.strip_prefix("url.").ok_or_else(|| {
+        format!("'{s}': use url.path / url.base / url.full / url.name / url.query")
+    })?;
     // Section identifier up to the first `.` or `[`.
     let head_end = rest.find(['.', '[']).unwrap_or(rest.len());
     let section = &rest[..head_end];
@@ -203,8 +211,15 @@ fn parse_url_sel(s: &str) -> Result<UrlSel<'_>, String> {
                 "base" => Section::Base,
                 _ => Section::Full,
             };
-            let index = if tail.is_empty() { None } else { Some(parse_index(tail)?) };
-            Ok(UrlSel::Segments { section: sec, index })
+            let index = if tail.is_empty() {
+                None
+            } else {
+                Some(parse_index(tail)?)
+            };
+            Ok(UrlSel::Segments {
+                section: sec,
+                index,
+            })
         }
         other => Err(format!("'{s}': unknown url section '{other}'")),
     }
@@ -232,7 +247,9 @@ fn parse_opt_int(s: &str) -> Result<Option<i64>, String> {
 }
 
 fn parse_int(s: &str) -> Result<i64, String> {
-    s.trim().parse::<i64>().map_err(|_| format!("'{s}' is not an integer index"))
+    s.trim()
+        .parse::<i64>()
+        .map_err(|_| format!("'{s}' is not an integer index"))
 }
 
 fn require_empty(tail: &str, what: &str) -> Result<(), String> {
@@ -256,10 +273,16 @@ fn eval_token(interior: &str, url: &UrlView, data: &Map<String, Value>) -> Resul
     if parsed.optional {
         return Ok(Token::Elide);
     }
-    Err(format!("'{interior}' resolved to nothing (mark it optional with `?` or give a `|| default`)"))
+    Err(format!(
+        "'{interior}' resolved to nothing (mark it optional with `?` or give a `|| default`)"
+    ))
 }
 
-fn eval_expr(expr: &Expr, url: &UrlView, data: &Map<String, Value>) -> Result<Option<String>, String> {
+fn eval_expr(
+    expr: &Expr,
+    url: &UrlView,
+    data: &Map<String, Value>,
+) -> Result<Option<String>, String> {
     match expr {
         Expr::Literal(s) => Ok(Some(s.to_string())),
         Expr::Data(path) => Ok(eval_data(path, data)),
@@ -341,7 +364,9 @@ fn query_get(query: &str, key: &str) -> Option<String> {
     query.split('&').filter(|p| !p.is_empty()).find_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         (k == key).then(|| {
-            percent_encoding::percent_decode_str(v).decode_utf8_lossy().replace('+', " ")
+            percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .replace('+', " ")
         })
     })
 }
@@ -352,7 +377,13 @@ mod tests {
     use serde_json::json;
 
     fn url<'a>(path: &'a [&'a str], base: &'a [&'a str], query: &'a str) -> UrlView<'a> {
-        UrlView { path, base, name: path.last().copied(), query, rest: "" }
+        UrlView {
+            path,
+            base,
+            name: path.last().copied(),
+            query,
+            rest: "",
+        }
     }
 
     fn r(pattern: &str, u: &UrlView) -> Result<String, RsError> {
@@ -397,15 +428,36 @@ mod tests {
     fn rest_forwards_verbatim_remainder() {
         // `${url.rest}` is the byte-exact service-path suffix, for transparent
         // forwarding: `/wrapped${url.rest}` reproduces the path beyond the mount.
-        let rest = |s: &'static str| UrlView { path: &[], base: &[], name: None, query: "", rest: s };
+        let rest = |s: &'static str| UrlView {
+            path: &[],
+            base: &[],
+            name: None,
+            query: "",
+            rest: s,
+        };
         assert_eq!(r("/wrapped${url.rest}", &rest("/")).unwrap(), "/wrapped/");
         assert_eq!(r("/wrapped${url.rest}", &rest("/x")).unwrap(), "/wrapped/x");
-        assert_eq!(r("/wrapped${url.rest}", &rest("/a/b")).unwrap(), "/wrapped/a/b");
+        assert_eq!(
+            r("/wrapped${url.rest}", &rest("/a/b")).unwrap(),
+            "/wrapped/a/b"
+        );
         // Trailing slash within a sub-path is preserved.
-        assert_eq!(r("/wrapped${url.rest}", &rest("/a/b/")).unwrap(), "/wrapped/a/b/");
+        assert_eq!(
+            r("/wrapped${url.rest}", &rest("/a/b/")).unwrap(),
+            "/wrapped/a/b/"
+        );
         // Combined with the query (forwarded separately, as documented).
-        let u = UrlView { path: &[], base: &[], name: None, query: "p=1", rest: "/a" };
-        assert_eq!(r("/wrapped${url.rest}?${url.query}", &u).unwrap(), "/wrapped/a?p=1");
+        let u = UrlView {
+            path: &[],
+            base: &[],
+            name: None,
+            query: "p=1",
+            rest: "/a",
+        };
+        assert_eq!(
+            r("/wrapped${url.rest}?${url.query}", &u).unwrap(),
+            "/wrapped/a?p=1"
+        );
     }
 
     #[test]
@@ -450,8 +502,14 @@ mod tests {
     fn data_plane_unchanged() {
         let data = json!({ "id": "o1", "order": { "customerId": 7 } });
         let data = data.as_object().unwrap();
-        assert_eq!(resolve("/orders/${id}", &UrlView::EMPTY, data).unwrap(), "/orders/o1");
-        assert_eq!(resolve("/c/${order.customerId}", &UrlView::EMPTY, data).unwrap(), "/c/7");
+        assert_eq!(
+            resolve("/orders/${id}", &UrlView::EMPTY, data).unwrap(),
+            "/orders/o1"
+        );
+        assert_eq!(
+            resolve("/c/${order.customerId}", &UrlView::EMPTY, data).unwrap(),
+            "/c/7"
+        );
         assert!(resolve("/x/${missing}", &UrlView::EMPTY, data).is_err());
         assert!(resolve("/x/${unclosed", &UrlView::EMPTY, data).is_err());
     }

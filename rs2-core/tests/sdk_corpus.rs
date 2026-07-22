@@ -15,7 +15,9 @@ use std::time::Duration;
 use http::{Method, StatusCode};
 use serde_json::json;
 
-use rs2_core::contract::{CapabilityTarget, Engine, GrantedHost, HostApi, InvocationLimits, ServiceCode};
+use rs2_core::contract::{
+    CapabilityTarget, Engine, GrantedHost, HostApi, InvocationLimits, ServiceCode,
+};
 use rs2_core::engines::js::JsEngine;
 use rs2_core::message::Message;
 
@@ -123,7 +125,11 @@ async fn real_sdk_corpus_meets_g5() {
             name.strip_suffix(".mjs").map(String::from)
         })
         .collect();
-    assert!(entries.len() >= 10, "curated corpus has {} entries", entries.len());
+    assert!(
+        entries.len() >= 10,
+        "curated corpus has {} entries",
+        entries.len()
+    );
 
     let engine = JsEngine::new();
     let mut passed = Vec::new();
@@ -156,7 +162,13 @@ async fn real_sdk_corpus_meets_g5() {
             .await;
         match result {
             Ok(mut resp) if resp.status == Some(StatusCode::OK) => {
-                let body = resp.body.as_mut().unwrap().as_json(1024 * 1024).await.unwrap();
+                let body = resp
+                    .body
+                    .as_mut()
+                    .unwrap()
+                    .as_json(1024 * 1024)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     body["sdk"].as_str(),
                     Some(name.as_str()),
@@ -167,8 +179,10 @@ async fn real_sdk_corpus_meets_g5() {
             }
             Ok(mut resp) => {
                 let detail = match &mut resp.body {
-                    Some(b) => String::from_utf8_lossy(b.materialize(65536).await.unwrap_or(&Default::default()))
-                        .into_owned(),
+                    Some(b) => String::from_utf8_lossy(
+                        b.materialize(65536).await.unwrap_or(&Default::default()),
+                    )
+                    .into_owned(),
                     None => String::new(),
                 };
                 println!("FAIL {name:<10} status {:?}: {detail}", resp.status);

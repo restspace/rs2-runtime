@@ -27,10 +27,17 @@ impl ConfigLoader for StaticLoader {
 }
 
 fn rt(file_root: &std::path::Path, mounts: serde_json::Value) -> Arc<Runtime> {
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(file_root)), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(file_root)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({ "mounts": mounts })));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 fn req(method: Method, path: &str) -> Message {
@@ -79,7 +86,10 @@ async fn each_action_is_gated_independently() {
         denial(&rt, req(Method::POST, "/x/things/")).await,
         Some(StatusCode::UNAUTHORIZED)
     );
-    assert_eq!(denial(&rt, as_role(req(Method::POST, "/x/things/"), "E")).await, None);
+    assert_eq!(
+        denial(&rt, as_role(req(Method::POST, "/x/things/"), "E")).await,
+        None
+    );
     assert_eq!(
         denial(&rt, as_role(req(Method::POST, "/x/things/"), "U")).await,
         Some(StatusCode::FORBIDDEN)
@@ -89,7 +99,10 @@ async fn each_action_is_gated_independently() {
         denial(&rt, as_role(req(Method::PUT, "/x/things/k"), "U")).await,
         Some(StatusCode::FORBIDDEN)
     );
-    assert_eq!(denial(&rt, as_role(req(Method::PUT, "/x/things/k"), "A")).await, None);
+    assert_eq!(
+        denial(&rt, as_role(req(Method::PUT, "/x/things/k"), "A")).await,
+        None
+    );
 }
 
 #[tokio::test]
@@ -113,7 +126,10 @@ async fn delete_and_invoke_default_to_write_and_read_defaults_open() {
         denial(&rt, as_role(req(Method::DELETE, "/y/things/k"), "U")).await,
         Some(StatusCode::FORBIDDEN)
     );
-    assert_eq!(denial(&rt, as_role(req(Method::DELETE, "/y/things/k"), "A")).await, None);
+    assert_eq!(
+        denial(&rt, as_role(req(Method::DELETE, "/y/things/k"), "A")).await,
+        None
+    );
     // invoke defaults to write ("A"): anonymous POST must authenticate.
     assert_eq!(
         denial(&rt, req(Method::POST, "/y/things/")).await,

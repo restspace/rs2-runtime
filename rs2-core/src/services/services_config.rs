@@ -209,14 +209,19 @@ impl ServicesService {
                         (vec![], 0)
                     }
                     Err(e) if e.code == crate::error::codes::NOT_FOUND => {
-                        return Err(RsError::not_found(format!("no deployed code '{}'", rest[0])))
+                        return Err(RsError::not_found(format!(
+                            "no deployed code '{}'",
+                            rest[0]
+                        )))
                     }
                     Err(e) => return Err(e),
                 };
                 // Annotate version entries with where the live config
                 // mounts them (extra entry fields are contract-legal).
-                let mut listing_entries: Vec<serde_json::Value> =
-                    entries.drain(..).map(|e| serde_json::to_value(e).unwrap()).collect();
+                let mut listing_entries: Vec<serde_json::Value> = entries
+                    .drain(..)
+                    .map(|e| serde_json::to_value(e).unwrap())
+                    .collect();
                 if let [name] = rest {
                     if let Ok((config, _)) = control.raw_config(&msg.tenant).await {
                         let live = mounted(&config, name);
@@ -270,7 +275,9 @@ impl ServicesService {
                         return Ok(resp);
                     }
                 }
-                Err(RsError::not_found(format!("no deployed code '{name}@{version}'")))
+                Err(RsError::not_found(format!(
+                    "no deployed code '{name}@{version}'"
+                )))
             }
 
             // ---- deploy: keyless POST to a bundle's container ----
@@ -304,8 +311,10 @@ impl ServicesService {
             // ---- PUT child: only at its true content-derived name ----
             (&http::Method::PUT, [name, version]) => {
                 let (name, version) = (name.to_string(), version.to_string());
-                let stem =
-                    version.trim_end_matches(".wasm").trim_end_matches(".js").to_string();
+                let stem = version
+                    .trim_end_matches(".wasm")
+                    .trim_end_matches(".js")
+                    .to_string();
                 let manifest = msg.header("x-rs2-manifest").map(str::to_string);
                 let (bytes, is_js, _) = self.validate_bundle(&mut msg, ctx).await?;
                 let computed = super::code::version_of(&bytes);
@@ -319,7 +328,11 @@ impl ServicesService {
                 if let Some(manifest) = manifest {
                     Self::store_manifest(&files, &name, &stem, &manifest).await?;
                 }
-                let child = if is_js { format!("{stem}.js") } else { format!("{stem}.wasm") };
+                let child = if is_js {
+                    format!("{stem}.js")
+                } else {
+                    format!("{stem}.wasm")
+                };
                 let created = files
                     .write(
                         &format!("/{name}/{child}"),
@@ -330,7 +343,11 @@ impl ServicesService {
                     )
                     .await?;
                 let mut resp = msg.response(
-                    if created { http::StatusCode::CREATED } else { http::StatusCode::OK },
+                    if created {
+                        http::StatusCode::CREATED
+                    } else {
+                        http::StatusCode::OK
+                    },
                     None,
                 );
                 resp.set_header("etag", &format!("\"{stem}\""));
@@ -358,7 +375,9 @@ impl ServicesService {
                         return Ok(msg.no_content());
                     }
                 }
-                Err(RsError::not_found(format!("no deployed code '{name}@{stem}'")))
+                Err(RsError::not_found(format!(
+                    "no deployed code '{name}@{stem}'"
+                )))
             }
             (&http::Method::DELETE, [name]) => {
                 let (config, _) = control.raw_config(&msg.tenant).await?;
@@ -396,7 +415,10 @@ impl ServicesService {
             .map(|b| b.media_type.essence().contains("javascript"))
             .unwrap_or(false);
         let bytes = match &mut msg.body {
-            Some(b) => b.materialize(ctx.limits.materialized_body_bytes).await?.clone(),
+            Some(b) => b
+                .materialize(ctx.limits.materialized_body_bytes)
+                .await?
+                .clone(),
             None => return Err(RsError::bad_request("deploying requires a bundle body")),
         };
         let validated = Self::compile_check_bytes(&bytes, is_js)?;
@@ -494,8 +516,11 @@ impl ServicesService {
                     .filter_map(|c| {
                         let name = c.get("name")?.as_str()?;
                         let url = c.get("url")?.as_str()?;
-                        let allowlisted =
-                            ctx.catalogue.as_ref().map(|cl| cl.host_allowed(url)).unwrap_or(false);
+                        let allowlisted = ctx
+                            .catalogue
+                            .as_ref()
+                            .map(|cl| cl.host_allowed(url))
+                            .unwrap_or(false);
                         Some(serde_json::json!({
                             "name": name,
                             "url": url,
@@ -538,9 +563,11 @@ impl ServicesService {
         }
         // Built-in adapters (selectable as `builtin:<name>`).
         if let Some(reg) = &ctx.builtin_adapters {
-            for (adapter_kind, names) in
-                [("data", reg.data_names()), ("file", reg.files_names()), ("query", reg.query_names())]
-            {
+            for (adapter_kind, names) in [
+                ("data", reg.data_names()),
+                ("file", reg.files_names()),
+                ("query", reg.query_names()),
+            ] {
                 for name in names {
                     items.push(serde_json::json!({
                         "name": name,
@@ -556,7 +583,10 @@ impl ServicesService {
         // Remote catalogue items.
         if let Some(client) = &ctx.catalogue {
             let (config, _) = control.raw_config(&msg.tenant).await?;
-            let code_store = ctx.files.as_ref().map(|f| f.prefixed(super::code::CODE_PREFIX));
+            let code_store = ctx
+                .files
+                .as_ref()
+                .map(|f| f.prefixed(super::code::CODE_PREFIX));
             if let Some(cats) = config.get("catalogues").and_then(|c| c.as_array()) {
                 for c in cats {
                     let (Some(cat_name), Some(url)) = (
@@ -572,7 +602,10 @@ impl ServicesService {
                                     Some(store) => {
                                         let ext = if item.engine == "js" { "js" } else { "wasm" };
                                         store
-                                            .head(&format!("/{}/{}.{}", item.name, item.version, ext))
+                                            .head(&format!(
+                                                "/{}/{}.{}",
+                                                item.name, item.version, ext
+                                            ))
                                             .await
                                             .is_ok()
                                     }
@@ -584,7 +617,10 @@ impl ServicesService {
                                     obj.insert("source".into(), serde_json::json!("catalogue"));
                                     obj.insert(
                                         "ref".into(),
-                                        serde_json::json!(format!("code:{}@{}", item.name, item.version)),
+                                        serde_json::json!(format!(
+                                            "code:{}@{}",
+                                            item.name, item.version
+                                        )),
                                     );
                                     obj.insert("installed".into(), serde_json::json!(installed));
                                 }
@@ -641,7 +677,8 @@ impl ServicesService {
             .get("catalogues")
             .and_then(|c| c.as_array())
             .and_then(|arr| {
-                arr.iter().find(|c| c.get("name").and_then(|v| v.as_str()) == Some(&cat_name))
+                arr.iter()
+                    .find(|c| c.get("name").and_then(|v| v.as_str()) == Some(&cat_name))
             })
             .and_then(|c| c.get("url"))
             .and_then(|v| v.as_str())
@@ -659,7 +696,10 @@ impl ServicesService {
                 ))
             })?;
         if item.name.is_empty() || item.name.contains(['/', '\\', '.']) {
-            return Err(RsError::bad_request(format!("invalid code bundle name '{}'", item.name)));
+            return Err(RsError::bad_request(format!(
+                "invalid code bundle name '{}'",
+                item.name
+            )));
         }
 
         // Fetch (allowlist enforced inside the client) and pin by content hash.
@@ -695,8 +735,12 @@ impl ServicesService {
 #[async_trait]
 impl Service for ServicesService {
     async fn handle(&self, mut msg: Message, ctx: &ServiceContext) -> Result<Message, RsError> {
-        let segments: Vec<String> =
-            msg.url.service_segments().iter().map(|s| s.to_string()).collect();
+        let segments: Vec<String> = msg
+            .url
+            .service_segments()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let segments: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
         let control = ctx
             .control
@@ -708,7 +752,9 @@ impl Service for ServicesService {
         // with the `content-addressed` facet: child names derive from
         // content, so deploy = keyless POST and PUT must name the true hash.
         if segments.first() == Some(&"code") {
-            return self.handle_code_store(msg, ctx, &control, &segments[1..]).await;
+            return self
+                .handle_code_store(msg, ctx, &control, &segments[1..])
+                .await;
         }
 
         match (&msg.method, segments.as_slice()) {
@@ -762,7 +808,8 @@ impl Service for ServicesService {
                     .into_iter()
                     .map(|(name, def)| {
                         // Provided keys only — values (incl. secrets) stay hidden.
-                        let mut provided: Vec<&str> = def.config.keys().map(|k| k.as_str()).collect();
+                        let mut provided: Vec<&str> =
+                            def.config.keys().map(|k| k.as_str()).collect();
                         provided.sort();
                         serde_json::json!({
                             "name": name,
@@ -802,7 +849,9 @@ impl Service for ServicesService {
                 let if_match = msg
                     .header("if-match")
                     .map(|v| v.trim().trim_matches('"').to_string());
-                let version = control.put_config(&msg.tenant, body, if_match.as_deref()).await?;
+                let version = control
+                    .put_config(&msg.tenant, body, if_match.as_deref())
+                    .await?;
                 let mut resp = msg.no_content();
                 resp.set_header("etag", &format!("\"{version}\""));
                 Ok(resp)

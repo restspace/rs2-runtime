@@ -20,7 +20,10 @@ impl Client {
     /// `host` is the base URL (no trailing slash); `token`, when present, is
     /// sent as `Authorization: Bearer`.
     pub fn new(host: impl Into<String>, token: Option<String>) -> Self {
-        Self { host: host.into(), token }
+        Self {
+            host: host.into(),
+            token,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -52,7 +55,9 @@ impl Client {
         bytes: &[u8],
         if_match: Option<&str>,
     ) -> Result<Response, String> {
-        let mut req = self.auth(ureq::put(&self.url(path))).set("content-type", content_type);
+        let mut req = self
+            .auth(ureq::put(&self.url(path)))
+            .set("content-type", content_type);
         if let Some(tag) = if_match {
             req = req.set("if-match", tag);
         }
@@ -77,7 +82,9 @@ impl Client {
 
     pub fn post_json(&self, path: &str, value: &serde_json::Value) -> Result<Response, String> {
         let body = serde_json::to_vec(value).map_err(|e| format!("cannot serialize body: {e}"))?;
-        let req = self.auth(ureq::post(&self.url(path))).set("content-type", "application/json");
+        let req = self
+            .auth(ureq::post(&self.url(path)))
+            .set("content-type", "application/json");
         finish(req.send_bytes(&body))
     }
 

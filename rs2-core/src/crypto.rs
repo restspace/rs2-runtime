@@ -23,7 +23,10 @@ pub fn from_hex(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// HMAC of `message` under `key` for `sha256`/`sha512`; `None` on unknown algo.
@@ -46,7 +49,9 @@ pub fn hmac_bytes(algorithm: &str, key: &[u8], message: &[u8]) -> Option<Vec<u8>
 /// Constant-time HMAC verification against a hex signature. Any malformed input
 /// (unknown algorithm, non-hex signature) → `false`.
 pub fn hmac_verify(algorithm: &str, key: &[u8], message: &[u8], signature_hex: &str) -> bool {
-    let Some(provided) = from_hex(signature_hex) else { return false };
+    let Some(provided) = from_hex(signature_hex) else {
+        return false;
+    };
     match algorithm {
         "sha256" => match Hmac::<Sha256>::new_from_slice(key) {
             Ok(mut mac) => {

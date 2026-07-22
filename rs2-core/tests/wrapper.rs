@@ -46,7 +46,12 @@ fn req(method: Method, path: &str) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(10 * 1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(10 * 1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 /// A wrapper whose inline pipeline forwards to `/data${url.rest}` reproduces the
@@ -94,7 +99,12 @@ async fn wrapper_without_access_is_denied() {
     });
     let rt = runtime(config, dir.path());
     let resp = rt.handle(req(Method::GET, "/wrapper/x")).await;
-    assert_eq!(resp.status, Some(StatusCode::UNAUTHORIZED), "{:?}", resp.body);
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::UNAUTHORIZED),
+        "{:?}",
+        resp.body
+    );
 }
 
 /// A config-declared `pattern`/`facets` surface in the discovery catalogue —
@@ -114,7 +124,9 @@ async fn wrapper_declares_discovery_pattern() {
         ]
     });
     let rt = runtime(config, dir.path());
-    let mut resp = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
+    let mut resp = rt
+        .handle(req(Method::GET, "/.well-known/rs2/services"))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
     let doc = body_json(&mut resp).await;
     let wrapper = doc["services"]
@@ -124,8 +136,12 @@ async fn wrapper_declares_discovery_pattern() {
         .find(|s| s["path"] == "/wrapper")
         .expect("wrapper in catalogue");
     assert_eq!(wrapper["pattern"], "store");
-    let facets: Vec<&str> =
-        wrapper["facets"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+    let facets: Vec<&str> = wrapper["facets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
     assert!(facets.contains(&"schema"), "facets: {facets:?}");
 }
 
@@ -172,9 +188,15 @@ async fn wrapper_hashing_store_facade() {
     let mut got = rt.handle(req(Method::GET, "/users/ada@example.com")).await;
     assert_eq!(got.status, Some(StatusCode::OK), "{:?}", got.body);
     let rec = body_json(&mut got).await;
-    assert!(rec.get("password").is_none(), "plaintext must not be stored: {rec}");
     assert!(
-        rec["passwordHash"].as_str().unwrap_or("").starts_with("$argon2"),
+        rec.get("password").is_none(),
+        "plaintext must not be stored: {rec}"
+    );
+    assert!(
+        rec["passwordHash"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("$argon2"),
         "argon2id hash expected: {rec}"
     );
     assert_eq!(rec["roles"], "U");
@@ -216,38 +238,65 @@ async fn wrapper_input_schema_enforced_and_surfaced() {
     // A body that violates inputSchema is rejected 422 before the pipeline runs.
     let bad = req(Method::PUT, "/things/widgets/x").with_json(&json!({ "nope": 1 }));
     let mut bad_resp = rt.handle(bad).await;
-    assert_eq!(bad_resp.status, Some(StatusCode::UNPROCESSABLE_ENTITY), "{:?}", bad_resp.body);
+    assert_eq!(
+        bad_resp.status,
+        Some(StatusCode::UNPROCESSABLE_ENTITY),
+        "{:?}",
+        bad_resp.body
+    );
     let problem = body_json(&mut bad_resp).await;
-    assert!(problem["errors"].is_array(), "422 carries an errors array: {problem}");
+    assert!(
+        problem["errors"].is_array(),
+        "422 carries an errors array: {problem}"
+    );
 
     // A valid body passes through to the wrapped store.
     let good = req(Method::PUT, "/things/widgets/x").with_json(&json!({ "name": "ok" }));
     let good_status = rt.handle(good).await.status;
-    assert!(matches!(good_status, Some(StatusCode::OK) | Some(StatusCode::CREATED)), "{good_status:?}");
+    assert!(
+        matches!(
+            good_status,
+            Some(StatusCode::OK) | Some(StatusCode::CREATED)
+        ),
+        "{good_status:?}"
+    );
 
     // Discovery catalogue carries both schemas on the wrapper entry.
-    let mut svcs = rt.handle(req(Method::GET, "/.well-known/rs2/services")).await;
+    let mut svcs = rt
+        .handle(req(Method::GET, "/.well-known/rs2/services"))
+        .await;
     let doc = body_json(&mut svcs).await;
-    let entry = doc["services"].as_array().unwrap().iter()
-        .find(|s| s["path"] == "/things").expect("wrapper entry");
+    let entry = doc["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["path"] == "/things")
+        .expect("wrapper entry");
     assert_eq!(entry["inputSchema"]["required"][0], "name");
     assert!(entry["outputSchema"].is_object());
 
     // OpenAPI: the wrapper path's PUT carries the inputSchema as a requestBody.
-    let mut oapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let mut oapi = rt
+        .handle(req(Method::GET, "/.well-known/rs2/openapi"))
+        .await;
     let api = body_json(&mut oapi).await;
     let put = &api["paths"]["/things/{path}"]["put"];
     assert_eq!(
-        put["requestBody"]["content"]["application/json"]["schema"]["required"][0],
-        "name",
+        put["requestBody"]["content"]["application/json"]["schema"]["required"][0], "name",
         "openapi requestBody schema: {api}"
     );
 
     // Agent surface: a store-pattern wrapper is an entity carrying the schemas.
-    let mut agent = rt.handle(req(Method::GET, "/.well-known/rs2/agent-surface")).await;
+    let mut agent = rt
+        .handle(req(Method::GET, "/.well-known/rs2/agent-surface"))
+        .await;
     let surface = body_json(&mut agent).await;
-    let ent = surface["entities"].as_array().unwrap().iter()
-        .find(|e| e["path"] == "/things").expect("wrapper entity on agent surface");
+    let ent = surface["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "/things")
+        .expect("wrapper entity on agent surface");
     assert_eq!(ent["kind"], "entity");
     assert!(ent["inputSchema"].is_object());
 }

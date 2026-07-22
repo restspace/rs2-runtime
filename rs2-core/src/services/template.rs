@@ -53,7 +53,10 @@ pub struct TemplateService {
 
 impl TemplateService {
     pub fn from_config(_config: &Value, store: SpecStore) -> Result<Self, RsError> {
-        Ok(TemplateService { store, cache: Mutex::new(HashMap::new()) })
+        Ok(TemplateService {
+            store,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     /// The write-time validator: the envelope must carry a non-empty compiled
@@ -61,13 +64,15 @@ impl TemplateService {
     /// first render — V8 compilation needs an isolate, which the sync validator
     /// has no access to.)
     pub fn validator() -> super::spec_store::SpecValidator {
-        Arc::new(|doc: &Value| match doc.get("source").and_then(|s| s.as_str()) {
-            Some(s) if !s.trim().is_empty() => Ok(doc.clone()),
-            _ => Err(RsError::bad_request(
-                "template envelope must be a JSON object with a non-empty \"source\" string \
+        Arc::new(
+            |doc: &Value| match doc.get("source").and_then(|s| s.as_str()) {
+                Some(s) if !s.trim().is_empty() => Ok(doc.clone()),
+                _ => Err(RsError::bad_request(
+                    "template envelope must be a JSON object with a non-empty \"source\" string \
                  (the compiled bundle from `rs2 template build`)",
-            )),
-        })
+                )),
+            },
+        )
     }
 
     /// The resident isolate for a template, reused while its version matches.
@@ -107,8 +112,12 @@ impl Service for TemplateService {
         }
 
         // ---- render: any verb, longest stored prefix ----
-        let segments: Vec<String> =
-            msg.url.service_segments().iter().map(|s| s.to_string()).collect();
+        let segments: Vec<String> = msg
+            .url
+            .service_segments()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let Some((doc, split)) = self.store.resolve(&segments).await? else {
             return Err(RsError::not_found(format!(
                 "no template matches '{}' (author one at {}{}/…)",
@@ -138,25 +147,29 @@ impl Service for TemplateService {
             Some(b) => match b.as_json(ctx.limits.materialized_body_bytes).await? {
                 Value::Object(named) => props.extend(named),
                 Value::Null => {}
-                _ => {
-                    return Err(RsError::bad_request(
-                        "template props must be a JSON object",
-                    ))
-                }
+                _ => return Err(RsError::bad_request("template props must be a JSON object")),
             },
         }
 
         // Build (or reuse) the isolate for this template version and render.
-        let key = if split == 0 { ROOT_SPEC.to_string() } else { segments[..split].join("/") };
+        let key = if split == 0 {
+            ROOT_SPEC.to_string()
+        } else {
+            segments[..split].join("/")
+        };
         let version = version_of(&source);
-        let adapter =
-            self.adapter_for(&key, &version, source, &msg.tenant, ctx.limits.clone());
-        let (status, body) = adapter.call("POST", "/", Some(Value::Object(props))).await?;
+        let adapter = self.adapter_for(&key, &version, source, &msg.tenant, ctx.limits.clone());
+        let (status, body) = adapter
+            .call("POST", "/", Some(Value::Object(props)))
+            .await?;
         let html = body.as_str().ok_or_else(|| {
             RsError::contract_violation("template render did not return a string body")
         })?;
 
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
-        Ok(msg.response(status, Some(Body::from_string(html, MediaType::parse(&content_type)))))
+        Ok(msg.response(
+            status,
+            Some(Body::from_string(html, MediaType::parse(&content_type))),
+        ))
     }
 }

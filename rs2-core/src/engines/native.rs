@@ -34,7 +34,11 @@ impl Engine for NativeEngine {
     ) -> Result<Message, RsError> {
         let handler = match code {
             ServiceCode::Native(h) => h.clone(),
-            _ => return Err(RsError::engine_unavailable("native engine only runs native handlers")),
+            _ => {
+                return Err(RsError::engine_unavailable(
+                    "native engine only runs native handlers",
+                ))
+            }
         };
         let fut = handler(msg, config.clone(), host);
         match tokio::time::timeout(limits.wall_clock, fut).await {

@@ -47,7 +47,9 @@ fn test_runtime(file_root: &std::path::Path) -> Arc<Runtime> {
             "extensionPriority": ["html", "md"] } }
     ]})));
     Runtime::new(
-        Tenancy::Single { tenant: "t1".into() },
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
         adapters,
         loader,
         LimitTable::default(),
@@ -70,11 +72,21 @@ async fn put(rt: &Runtime, path: &str, content: &str, mt: &str) -> Message {
 }
 
 async fn put_ok(rt: &Runtime, path: &str, content: &str, mt: &str) {
-    assert_eq!(put(rt, path, content, mt).await.status, Some(StatusCode::CREATED), "{path}");
+    assert_eq!(
+        put(rt, path, content, mt).await.status,
+        Some(StatusCode::CREATED),
+        "{path}"
+    );
 }
 
 async fn body_of(resp: &mut Message) -> Vec<u8> {
-    resp.body.as_mut().unwrap().materialize(65536).await.unwrap().to_vec()
+    resp.body
+        .as_mut()
+        .unwrap()
+        .materialize(65536)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -85,8 +97,14 @@ async fn friendly_url_resolves_and_advertises_real_path() {
 
     let mut resp = rt.handle(req(Method::GET, "/friendly/docs/readme")).await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.body.as_ref().unwrap().media_type.essence(), "text/markdown");
-    assert_eq!(resp.header("content-location"), Some("/friendly/docs/readme.md"));
+    assert_eq!(
+        resp.body.as_ref().unwrap().media_type.essence(),
+        "text/markdown"
+    );
+    assert_eq!(
+        resp.header("content-location"),
+        Some("/friendly/docs/readme.md")
+    );
     assert_eq!(&body_of(&mut resp).await[..], b"# hello");
 }
 
@@ -99,18 +117,25 @@ async fn collision_resolved_by_accept_then_priority() {
     put_ok(&rt, "/friendly/page.html", "<h1>html</h1>", "text/html").await;
 
     // Accept prefers HTML.
-    let mut html = rt.handle(req_accept(Method::GET, "/friendly/page", "text/html")).await;
+    let mut html = rt
+        .handle(req_accept(Method::GET, "/friendly/page", "text/html"))
+        .await;
     assert_eq!(html.header("content-location"), Some("/friendly/page.html"));
     assert_eq!(&body_of(&mut html).await[..], b"<h1>html</h1>");
 
     // Accept prefers markdown.
-    let mut md = rt.handle(req_accept(Method::GET, "/friendly/page", "text/markdown")).await;
+    let mut md = rt
+        .handle(req_accept(Method::GET, "/friendly/page", "text/markdown"))
+        .await;
     assert_eq!(md.header("content-location"), Some("/friendly/page.md"));
     assert_eq!(&body_of(&mut md).await[..], b"# md");
 
     // No Accept → priority order (html is E1).
     let plain = rt.handle(req(Method::GET, "/friendly/page")).await;
-    assert_eq!(plain.header("content-location"), Some("/friendly/page.html"));
+    assert_eq!(
+        plain.header("content-location"),
+        Some("/friendly/page.html")
+    );
 }
 
 #[tokio::test]
@@ -145,10 +170,15 @@ async fn pin_not_dislodged_by_later_sibling() {
 
     // No-Accept GET still returns the pinned html — not dislodged.
     let plain = rt.handle(req(Method::GET, "/friendly/page")).await;
-    assert_eq!(plain.header("content-location"), Some("/friendly/page.html"));
+    assert_eq!(
+        plain.header("content-location"),
+        Some("/friendly/page.html")
+    );
 
     // An explicit Accept is the caller opting out — they may get the sibling.
-    let md = rt.handle(req_accept(Method::GET, "/friendly/page", "text/markdown")).await;
+    let md = rt
+        .handle(req_accept(Method::GET, "/friendly/page", "text/markdown"))
+        .await;
     assert_eq!(md.header("content-location"), Some("/friendly/page.md"));
 }
 
@@ -252,6 +282,9 @@ async fn head_resolves_friendly() {
     let resp = rt.handle(req(Method::HEAD, "/friendly/docs/readme")).await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     assert_eq!(resp.header("content-type"), Some("text/markdown"));
-    assert_eq!(resp.header("content-location"), Some("/friendly/docs/readme.md"));
+    assert_eq!(
+        resp.header("content-location"),
+        Some("/friendly/docs/readme.md")
+    );
     assert_eq!(resp.header("content-length"), Some("7"));
 }

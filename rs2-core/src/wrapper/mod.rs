@@ -717,12 +717,21 @@ mod tests {
         };
         let spec = "authenticated /{accountId} A";
         // Own-account subtree matches; another account's does not.
-        assert!(satisfies_role_spec(spec, &user(Some("acc1"), "/acc1/photo.jpg")));
-        assert!(!satisfies_role_spec(spec, &user(Some("acc1"), "/acc2/photo.jpg")));
+        assert!(satisfies_role_spec(
+            spec,
+            &user(Some("acc1"), "/acc1/photo.jpg")
+        ));
+        assert!(!satisfies_role_spec(
+            spec,
+            &user(Some("acc1"), "/acc2/photo.jpg")
+        ));
         // No claim → the placeholder stays verbatim → fail closed.
         assert!(!satisfies_role_spec(spec, &user(None, "/acc1/photo.jpg")));
         // `{email}` keeps resolving from the principal id.
-        assert!(satisfies_role_spec("U /{email}", &user(None, "/u1@x.com/inbox")));
+        assert!(satisfies_role_spec(
+            "U /{email}",
+            &user(None, "/u1@x.com/inbox")
+        ));
     }
 
     #[test]

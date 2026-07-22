@@ -15,7 +15,11 @@ mod scaffold;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "rs2", version, about = "RS2 sandboxed composable-service runtime CLI")]
+#[command(
+    name = "rs2",
+    version,
+    about = "RS2 sandboxed composable-service runtime CLI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -266,23 +270,36 @@ fn dispatch(command: Command) -> Result<(), String> {
         Command::New { name, js } => scaffold::new_service(&name, js),
         Command::Dev { config } => {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(rs2_server::run(&config)).map_err(|e| e.to_string())
+            rt.block_on(rs2_server::run(&config))
+                .map_err(|e| e.to_string())
         }
         Command::Test { path, component } => test_service(&path, component.as_deref()),
-        Command::Deploy { component, name, server, token, bundle } => {
-            (if bundle { esbuild(&component) } else { Ok(component) })
-                .and_then(|artifact| deploy(&artifact, &name, &server, token.as_deref()))
-        }
+        Command::Deploy {
+            component,
+            name,
+            server,
+            token,
+            bundle,
+        } => (if bundle {
+            esbuild(&component)
+        } else {
+            Ok(component)
+        })
+        .and_then(|artifact| deploy(&artifact, &name, &server, token.as_deref())),
         Command::Template { action } => match action {
             TemplateCommand::Build { entry, out } => template_build(&entry, out.as_deref()),
         },
         Command::Migrate { input, output } => migrate::migrate(&input, &output),
-        Command::Login { host, email, password } => {
-            commands::login(host.as_deref(), email.as_deref(), password.as_deref())
-        }
-        Command::Send { path, file, content_type } => {
-            commands::send(&path, &file, content_type.as_deref())
-        }
+        Command::Login {
+            host,
+            email,
+            password,
+        } => commands::login(host.as_deref(), email.as_deref(), password.as_deref()),
+        Command::Send {
+            path,
+            file,
+            content_type,
+        } => commands::send(&path, &file, content_type.as_deref()),
         Command::Service { action } => match action {
             ServiceCommand::Add { file, path } => commands::service_add(&file, path.as_deref()),
             ServiceCommand::SetAccess { path, access, set } => {
@@ -339,9 +356,11 @@ fn dispatch(command: Command) -> Result<(), String> {
             ),
         },
         Command::Pull { host, dir } => commands_mirror::pull(host.as_deref(), dir.as_deref()),
-        Command::Push { dir, dry_run, allow_secret_rotation } => {
-            commands_mirror::push(dir.as_deref(), dry_run, allow_secret_rotation)
-        }
+        Command::Push {
+            dir,
+            dry_run,
+            allow_secret_rotation,
+        } => commands_mirror::push(dir.as_deref(), dry_run, allow_secret_rotation),
         Command::Run { script } => run_script(&script),
     }
 }
@@ -359,7 +378,9 @@ fn run_script(script: &str) -> Result<(), String> {
         let mut args = shlex::split(line)
             .ok_or_else(|| format!("line {lineno}: unbalanced quotes: {line}"))?;
         if matches!(args.first().map(String::as_str), Some("dev")) {
-            return Err(format!("line {lineno}: `dev` runs a server and cannot be used in a script"));
+            return Err(format!(
+                "line {lineno}: `dev` runs a server and cannot be used in a script"
+            ));
         }
         args.insert(0, "rs2".to_string());
         let cli = Cli::try_parse_from(&args)
@@ -407,7 +428,10 @@ fn test_service(path: &str, component: Option<&str>) -> Result<(), String> {
     }
 
     // Component check: explicit path, or the standard cargo target.
-    let name = manifest.get("name").and_then(|v| v.as_str()).unwrap_or("service");
+    let name = manifest
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("service");
     let default_component = format!(
         "{path}/target/wasm32-wasip2/release/{}.wasm",
         name.replace('-', "_")
@@ -540,7 +564,9 @@ fn template_build(entry: &str, out: Option<&str>) -> Result<(), String> {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "template".to_string());
-        dir.join(format!("{stem}.template.json")).to_string_lossy().into_owned()
+        dir.join(format!("{stem}.template.json"))
+            .to_string_lossy()
+            .into_owned()
     });
     std::fs::write(&out_path, serde_json::to_string(&envelope).unwrap())
         .map_err(|e| format!("cannot write {out_path}: {e}"))?;
@@ -588,7 +614,9 @@ fn deploy(component: &str, name: &str, server: &str, token: Option<&str>) -> Res
     } else if bytes.starts_with(b"\0asm") {
         "application/wasm"
     } else {
-        return Err(format!("{component} is neither a .js bundle nor a WebAssembly binary"));
+        return Err(format!(
+            "{component} is neither a .js bundle nor a WebAssembly binary"
+        ));
     };
     // Deploy = keyless POST to the bundle's container (the code store is
     // content-addressed: the server derives the version name).

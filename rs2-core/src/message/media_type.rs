@@ -20,7 +20,10 @@ pub struct MediaType {
 
 impl MediaType {
     pub fn new(essence: &str) -> Self {
-        MediaType { essence: essence.trim().to_ascii_lowercase(), schema: None }
+        MediaType {
+            essence: essence.trim().to_ascii_lowercase(),
+            schema: None,
+        }
     }
 
     pub fn json() -> Self {
@@ -43,7 +46,11 @@ impl MediaType {
     /// Parse a `Content-Type` header value, extracting the `schema` parameter.
     pub fn parse(header_value: &str) -> Self {
         let mut parts = header_value.split(';');
-        let essence = parts.next().unwrap_or(OCTET_STREAM).trim().to_ascii_lowercase();
+        let essence = parts
+            .next()
+            .unwrap_or(OCTET_STREAM)
+            .trim()
+            .to_ascii_lowercase();
         let mut schema = None;
         for param in parts {
             if let Some((name, value)) = param.split_once('=') {
@@ -130,7 +137,9 @@ impl MediaType {
     /// preference order. Used to probe candidate files for an extension-less
     /// request.
     pub fn known_extensions() -> impl Iterator<Item = (&'static str, MediaType)> {
-        Self::EXTENSION_TABLE.iter().map(|(ext, essence)| (*ext, Self::new(essence)))
+        Self::EXTENSION_TABLE
+            .iter()
+            .map(|(ext, essence)| (*ext, Self::new(essence)))
     }
 
     /// Determine a media type for a stored file path (extension map),
@@ -167,7 +176,10 @@ mod tests {
     #[test]
     fn round_trips_to_wire_form() {
         let mt = MediaType::json().with_schema("/orders/.schema.json");
-        assert_eq!(mt.to_string(), "application/json; schema=\"/orders/.schema.json\"");
+        assert_eq!(
+            mt.to_string(),
+            "application/json; schema=\"/orders/.schema.json\""
+        );
         assert_eq!(MediaType::parse(&mt.to_string()), mt);
     }
 
@@ -181,7 +193,13 @@ mod tests {
 
     #[test]
     fn path_mapping_never_sniffs() {
-        assert_eq!(MediaType::for_path("a/b/c.json").essence(), "application/json");
-        assert_eq!(MediaType::for_path("a/b/mystery").essence(), "application/octet-stream");
+        assert_eq!(
+            MediaType::for_path("a/b/c.json").essence(),
+            "application/json"
+        );
+        assert_eq!(
+            MediaType::for_path("a/b/mystery").essence(),
+            "application/octet-stream"
+        );
     }
 }

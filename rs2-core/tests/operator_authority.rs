@@ -45,8 +45,10 @@ fn logic() -> serde_json::Value {
 }
 
 fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(file_root)), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(file_root)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({
         // `op` is the operator role; `dev` may author but not set authority.
         "operatorRoles": "op",
@@ -55,7 +57,12 @@ fn rt(file_root: &std::path::Path) -> Arc<Runtime> {
               "config": { "access": { "invoke": "all", "write": "dev op" } } }
         ]
     })));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 #[tokio::test]
@@ -70,13 +77,11 @@ async fn only_operators_may_set_or_change_spec_access() {
     // …but may not introduce an `access` field.
     let mut with_access = logic();
     with_access["access"] = json!({ "invoke": "all" });
-    let attempt =
-        as_role(req(Method::PUT, "/p/.pipelines/job"), "dev").with_json(&with_access);
+    let attempt = as_role(req(Method::PUT, "/p/.pipelines/job"), "dev").with_json(&with_access);
     assert_eq!(rt.handle(attempt).await.status, Some(StatusCode::FORBIDDEN));
 
     // An operator may set it.
-    let by_op =
-        as_role(req(Method::PUT, "/p/.pipelines/job"), "op").with_json(&with_access);
+    let by_op = as_role(req(Method::PUT, "/p/.pipelines/job"), "op").with_json(&with_access);
     assert_eq!(rt.handle(by_op).await.status, Some(StatusCode::OK));
 
     // The non-operator may keep editing the logic, resending the SAME access.
@@ -85,7 +90,11 @@ async fn only_operators_may_set_or_change_spec_access() {
         "access": { "invoke": "all" }
     });
     let edit = as_role(req(Method::PUT, "/p/.pipelines/job"), "dev").with_json(&edited);
-    assert_eq!(rt.handle(edit).await.status, Some(StatusCode::OK), "logic edit preserving access");
+    assert_eq!(
+        rt.handle(edit).await.status,
+        Some(StatusCode::OK),
+        "logic edit preserving access"
+    );
 
     // …but may not change the access while editing.
     edited["access"] = json!({ "invoke": "op" });
@@ -102,16 +111,22 @@ async fn no_operator_roles_means_no_api_operator() {
     // With operatorRoles absent, nobody is an operator over the API: setting a
     // spec's access is refused for everyone (authority is file-only).
     let dir = tempfile::tempdir().unwrap();
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir.path())), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({
         "mounts": [
             { "path": "/p", "service": "pipeline",
               "config": { "access": { "write": "all" } } }
         ]
     })));
-    let rt =
-        Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default());
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
 
     let mut with_access = logic();
     with_access["access"] = json!({ "invoke": "all" });

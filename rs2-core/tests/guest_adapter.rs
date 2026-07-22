@@ -471,7 +471,10 @@ fn bson_decode_doc(b: &[u8], start: usize) -> (Value, usize) {
                 json!({ "$date": v })
             }
             0x07 => {
-                let hex: String = b[off..off + 12].iter().map(|x| format!("{x:02x}")).collect();
+                let hex: String = b[off..off + 12]
+                    .iter()
+                    .map(|x| format!("{x:02x}"))
+                    .collect();
                 off += 12;
                 json!({ "$oid": hex })
             }
@@ -570,7 +573,10 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
             .and_then(|p| p.as_array())
             .cloned()
             .unwrap_or_default();
-        let docs: Vec<Value> = s.get(coll).map(|m| m.values().cloned().collect()).unwrap_or_default();
+        let docs: Vec<Value> = s
+            .get(coll)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default();
         let batch = run_pipeline(docs, &pipeline);
         // Real mongod replies to `aggregate` with the cursor shape (the whole
         // result in firstBatch when it fits): {cursor:{firstBatch,id,ns},ok:1}.
@@ -643,7 +649,10 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
 /// `$facet`/`$skip`/`$limit`/`$count` combination its paging facet appends.
 fn run_pipeline(mut docs: Vec<Value>, stages: &[Value]) -> Vec<Value> {
     for stage in stages {
-        let (op, arg) = stage.as_object().and_then(|o| o.iter().next()).expect("stage object");
+        let (op, arg) = stage
+            .as_object()
+            .and_then(|o| o.iter().next())
+            .expect("stage object");
         match op.as_str() {
             "$match" => {
                 let filter = arg.as_object().expect("$match object").clone();
@@ -672,7 +681,10 @@ fn run_pipeline(mut docs: Vec<Value>, stages: &[Value]) -> Vec<Value> {
             "$limit" => docs.truncate(arg.as_u64().unwrap_or(u64::MAX) as usize),
             "$count" => {
                 let mut counted = serde_json::Map::new();
-                counted.insert(arg.as_str().unwrap_or("n").to_string(), json!(docs.len() as i64));
+                counted.insert(
+                    arg.as_str().unwrap_or("n").to_string(),
+                    json!(docs.len() as i64),
+                );
                 docs = vec![Value::Object(counted)];
             }
             "$facet" => {
@@ -693,9 +705,10 @@ fn sort_cmp(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
-        (Some(Value::Number(x)), Some(Value::Number(y))) => {
-            x.as_f64().partial_cmp(&y.as_f64()).unwrap_or(Ordering::Equal)
-        }
+        (Some(Value::Number(x)), Some(Value::Number(y))) => x
+            .as_f64()
+            .partial_cmp(&y.as_f64())
+            .unwrap_or(Ordering::Equal),
         _ => Ordering::Equal,
     }
 }
@@ -1663,7 +1676,12 @@ async fn guest_backed_mongo_query_adapter_runs_an_aggregation() {
     // Execute with a param: the adapter runs ONE aggregate — the stored
     // pipeline plus its paging $facet — and returns the sorted rows + total.
     let mut resp = rt.handle(req(Method::GET, "/q/items?accountId=acc1")).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "execute: {:?}", resp.body);
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "execute: {:?}",
+        resp.body
+    );
     assert_eq!(resp.header("x-total-count"), Some("3"), "X-Total-Count");
     let rows = body_json(&mut resp).await;
     let rows = rows.as_array().unwrap();
@@ -1686,7 +1704,10 @@ async fn guest_backed_mongo_query_adapter_runs_an_aggregation() {
     let page = body_json(&mut resp).await;
     let page = page.as_array().unwrap();
     assert_eq!(page.len(), 1, "$take pages");
-    assert_eq!(page[0]["name"], "beta", "$skip offsets into the sorted rows");
+    assert_eq!(
+        page[0]["name"], "beta",
+        "$skip offsets into the sorted rows"
+    );
 
     // A malformed stored query (no pipeline) is a clear 400 from the adapter.
     let bad = json!({
@@ -1735,11 +1756,17 @@ async fn mongo_adapter_round_trips_int64_and_decodes_dates_and_object_ids() {
     // (Values beyond ±2^53-1 would lose precision as a JS Number — documented
     // codec caveat — so the boundary case is the largest safe integer.)
     let resp = rt
-        .handle(req(Method::PUT, "/data/orders/big").with_json(
-            &json!({ "big": 3_000_000_000i64, "max": 9_007_199_254_740_991i64 }),
-        ))
+        .handle(
+            req(Method::PUT, "/data/orders/big")
+                .with_json(&json!({ "big": 3_000_000_000i64, "max": 9_007_199_254_740_991i64 })),
+        )
         .await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "PUT: {:?}", resp.body);
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "PUT: {:?}",
+        resp.body
+    );
     {
         // The backend received true int64s, not doubles.
         let s = store.lock().unwrap();
@@ -1753,7 +1780,11 @@ async fn mongo_adapter_round_trips_int64_and_decodes_dates_and_object_ids() {
     // a float (exact up to 2^53), so the JSON number *representation* can
     // differ while the value round-trips losslessly.
     let rec = body_json(&mut resp).await;
-    assert_eq!(rec["big"].as_f64(), Some(3_000_000_000.0), "int64 round-trips");
+    assert_eq!(
+        rec["big"].as_f64(),
+        Some(3_000_000_000.0),
+        "int64 round-trips"
+    );
     assert_eq!(
         rec["max"].as_f64(),
         Some(9_007_199_254_740_991.0),
@@ -1763,15 +1794,20 @@ async fn mongo_adapter_round_trips_int64_and_decodes_dates_and_object_ids() {
     // Wire types a JSON PUT can't produce: seed the backend directly with a
     // UTC datetime + ObjectId (what real v1 data holds) and assert the
     // adapter's decode doesn't lose them.
-    store.lock().unwrap().entry("legacy".to_string()).or_default().insert(
-        "v1".to_string(),
-        json!({
-            "_id": "v1",
-            "created": { "$date": 1_704_067_200_000i64 },
-            "owner": { "$oid": "507f1f77bcf86cd799439011" },
-            "n": 1
-        }),
-    );
+    store
+        .lock()
+        .unwrap()
+        .entry("legacy".to_string())
+        .or_default()
+        .insert(
+            "v1".to_string(),
+            json!({
+                "_id": "v1",
+                "created": { "$date": 1_704_067_200_000i64 },
+                "owner": { "$oid": "507f1f77bcf86cd799439011" },
+                "n": 1
+            }),
+        );
     let mut resp = rt.handle(req(Method::GET, "/data/legacy/v1")).await;
     assert_eq!(resp.status, Some(StatusCode::OK), "GET seeded record");
     let rec = body_json(&mut resp).await;

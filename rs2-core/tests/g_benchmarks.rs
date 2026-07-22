@@ -92,8 +92,7 @@ async fn g1_dispatch_overhead_under_1ms_p99() {
     // The "native function call path": the same service instance invoked
     // directly, no router/wrapper/limits/idempotency around it.
     let parsed: TenantConfig = serde_json::from_value(config).unwrap();
-    let tenant =
-        Tenant::build("t", parsed, &adapters, &LimitTable::default(), None, None).unwrap();
+    let tenant = Tenant::build("t", parsed, &adapters, &LimitTable::default(), None, None).unwrap();
     let (service, ctx) = tenant.instance("/data").unwrap();
     let (service, ctx) = (service.clone(), ctx.clone());
 
@@ -104,7 +103,9 @@ async fn g1_dispatch_overhead_under_1ms_p99() {
         assert_eq!(resp.status, Some(StatusCode::OK));
     };
     let dispatched_call = || async {
-        let resp = rt.handle(Message::request(Method::GET, "/data/items/k", "t")).await;
+        let resp = rt
+            .handle(Message::request(Method::GET, "/data/items/k", "t"))
+            .await;
         assert_eq!(resp.status, Some(StatusCode::OK));
     };
 
@@ -169,7 +170,10 @@ async fn g3_pathological_tenant_cannot_degrade_neighbors() {
         Arc::new(MemDataStore::new()),
     );
     let rt = Runtime::new(
-        Tenancy::Multi { domain_map: Default::default(), main_domain: Some("rs2.test".into()) },
+        Tenancy::Multi {
+            domain_map: Default::default(),
+            main_domain: Some("rs2.test".into()),
+        },
         adapters,
         Arc::new(StaticLoader(config)),
         limits,
@@ -190,7 +194,9 @@ async fn g3_pathological_tenant_cannot_degrade_neighbors() {
         .with_json(&json!({ "name": "steady" }));
     assert_eq!(rt.handle(seed).await.status, Some(StatusCode::CREATED));
     let good_call = || async {
-        let resp = rt.handle(Message::request(Method::GET, "/data/items/k", "good")).await;
+        let resp = rt
+            .handle(Message::request(Method::GET, "/data/items/k", "good"))
+            .await;
         assert_eq!(resp.status, Some(StatusCode::OK));
     };
     let _ = measure(100, good_call).await;
@@ -213,8 +219,13 @@ async fn g3_pathological_tenant_cannot_degrade_neighbors() {
             let path = path.to_string();
             attackers.push(tokio::spawn(async move {
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    let resp = rt.handle(Message::request(Method::GET, &path, "evil")).await;
-                    outcomes.lock().unwrap().push(resp.status.map(|s| s.as_u16()).unwrap_or(0));
+                    let resp = rt
+                        .handle(Message::request(Method::GET, &path, "evil"))
+                        .await;
+                    outcomes
+                        .lock()
+                        .unwrap()
+                        .push(resp.status.map(|s| s.as_u16()).unwrap_or(0));
                     // Real clients, not a scheduler-saturating busy loop —
                     // 8 clients × ~1k req/s is still a flood.
                     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -244,8 +255,10 @@ async fn g3_pathological_tenant_cannot_degrade_neighbors() {
         // Every pathological invocation came back structured, the process
         // is alive, and the neighbor's p99 stayed within 2× baseline
         // (small absolute floor to keep microsecond baselines un-flaky).
-        assert!(evil_total > 0 && evil_contained == evil_total,
-            "[{label}] evil outcomes were all structured 503s: {evil_contained}/{evil_total}");
+        assert!(
+            evil_total > 0 && evil_contained == evil_total,
+            "[{label}] evil outcomes were all structured 503s: {evil_contained}/{evil_total}"
+        );
         let bound = std::cmp::max(base_p99 * 2, base_p99 + Duration::from_millis(2));
         assert!(
             attack_p99 <= bound,

@@ -121,10 +121,12 @@ pub trait Service: Send + Sync {
 /// Whether an `If-None-Match` header value matches the resource's ETag
 /// (list-aware; weak validators compare by value; `*` matches anything).
 pub(crate) fn if_none_match_hits(if_none_match: Option<&str>, etag: &str) -> bool {
-    let Some(inm) = if_none_match else { return false };
-    inm.split(',').map(str::trim).any(|candidate| {
-        candidate == "*" || candidate.trim_start_matches("W/") == etag
-    })
+    let Some(inm) = if_none_match else {
+        return false;
+    };
+    inm.split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == etag)
 }
 
 /// Parse a store write's conditional headers into a [`WritePrecondition`].
@@ -149,6 +151,10 @@ pub(crate) fn pagination(msg: &Message) -> (usize, usize) {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1000)
         .min(10_000);
-    let skip = msg.url.query_param("$skip").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let skip = msg
+        .url
+        .query_param("$skip")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     (take, skip)
 }

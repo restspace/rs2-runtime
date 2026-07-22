@@ -55,7 +55,12 @@ impl FileStore for LocalFsFileStore {
         Self::meta_of(&full).await
     }
 
-    async fn read(&self, tenant: &str, path: &str, range: Option<ByteRange>) -> Result<Body, RsError> {
+    async fn read(
+        &self,
+        tenant: &str,
+        path: &str,
+        range: Option<ByteRange>,
+    ) -> Result<Body, RsError> {
         let full = self.resolve(tenant, path)?;
         let md = tokio::fs::metadata(&full).await?;
         if md.is_dir() {
@@ -105,7 +110,10 @@ impl FileStore for LocalFsFileStore {
             stream,
             MediaType::for_path(path),
             Some(len),
-            Provenance::Replayable { url: path.to_string(), version },
+            Provenance::Replayable {
+                url: path.to_string(),
+                version,
+            },
         );
         if let Some(m) = modified {
             body = body.with_last_modified(m);
@@ -126,7 +134,8 @@ impl FileStore for LocalFsFileStore {
         let mut stream = body.into_stream();
         let result: Result<(), RsError> = async {
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| RsError::internal(format!("body stream error: {e}")))?;
+                let chunk =
+                    chunk.map_err(|e| RsError::internal(format!("body stream error: {e}")))?;
                 file.write_all(&chunk).await?;
             }
             file.flush().await?;
@@ -150,7 +159,9 @@ impl FileStore for LocalFsFileStore {
         let full = self.resolve(tenant, path)?;
         let md = tokio::fs::metadata(&full).await?;
         if md.is_dir() {
-            return Err(RsError::bad_request("path is a directory; use directory delete"));
+            return Err(RsError::bad_request(
+                "path is a directory; use directory delete",
+            ));
         }
         tokio::fs::remove_file(&full).await?;
         Ok(())
@@ -163,15 +174,15 @@ impl FileStore for LocalFsFileStore {
             .await
             .map_err(|_| RsError::not_found("source does not exist"))?;
         if smd.is_dir() {
-            return Err(RsError::bad_request("source is a directory; file move only"));
+            return Err(RsError::bad_request(
+                "source is a directory; file move only",
+            ));
         }
         if let Some(parent) = dst.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         let existed = match tokio::fs::metadata(&dst).await {
-            Ok(md) if md.is_dir() => {
-                return Err(RsError::conflict("destination is a directory"))
-            }
+            Ok(md) if md.is_dir() => return Err(RsError::conflict("destination is a directory")),
             Ok(_) => true,
             Err(_) => false,
         };
@@ -197,7 +208,9 @@ impl FileStore for LocalFsFileStore {
 
     async fn delete_dir_all(&self, tenant: &str, path: &str) -> Result<(), RsError> {
         if path.split('/').all(|s| s.is_empty()) {
-            return Err(RsError::bad_request("refusing to recursively delete the store root"));
+            return Err(RsError::bad_request(
+                "refusing to recursively delete the store root",
+            ));
         }
         let full = self.resolve(tenant, path)?;
         tokio::fs::remove_dir_all(&full).await.map_err(|e| {
@@ -209,7 +222,13 @@ impl FileStore for LocalFsFileStore {
         })
     }
 
-    async fn list(&self, tenant: &str, path: &str, take: usize, skip: usize) -> Result<(Vec<DirEntry>, u64), RsError> {
+    async fn list(
+        &self,
+        tenant: &str,
+        path: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<DirEntry>, u64), RsError> {
         let full = self.resolve(tenant, path)?;
         let mut rd = match tokio::fs::read_dir(&full).await {
             Ok(rd) => rd,
@@ -230,15 +249,18 @@ impl FileStore for LocalFsFileStore {
             }
             let md = entry.metadata().await?;
             let is_dir = md.is_dir();
-            let content_type = if is_dir { None } else { Some(MediaType::for_path(&name).to_string()) };
+            let content_type = if is_dir {
+                None
+            } else {
+                Some(MediaType::for_path(&name).to_string())
+            };
             entries.push(DirEntry {
                 name: if is_dir { format!("{name}/") } else { name },
                 size: if is_dir { 0 } else { md.len() },
-                last_modified: md
-                    .modified()
-                    .ok()
-                    .map(OffsetDateTime::from)
-                    .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+                last_modified: md.modified().ok().map(OffsetDateTime::from).and_then(|t| {
+                    t.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                }),
                 dir: is_dir,
                 content_type,
             });

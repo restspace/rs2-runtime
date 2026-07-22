@@ -14,7 +14,9 @@ use crate::idempotency;
 use crate::message::Message;
 use crate::router::{validate_path, Tenancy};
 use crate::tenant::{Adapters, Tenant, TenantConfig};
-use crate::wrapper::{check_access, check_declared_body_size, LimitTable, TenantBreaker, TenantLimiter};
+use crate::wrapper::{
+    check_access, check_declared_body_size, LimitTable, TenantBreaker, TenantLimiter,
+};
 
 /// Source of tenant configs ("config store" — PRD §13). The server binary
 /// supplies a file-backed loader; embedders supply their own.
@@ -26,7 +28,9 @@ pub trait ConfigLoader: Send + Sync {
     /// concurrency on the self-config API, PRD §10.6).
     async fn load_raw(&self, tenant: &str) -> Result<(serde_json::Value, String), RsError> {
         let _ = tenant;
-        Err(RsError::engine_unavailable("this config loader does not support raw access"))
+        Err(RsError::engine_unavailable(
+            "this config loader does not support raw access",
+        ))
     }
 
     /// Enumerate known tenants for host-driven background work (the scheduler).
@@ -45,7 +49,9 @@ pub trait ConfigLoader: Send + Sync {
         expected_version: Option<&str>,
     ) -> Result<String, RsError> {
         let _ = (tenant, config, expected_version);
-        Err(RsError::engine_unavailable("this config loader does not support writes"))
+        Err(RsError::engine_unavailable(
+            "this config loader does not support writes",
+        ))
     }
 }
 
@@ -109,7 +115,10 @@ struct RuntimeControl(std::sync::Weak<Runtime>);
 #[async_trait]
 impl TenantControl for RuntimeControl {
     async fn raw_config(&self, tenant: &str) -> Result<(serde_json::Value, String), RsError> {
-        let rt = self.0.upgrade().ok_or_else(|| RsError::internal("runtime has shut down"))?;
+        let rt = self
+            .0
+            .upgrade()
+            .ok_or_else(|| RsError::internal("runtime has shut down"))?;
         rt.loader.load_raw(tenant).await
     }
 
@@ -119,7 +128,10 @@ impl TenantControl for RuntimeControl {
         config: serde_json::Value,
         if_match: Option<&str>,
     ) -> Result<String, RsError> {
-        let rt = self.0.upgrade().ok_or_else(|| RsError::internal("runtime has shut down"))?;
+        let rt = self
+            .0
+            .upgrade()
+            .ok_or_else(|| RsError::internal("runtime has shut down"))?;
         // Validate the entire config by dry-building the tenant (PRD §10.6):
         // mounts, service configs, pipeline specs all checked before any
         // persistence — an invalid config never touches the running tenant.
@@ -189,7 +201,10 @@ impl Runtime {
                 Some(requester),
                 Some(control),
             )?);
-            self.tenants.write().await.insert(name.to_string(), tenant.clone());
+            self.tenants
+                .write()
+                .await
+                .insert(name.to_string(), tenant.clone());
             Ok(tenant)
         }
         .await;
@@ -279,16 +294,16 @@ impl Runtime {
         if external {
             if let Some(origin) = origin {
                 if let Some(tenant) = self.tenants.read().await.get(&tenant_name) {
-                    tenant.cors.decorate(&mut resp, &origin, request_host.as_deref());
+                    tenant
+                        .cors
+                        .decorate(&mut resp, &origin, request_host.as_deref());
                 }
             }
         }
         // Default caching posture: anything that didn't opt in — errors,
         // discovery docs, preflights, auth responses — is never stored.
         // (304s are exempt: the cached entry's own policy governs them.)
-        if resp.header("cache-control").is_none()
-            && resp.status != Some(StatusCode::NOT_MODIFIED)
-        {
+        if resp.header("cache-control").is_none() && resp.status != Some(StatusCode::NOT_MODIFIED) {
             resp.set_header("cache-control", "no-store");
         }
 
@@ -347,14 +362,21 @@ impl Runtime {
             return;
         }
         let source = if external { "external" } else { "internal" };
-        let mut rec = LogRecord::now(severity, tenant, trace, format!("{method} {path} -> {status}"))
-            .attr("http.request.method", method)
-            .attr("url.path", path)
-            .attr("http.response.status_code", status as i64)
-            .attr("rs2.source", source)
-            .attr("duration_ms", start.elapsed().as_millis() as i64);
+        let mut rec = LogRecord::now(
+            severity,
+            tenant,
+            trace,
+            format!("{method} {path} -> {status}"),
+        )
+        .attr("http.request.method", method)
+        .attr("url.path", path)
+        .attr("http.response.status_code", status as i64)
+        .attr("rs2.source", source)
+        .attr("duration_ms", start.elapsed().as_millis() as i64);
         if let Some(p) = principal {
-            rec = rec.attr("enduser.id", p.id.as_str()).attr("rs2.principal.kind", p.kind.as_str());
+            rec = rec
+                .attr("enduser.id", p.id.as_str())
+                .attr("rs2.principal.kind", p.kind.as_str());
         }
         if let Some(e) = &err {
             rec = rec
@@ -368,7 +390,11 @@ impl Runtime {
     async fn dispatch(&self, mut msg: Message) -> Result<Message, RsError> {
         validate_path(&msg.url.path)?;
         if msg.depth > self.limits.max_depth {
-            return Err(RsError::limit_exceeded("call_depth", msg.depth as u64, self.limits.max_depth as u64));
+            return Err(RsError::limit_exceeded(
+                "call_depth",
+                msg.depth as u64,
+                self.limits.max_depth as u64,
+            ));
         }
         // Breach circuit breaker (PRD §9.3): a tenant tripping limits
         // repeatedly fails fast here, before holding any node resources.
@@ -382,20 +408,27 @@ impl Runtime {
                 let request_host = msg.header("host").map(str::to_string);
                 if msg.method == http::Method::OPTIONS {
                     if let Some(preflight) =
-                        tenant.cors.preflight(&msg, &origin, request_host.as_deref())
+                        tenant
+                            .cors
+                            .preflight(&msg, &origin, request_host.as_deref())
                     {
                         return Ok(preflight);
                     }
                 }
-                tenant.cors.check_cookie_csrf(&msg, &origin, request_host.as_deref())?;
+                tenant
+                    .cors
+                    .check_cookie_csrf(&msg, &origin, request_host.as_deref())?;
             }
         }
 
         // Verify any presented token into a principal (PRD §10.5); a bad
         // token is rejected outright rather than treated as anonymous.
         if msg.principal.is_none() {
-            if let Some(secret) =
-                tenant.auth.as_ref().and_then(|a| a.get("jwtSecret")).and_then(|v| v.as_str())
+            if let Some(secret) = tenant
+                .auth
+                .as_ref()
+                .and_then(|a| a.get("jwtSecret"))
+                .and_then(|v| v.as_str())
             {
                 msg.principal = crate::services::auth::principal_from_token(&msg, secret)?;
             }
@@ -407,10 +440,9 @@ impl Runtime {
             return crate::discovery::handle(&tenant, msg).await;
         }
 
-        let mount = tenant
-            .mounts
-            .route(&msg.url.path)
-            .ok_or_else(|| RsError::not_found(format!("no service mounted at '{}'", msg.url.path)))?;
+        let mount = tenant.mounts.route(&msg.url.path).ok_or_else(|| {
+            RsError::not_found(format!("no service mounted at '{}'", msg.url.path))
+        })?;
         msg.url.apply_mount(&mount.base_path);
 
         check_access(&msg, mount)?;
@@ -422,12 +454,18 @@ impl Runtime {
         if msg.method == http::Method::OPTIONS {
             let desc = crate::discovery::describe_mount(mount);
             let mut resp = msg.ok_json(&desc);
-            resp.set_header("allow", &crate::discovery::allowed_methods(mount).join(", "));
+            resp.set_header(
+                "allow",
+                &crate::discovery::allowed_methods(mount).join(", "),
+            );
             return Ok(resp);
         }
 
         check_declared_body_size(&msg, &self.limits)?;
-        let _permit = self.limiter.admit(&msg.tenant, self.limits.tenant_concurrency).await?;
+        let _permit = self
+            .limiter
+            .admit(&msg.tenant, self.limits.tenant_concurrency)
+            .await?;
 
         let (service, ctx) = tenant
             .instance(&mount.base_path)
@@ -455,9 +493,8 @@ impl Runtime {
             match store.begin(&scope, &key, hash.as_deref()).await? {
                 idempotency::Begin::Replay(stored) => Ok(stored.into_message(&msg)),
                 idempotency::Begin::InFlight => {
-                    let mut err = RsError::conflict(
-                        "a request with this Idempotency-Key is still executing",
-                    );
+                    let mut err =
+                        RsError::conflict("a request with this Idempotency-Key is still executing");
                     err.retryable = true;
                     err.retry_after_ms = Some(1000);
                     Err(err)
@@ -465,24 +502,22 @@ impl Runtime {
                 idempotency::Begin::PayloadMismatch => Err(RsError::idempotency_key_reuse(
                     "Idempotency-Key was already used with a different request payload",
                 )),
-                idempotency::Begin::Fresh => {
-                    match self.invoke(service, ctx, msg).await {
-                        Ok(resp) => {
-                            let (resp, stored) =
-                                idempotency::capture_response(resp, idempotency::DEFAULT_BODY_CAP)
-                                    .await;
-                            match stored {
-                                Some(s) => store.complete(&scope, &key, s).await?,
-                                None => store.abandon(&scope, &key).await?,
-                            }
-                            Ok(resp)
+                idempotency::Begin::Fresh => match self.invoke(service, ctx, msg).await {
+                    Ok(resp) => {
+                        let (resp, stored) =
+                            idempotency::capture_response(resp, idempotency::DEFAULT_BODY_CAP)
+                                .await;
+                        match stored {
+                            Some(s) => store.complete(&scope, &key, s).await?,
+                            None => store.abandon(&scope, &key).await?,
                         }
-                        Err(err) => {
-                            store.abandon(&scope, &key).await?;
-                            Err(err)
-                        }
+                        Ok(resp)
                     }
-                }
+                    Err(err) => {
+                        store.abandon(&scope, &key).await?;
+                        Err(err)
+                    }
+                },
             }
         } else {
             self.invoke(service, ctx, msg).await
@@ -628,7 +663,9 @@ async fn scheduler_loop(
         let now = tokio::time::Instant::now();
         let now_wall = time::OffsetDateTime::now_utc();
         for (key, entry) in desired.iter_mut() {
-            let Some(occurrence_ms) = entry.due_occurrence(now, now_wall) else { continue };
+            let Some(occurrence_ms) = entry.due_occurrence(now, now_wall) else {
+                continue;
+            };
             // Overlap guard: skip while this mount's previous fire is running.
             {
                 let mut set = in_flight.lock().unwrap();
@@ -650,7 +687,10 @@ async fn scheduler_loop(
                 continue;
             }
             let rt2 = rt.clone();
-            let guard = InFlightGuard { set: in_flight.clone(), key: key.clone() };
+            let guard = InFlightGuard {
+                set: in_flight.clone(),
+                key: key.clone(),
+            };
             let (tenant, base) = key.clone();
             tokio::spawn(async move {
                 let _guard = guard; // removes the in-flight marker on completion/panic
@@ -674,7 +714,11 @@ async fn reconcile_schedules(
             Ok(cv) => cv,
             Err(_) => continue,
         };
-        if config_versions.get(tenant).map(|v| v == &version).unwrap_or(false) {
+        if config_versions
+            .get(tenant)
+            .map(|v| v == &version)
+            .unwrap_or(false)
+        {
             continue;
         }
         desired.retain(|(t, _), _| t != tenant);
@@ -700,7 +744,10 @@ async fn reconcile_schedules(
                         }
                     }
                 };
-                desired.insert((tenant.clone(), base.to_string()), SchedEntry { schedule, state });
+                desired.insert(
+                    (tenant.clone(), base.to_string()),
+                    SchedEntry { schedule, state },
+                );
             }
         }
         config_versions.insert(tenant.clone(), version);
@@ -731,5 +778,7 @@ async fn watched_tenants(rt: &std::sync::Arc<Runtime>) -> Vec<String> {
 
 /// Build and dispatch the synthetic internal tick (`POST` + `x-rs2-trigger`).
 async fn fire_tick(rt: &std::sync::Arc<Runtime>, tenant: &str, base_path: &str) {
-    let _ = rt.handle(crate::scheduler::tick_message(tenant, base_path)).await;
+    let _ = rt
+        .handle(crate::scheduler::tick_message(tenant, base_path))
+        .await;
 }

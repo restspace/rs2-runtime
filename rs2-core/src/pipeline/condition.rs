@@ -44,8 +44,17 @@ pub enum CmpOp {
     Ge,
 }
 
-const BUILTINS: &[&str] =
-    &["status", "ok", "method", "mime", "isJson", "isText", "isBinary", "name", "isDirectory"];
+const BUILTINS: &[&str] = &[
+    "status",
+    "ok",
+    "method",
+    "mime",
+    "isJson",
+    "isText",
+    "isBinary",
+    "name",
+    "isDirectory",
+];
 
 #[derive(Debug, Clone)]
 pub struct Condition {
@@ -55,13 +64,19 @@ pub struct Condition {
 
 impl Condition {
     pub fn parse(source: &str) -> Result<Condition, String> {
-        let mut p = Parser { input: source.as_bytes(), pos: 0 };
+        let mut p = Parser {
+            input: source.as_bytes(),
+            pos: 0,
+        };
         let expr = p.expr()?;
         p.skip_ws();
         if p.pos != p.input.len() {
             return Err(format!("unexpected input at position {}", p.pos));
         }
-        Ok(Condition { expr, source: source.to_string() })
+        Ok(Condition {
+            expr,
+            source: source.to_string(),
+        })
     }
 
     /// Evaluate against a message and the pipeline's variables.
@@ -94,7 +109,10 @@ fn eval(
         Expr::Literal(v) => v.clone(),
         Expr::Builtin(name) => {
             let status = msg.status.map(|s| s.as_u16()).unwrap_or(200);
-            let mime = msg.body.as_ref().map(|b| b.media_type.essence().to_string());
+            let mime = msg
+                .body
+                .as_ref()
+                .map(|b| b.media_type.essence().to_string());
             match name.as_str() {
                 "status" => Value::from(status),
                 "ok" => Value::Bool(msg.is_ok()),
@@ -102,9 +120,11 @@ fn eval(
                 "mime" => mime.map(Value::String).unwrap_or(Value::Null),
                 "isJson" => Value::Bool(msg.body.as_ref().is_some_and(|b| b.media_type.is_json())),
                 "isText" => Value::Bool(msg.body.as_ref().is_some_and(|b| b.media_type.is_text())),
-                "isBinary" => Value::Bool(msg.body.as_ref().is_some_and(|b| {
-                    !b.media_type.is_json() && !b.media_type.is_text()
-                })),
+                "isBinary" => Value::Bool(
+                    msg.body
+                        .as_ref()
+                        .is_some_and(|b| !b.media_type.is_json() && !b.media_type.is_text()),
+                ),
                 "name" => msg.name.clone().map(Value::String).unwrap_or(Value::Null),
                 "isDirectory" => Value::Bool(msg.url.is_directory()),
                 other => return Err(RsError::internal(format!("unknown builtin '{other}'"))),
@@ -128,9 +148,7 @@ fn eval(
         Expr::And(l, r) => {
             Value::Bool(truthy(&eval(l, msg, vars)?) && truthy(&eval(r, msg, vars)?))
         }
-        Expr::Or(l, r) => {
-            Value::Bool(truthy(&eval(l, msg, vars)?) || truthy(&eval(r, msg, vars)?))
-        }
+        Expr::Or(l, r) => Value::Bool(truthy(&eval(l, msg, vars)?) || truthy(&eval(r, msg, vars)?)),
         Expr::Cmp(l, op, r) => {
             let (l, r) = (eval(l, msg, vars)?, eval(r, msg, vars)?);
             Value::Bool(compare(&l, *op, &r))
@@ -282,10 +300,7 @@ impl<'a> Parser<'a> {
                 if c == b'-' {
                     self.pos += 1;
                 }
-                while self
-                    .peek()
-                    .is_some_and(|c| c.is_ascii_digit() || c == b'.')
-                {
+                while self.peek().is_some_and(|c| c.is_ascii_digit() || c == b'.') {
                     self.pos += 1;
                 }
                 let text = String::from_utf8_lossy(&self.input[start..self.pos]);

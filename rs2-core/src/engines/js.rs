@@ -164,8 +164,12 @@ pub fn generate_prelude_snapshot() -> Vec<u8> {
         module_loader: Some(Rc::new(deno_core::NoopModuleLoader)),
         ..Default::default()
     });
-    runtime.execute_script("rs2:bootstrap", BOOTSTRAP).expect("bootstrap snapshot");
-    runtime.execute_script("rs2:prelude", COMPAT_PRELUDE).expect("prelude snapshot");
+    runtime
+        .execute_script("rs2:bootstrap", BOOTSTRAP)
+        .expect("bootstrap snapshot");
+    runtime
+        .execute_script("rs2:prelude", COMPAT_PRELUDE)
+        .expect("prelude snapshot");
     runtime.snapshot().to_vec()
 }
 
@@ -287,7 +291,9 @@ impl InvocationState {
 
     fn socket_allowed(&self, host: &str, port: u16) -> bool {
         let target = format!("{host}:{port}");
-        self.socket_allowlist.iter().any(|pat| socket_pattern_matches(pat, host, port, &target))
+        self.socket_allowlist
+            .iter()
+            .any(|pat| socket_pattern_matches(pat, host, port, &target))
     }
 }
 
@@ -356,7 +362,14 @@ fn active_connector() -> tokio_rustls::TlsConnector {
 async fn connect_stream(host: &str, port: u16, tls: bool) -> Result<SockStream, RsError> {
     let tcp = tokio::net::TcpStream::connect((host, port))
         .await
-        .map_err(|e| RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("connect {host}:{port} failed: {e}")))?;
+        .map_err(|e| {
+            RsError::new(
+                502,
+                codes::CONTRACT_VIOLATION,
+                "Bad Gateway",
+                format!("connect {host}:{port} failed: {e}"),
+            )
+        })?;
     if !tls {
         return Ok(SockStream::Plain(tcp));
     }
@@ -365,7 +378,14 @@ async fn connect_stream(host: &str, port: u16, tls: bool) -> Result<SockStream, 
     let stream = active_connector()
         .connect(server_name, tcp)
         .await
-        .map_err(|e| RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("TLS handshake to {host}:{port} failed: {e}")))?;
+        .map_err(|e| {
+            RsError::new(
+                502,
+                codes::CONTRACT_VIOLATION,
+                "Bad Gateway",
+                format!("TLS handshake to {host}:{port} failed: {e}"),
+            )
+        })?;
     Ok(SockStream::Tls(Box::new(stream)))
 }
 
@@ -562,7 +582,8 @@ fn block_on_main<T: Send + 'static>(
     main.spawn(async move {
         let _ = tx.send(fut.await);
     });
-    rx.recv().map_err(|_| JsErrorBox::generic("host task dropped"))
+    rx.recv()
+        .map_err(|_| JsErrorBox::generic("host task dropped"))
 }
 
 #[op2]
@@ -603,7 +624,9 @@ fn op_rs2_log(state: &mut OpState, #[string] level: &str, #[string] text: &str) 
 fn op_rs2_state_get(state: &mut OpState, #[string] key: String) -> Option<String> {
     let inv = state.borrow::<Arc<InvocationState>>().clone();
     let host = inv.host.clone();
-    let bytes = block_on_main(&inv.main, async move { host.state_get(&key).await }).ok().flatten();
+    let bytes = block_on_main(&inv.main, async move { host.state_get(&key).await })
+        .ok()
+        .flatten();
     bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
@@ -611,7 +634,9 @@ fn op_rs2_state_get(state: &mut OpState, #[string] key: String) -> Option<String
 fn op_rs2_state_put(state: &mut OpState, #[string] key: String, #[string] value: String) {
     let inv = state.borrow::<Arc<InvocationState>>().clone();
     let host = inv.host.clone();
-    let _ = block_on_main(&inv.main, async move { host.state_put(&key, value.into_bytes()).await });
+    let _ = block_on_main(&inv.main, async move {
+        host.state_put(&key, value.into_bytes()).await
+    });
 }
 
 /// `fetch` compat hook — like [`op_rs2_request`] but always the `fetch`
@@ -658,30 +683,53 @@ fn op_rs2_sock_connect(
     let inv = state.borrow::<Arc<InvocationState>>().clone();
     let port = port as u16;
     if !inv.socket_allowed(&host, port) {
-        return fail_socket(&inv, RsError::capability_denied(&format!("socket {host}:{port}")));
+        return fail_socket(
+            &inv,
+            RsError::capability_denied(&format!("socket {host}:{port}")),
+        );
     }
     let host2 = host.clone();
-    let stream = match block_on_main(&inv.main, async move { connect_stream(&host2, port, tls).await }) {
+    let stream = match block_on_main(
+        &inv.main,
+        async move { connect_stream(&host2, port, tls).await },
+    ) {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return fail_socket(&inv, e),
         Err(_) => return fail_socket(&inv, RsError::internal("socket task dropped")),
     };
     let id = inv.socket_seq.fetch_add(1, Ordering::SeqCst);
-    inv.sockets.lock().unwrap().insert(id, Arc::new(tokio::sync::Mutex::new(stream)));
+    inv.sockets
+        .lock()
+        .unwrap()
+        .insert(id, Arc::new(tokio::sync::Mutex::new(stream)));
     json!({ "id": id })
 }
 
 #[op2]
 #[serde]
-fn op_rs2_sock_write(state: &mut OpState, #[smi] id: u32, #[buffer] data: &[u8]) -> serde_json::Value {
+fn op_rs2_sock_write(
+    state: &mut OpState,
+    #[smi] id: u32,
+    #[buffer] data: &[u8],
+) -> serde_json::Value {
     let inv = state.borrow::<Arc<InvocationState>>().clone();
     let Some(sock) = inv.sockets.lock().unwrap().get(&id).cloned() else {
         return fail_socket(&inv, RsError::bad_request("write to unknown socket"));
     };
     let data = data.to_vec();
-    match block_on_main(&inv.main, async move { sock.lock().await.write_all(&data).await }) {
+    match block_on_main(&inv.main, async move {
+        sock.lock().await.write_all(&data).await
+    }) {
         Ok(Ok(())) => Value::Null,
-        Ok(Err(e)) => fail_socket(&inv, RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("socket write failed: {e}"))),
+        Ok(Err(e)) => fail_socket(
+            &inv,
+            RsError::new(
+                502,
+                codes::CONTRACT_VIOLATION,
+                "Bad Gateway",
+                format!("socket write failed: {e}"),
+            ),
+        ),
         Err(_) => fail_socket(&inv, RsError::internal("socket task dropped")),
     }
 }
@@ -694,7 +742,10 @@ fn op_rs2_sock_read(state: &mut OpState, #[smi] id: u32, #[smi] max: u32) -> ser
         return fail_socket(&inv, RsError::bad_request("read from unknown socket"));
     };
     let max = (max as usize).clamp(1, 1 << 20);
-    match block_on_main(&inv.main, async move { sock.lock().await.read_up_to(max).await }) {
+    match block_on_main(
+        &inv.main,
+        async move { sock.lock().await.read_up_to(max).await },
+    ) {
         Ok(Ok(bytes)) => {
             if bytes.is_empty() {
                 return Value::Null; // EOF
@@ -703,7 +754,15 @@ fn op_rs2_sock_read(state: &mut OpState, #[smi] id: u32, #[smi] max: u32) -> ser
             *inv.pending_chunk.lock().unwrap() = Some(bytes);
             json!({ "data": len })
         }
-        Ok(Err(e)) => fail_socket(&inv, RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("socket read failed: {e}"))),
+        Ok(Err(e)) => fail_socket(
+            &inv,
+            RsError::new(
+                502,
+                codes::CONTRACT_VIOLATION,
+                "Bad Gateway",
+                format!("socket read failed: {e}"),
+            ),
+        ),
         Err(_) => fail_socket(&inv, RsError::internal("socket task dropped")),
     }
 }
@@ -742,7 +801,9 @@ fn op_rs2_body_read(state: &mut OpState) -> serde_json::Value {
     });
     match chunk {
         Ok(Some(Ok(bytes))) => {
-            let total = inv.streamed_in.fetch_add(bytes.len() as u64, Ordering::SeqCst)
+            let total = inv
+                .streamed_in
+                .fetch_add(bytes.len() as u64, Ordering::SeqCst)
                 + bytes.len() as u64;
             if total > inv.materialize_cap {
                 return fail_body(
@@ -757,7 +818,12 @@ fn op_rs2_body_read(state: &mut OpState) -> serde_json::Value {
         Ok(None) => Value::Null, // EOF
         Ok(Some(Err(e))) => fail_body(
             &inv,
-            RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", format!("request body stream error: {e}")),
+            RsError::new(
+                502,
+                codes::CONTRACT_VIOLATION,
+                "Bad Gateway",
+                format!("request body stream error: {e}"),
+            ),
         ),
         Err(_) => fail_body(&inv, RsError::internal("body read task dropped")),
     }
@@ -777,13 +843,22 @@ fn fail_body(inv: &InvocationState, e: RsError) -> Value {
 /// twice, or without the mount opting in, is a contract violation.
 #[op2]
 #[serde]
-fn op_rs2_stream_begin(state: &mut OpState, #[serde] envelope: serde_json::Value) -> serde_json::Value {
+fn op_rs2_stream_begin(
+    state: &mut OpState,
+    #[serde] envelope: serde_json::Value,
+) -> serde_json::Value {
     let inv = state.borrow::<Arc<InvocationState>>().clone();
     let Some(sink) = inv.response_sink.lock().unwrap().clone() else {
-        return fail_body(&inv, RsError::internal("response streaming is not enabled for this mount"));
+        return fail_body(
+            &inv,
+            RsError::internal("response streaming is not enabled for this mount"),
+        );
     };
     let Some(tx) = sink.headers.lock().unwrap().take() else {
-        return fail_body(&inv, RsError::contract_violation("beginStream called more than once"));
+        return fail_body(
+            &inv,
+            RsError::contract_violation("beginStream called more than once"),
+        );
     };
     sink.began.store(true, Ordering::SeqCst);
     let _ = tx.send(envelope);
@@ -799,14 +874,23 @@ fn op_rs2_stream_begin(state: &mut OpState, #[serde] envelope: serde_json::Value
 fn op_rs2_body_write(state: &mut OpState, #[buffer] data: &[u8]) -> serde_json::Value {
     let inv = state.borrow::<Arc<InvocationState>>().clone();
     let Some(sink) = inv.response_sink.lock().unwrap().clone() else {
-        return fail_body(&inv, RsError::internal("response streaming is not enabled for this mount"));
+        return fail_body(
+            &inv,
+            RsError::internal("response streaming is not enabled for this mount"),
+        );
     };
     if !sink.began.load(Ordering::SeqCst) {
-        return fail_body(&inv, RsError::contract_violation("body write before beginStream"));
+        return fail_body(
+            &inv,
+            RsError::contract_violation("body write before beginStream"),
+        );
     }
     let total = sink.sent.fetch_add(data.len() as u64, Ordering::SeqCst) + data.len() as u64;
     if total > sink.cap {
-        return fail_body(&inv, RsError::limit_exceeded("materialized_body_bytes", total, sink.cap));
+        return fail_body(
+            &inv,
+            RsError::limit_exceeded("materialized_body_bytes", total, sink.cap),
+        );
     }
     let bytes = Bytes::copy_from_slice(data);
     let chunks = sink.chunks.clone();
@@ -814,7 +898,12 @@ fn op_rs2_body_write(state: &mut OpState, #[buffer] data: &[u8]) -> serde_json::
         Ok(Ok(())) => Value::Null,
         Ok(Err(_)) => fail_body(
             &inv,
-            RsError::new(502, codes::CONTRACT_VIOLATION, "Bad Gateway", "response stream consumer is gone"),
+            RsError::new(
+                502,
+                codes::CONTRACT_VIOLATION,
+                "Bad Gateway",
+                "response stream consumer is gone",
+            ),
         ),
         Err(_) => fail_body(&inv, RsError::internal("stream write task dropped")),
     }
@@ -909,7 +998,11 @@ impl JsEngine {
                     return Err(RsError::limit_exceeded("wall_clock_ms", ms, ms));
                 }
                 if oom.load(Ordering::SeqCst) {
-                    return Err(RsError::limit_exceeded("memory_bytes", HEAP as u64, HEAP as u64));
+                    return Err(RsError::limit_exceeded(
+                        "memory_bytes",
+                        HEAP as u64,
+                        HEAP as u64,
+                    ));
                 }
             }
             result
@@ -931,7 +1024,11 @@ impl Engine for JsEngine {
     ) -> Result<Message, RsError> {
         let source = match code {
             ServiceCode::JsBundle(s) => s.clone(),
-            _ => return Err(RsError::engine_unavailable("js engine only runs js bundles")),
+            _ => {
+                return Err(RsError::engine_unavailable(
+                    "js engine only runs js bundles",
+                ))
+            }
         };
         let template = msg.response(http::StatusCode::OK, None);
 
@@ -1044,8 +1141,18 @@ impl Engine for JsEngine {
         // without ever streaming, fall back to its envelope.
         if response_streaming {
             return invoke_streaming(
-                source, input, config, host, main, tenant, depth, principal, limits, template,
-                request_stream, carried_body,
+                source,
+                input,
+                config,
+                host,
+                main,
+                tenant,
+                depth,
+                principal,
+                limits,
+                template,
+                request_stream,
+                carried_body,
             )
             .await;
         }
@@ -1081,20 +1188,29 @@ impl Engine for JsEngine {
 /// a `Message`, using `template` for identity. `fallback_body` is used when the
 /// envelope carries no `body` — the passthrough request body, or a streamed
 /// response body.
-fn envelope_to_message(template: &Message, outcome: &Value, fallback_body: Option<Body>) -> Message {
+fn envelope_to_message(
+    template: &Message,
+    outcome: &Value,
+    fallback_body: Option<Body>,
+) -> Message {
     let status = outcome
         .get("status")
         .and_then(|s| s.as_u64())
         .and_then(|s| http::StatusCode::from_u16(s as u16).ok())
         .unwrap_or(http::StatusCode::OK);
-    let media_type = outcome.get("mediaType").and_then(|m| m.as_str()).map(MediaType::parse);
+    let media_type = outcome
+        .get("mediaType")
+        .and_then(|m| m.as_str())
+        .map(MediaType::parse);
     let body = match outcome.get("body") {
         // No body in the envelope → use the fallback (a passthrough or streamed
         // body); otherwise an absent body simply means no body.
         None | Some(Value::Null) => fallback_body,
         Some(Value::String(text)) => Some(Body::from_string(
             text.clone(),
-            media_type.clone().unwrap_or_else(|| MediaType::new("text/plain")),
+            media_type
+                .clone()
+                .unwrap_or_else(|| MediaType::new("text/plain")),
         )),
         Some(other) => {
             let mut b = Body::from_json(other);
@@ -1227,8 +1343,18 @@ async fn run_invocation(
     limits: &InvocationLimits,
 ) -> Result<Value, RsError> {
     let oom = Arc::new(AtomicBool::new(false));
-    let (mut runtime, default_export) = build_runtime(source, inv.clone(), limits, oom.clone()).await?;
-    dispatch_once(&mut runtime, &default_export, &input, &config, &inv, limits, &oom).await
+    let (mut runtime, default_export) =
+        build_runtime(source, inv.clone(), limits, oom.clone()).await?;
+    dispatch_once(
+        &mut runtime,
+        &default_export,
+        &input,
+        &config,
+        &inv,
+        limits,
+        &oom,
+    )
+    .await
 }
 
 /// Wall-clock watchdog: terminate the isolate at `deadline`. Returns
@@ -1241,18 +1367,14 @@ async fn run_invocation(
 /// was thousands of thread creations per second under load, for pure
 /// bookkeeping. The thread blocks on its channel while idle and polls at
 /// the same 5 ms cadence while any entry is live.
-fn spawn_watchdog(
-    handle: v8::IsolateHandle,
-    wall: Duration,
-) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+fn spawn_watchdog(handle: v8::IsolateHandle, wall: Duration) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
     struct Entry {
         handle: v8::IsolateHandle,
         deadline: std::time::Instant,
         timed_out: Arc<AtomicBool>,
         done: Arc<AtomicBool>,
     }
-    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<Entry>> =
-        std::sync::OnceLock::new();
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<Entry>> = std::sync::OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<Entry>();
         std::thread::spawn(move || {
@@ -1376,7 +1498,9 @@ pub(crate) async fn build_runtime(
             if let Some(err) = inv.host_error.lock().unwrap().take() {
                 return Err(err);
             }
-            Err(RsError::contract_violation(format!("JS bundle failed: {fail}")))
+            Err(RsError::contract_violation(format!(
+                "JS bundle failed: {fail}"
+            )))
         }
     }
 }
@@ -1392,14 +1516,21 @@ async fn load_and_evaluate(
         .await
         .map_err(|e| format!("module load: {e}"))?;
     let eval = runtime.mod_evaluate(mod_id);
-    runtime.run_event_loop(Default::default()).await.map_err(|e| format!("evaluate: {e}"))?;
+    runtime
+        .run_event_loop(Default::default())
+        .await
+        .map_err(|e| format!("evaluate: {e}"))?;
     eval.await.map_err(|e| format!("evaluate: {e}"))?;
 
-    let namespace = runtime.get_module_namespace(mod_id).map_err(|e| format!("namespace: {e}"))?;
+    let namespace = runtime
+        .get_module_namespace(mod_id)
+        .map_err(|e| format!("namespace: {e}"))?;
     deno_core::scope!(scope, runtime);
     let ns = v8::Local::new(scope, namespace);
     let default_key = v8::String::new(scope, "default").ok_or("oom")?;
-    let default_export = ns.get(scope, default_key.into()).ok_or("no default export")?;
+    let default_export = ns
+        .get(scope, default_key.into())
+        .ok_or("no default export")?;
     Ok(v8::Global::new(scope, default_export))
 }
 
@@ -1444,7 +1575,9 @@ pub(crate) async fn dispatch_once(
             if let Some(err) = inv.host_error.lock().unwrap().take() {
                 return Err(err);
             }
-            Err(RsError::contract_violation(format!("JS service failed: {fail}")))
+            Err(RsError::contract_violation(format!(
+                "JS service failed: {fail}"
+            )))
         }
     }
 }
@@ -1465,10 +1598,12 @@ async fn drive_dispatch(
         deno_core::scope!(scope, runtime);
         let global = scope.get_current_context().global(scope);
         let dispatch_key = v8::String::new(scope, "__rs2_dispatch").ok_or("oom")?;
-        let dispatch_val =
-            global.get(scope, dispatch_key.into()).ok_or("dispatch prelude missing")?;
-        let dispatch_local: v8::Local<v8::Function> =
-            dispatch_val.try_into().map_err(|_| "dispatch is not a function".to_string())?;
+        let dispatch_val = global
+            .get(scope, dispatch_key.into())
+            .ok_or("dispatch prelude missing")?;
+        let dispatch_local: v8::Local<v8::Function> = dispatch_val
+            .try_into()
+            .map_err(|_| "dispatch is not a function".to_string())?;
 
         let msg_local =
             serde_v8::to_v8(scope, input).map_err(|e| format!("msg marshaling: {e}"))?;
@@ -1504,8 +1639,9 @@ async fn drive_dispatch(
 
     let mut spins = 0u32;
     let settled = loop {
-        let loop_result =
-            runtime.run_event_loop(PollEventLoopOptions::default()).await;
+        let loop_result = runtime
+            .run_event_loop(PollEventLoopOptions::default())
+            .await;
 
         // Inspect the (original) promise directly — checked before propagating
         // a loop error so an uncaught rejection still surfaces its identity.
@@ -1522,7 +1658,10 @@ async fn drive_dispatch(
                     }
                     v8::PromiseState::Rejected => {
                         let r = promise.result(scope);
-                        Some(Err(format!("handle rejected: {}", r.to_rust_string_lossy(scope))))
+                        Some(Err(format!(
+                            "handle rejected: {}",
+                            r.to_rust_string_lossy(scope)
+                        )))
                     }
                     v8::PromiseState::Pending => None,
                 }
@@ -1539,7 +1678,9 @@ async fn drive_dispatch(
                 deno_core::scope!(scope, runtime);
                 let func = v8::Local::new(scope, f);
                 let recv = v8::undefined(scope).into();
-                func.call(scope, recv, &[]).map(|v| v.is_true()).unwrap_or(false)
+                func.call(scope, recv, &[])
+                    .map(|v| v.is_true())
+                    .unwrap_or(false)
             }
             None => false,
         };
@@ -1646,8 +1787,7 @@ mod socket_tests {
         // Self-signed cert for "localhost".
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = cert.cert.der().clone();
-        let key_der =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
 
         let provider = || Arc::new(rustls::crypto::ring::default_provider());
         let server_config = rustls::ServerConfig::builder_with_provider(provider())
@@ -1686,7 +1826,9 @@ mod socket_tests {
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        super::set_tls_connector_for_test(tokio_rustls::TlsConnector::from(Arc::new(client_config)));
+        super::set_tls_connector_for_test(tokio_rustls::TlsConnector::from(Arc::new(
+            client_config,
+        )));
 
         let config = json!({
             "grants": { "db": { "type": "socket", "hosts": [format!("localhost:{port}")] } }
@@ -1736,11 +1878,18 @@ mod passthrough_tests {
 
     /// A request carrying a two-chunk streaming body of the given media type.
     fn streaming_request(media_type: MediaType) -> Message {
-        let chunks: Vec<Result<Bytes, std::io::Error>> =
-            vec![Ok(Bytes::from_static(b"chunk1")), Ok(Bytes::from_static(b"chunk2"))];
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"chunk1")),
+            Ok(Bytes::from_static(b"chunk2")),
+        ];
         let stream = futures::stream::iter(chunks).boxed();
         let mut msg = Message::request(http::Method::POST, "/x", "t1");
-        msg.body = Some(Body::from_stream(stream, media_type, Some(12), Provenance::Ephemeral));
+        msg.body = Some(Body::from_stream(
+            stream,
+            media_type,
+            Some(12),
+            Provenance::Ephemeral,
+        ));
         msg
     }
 
@@ -1782,7 +1931,10 @@ mod passthrough_tests {
 
         // The forwarded body is still a stream (proof it never materialized).
         let body = resp.body.as_mut().unwrap();
-        assert!(body.is_stream(), "passthrough must forward the stream by reference");
+        assert!(
+            body.is_stream(),
+            "passthrough must forward the stream by reference"
+        );
         let bytes = body.materialize(1024).await.unwrap();
         assert_eq!(&bytes[..], b"chunk1chunk2");
     }
@@ -1810,8 +1962,12 @@ mod passthrough_tests {
                 return { status: 200, body: msg.body, mediaType: "text/plain" };
             };
         "#;
-        let mut resp =
-            run(streaming_request(MediaType::new("text/plain")), json!({}), code).await;
+        let mut resp = run(
+            streaming_request(MediaType::new("text/plain")),
+            json!({}),
+            code,
+        )
+        .await;
         let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
         assert_eq!(&bytes[..], b"chunk1chunk2");
     }
@@ -1889,9 +2045,14 @@ mod passthrough_tests {
         let mut limits = InvocationLimits::default();
         limits.materialized_body_bytes = 8; // body is 12 bytes across two chunks
         let config = json!({ "requestStreaming": true });
-        let err = run_limited(streaming_request(MediaType::octet_stream()), config, code, limits)
-            .await
-            .unwrap_err();
+        let err = run_limited(
+            streaming_request(MediaType::octet_stream()),
+            config,
+            code,
+            limits,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code, crate::error::codes::LIMIT_EXCEEDED);
     }
 
@@ -1900,7 +2061,10 @@ mod passthrough_tests {
     async fn collect_chunks(mut msg: Message) -> Vec<Vec<u8>> {
         let body = msg.body.take().expect("response has a body");
         assert!(body.is_stream(), "expected a streamed response body");
-        body.into_stream().map(|r| r.unwrap().to_vec()).collect().await
+        body.into_stream()
+            .map(|r| r.unwrap().to_vec())
+            .collect()
+            .await
     }
 
     #[tokio::test]
@@ -1917,10 +2081,19 @@ mod passthrough_tests {
             };
         "#;
         let config = json!({ "responseStreaming": true });
-        let resp = run(Message::request(http::Method::GET, "/sse", "t1"), config, code).await;
+        let resp = run(
+            Message::request(http::Method::GET, "/sse", "t1"),
+            config,
+            code,
+        )
+        .await;
         assert_eq!(resp.status.unwrap(), http::StatusCode::OK);
         let chunks = collect_chunks(resp).await;
-        assert_eq!(chunks.len(), 3, "each write should surface as its own chunk");
+        assert_eq!(
+            chunks.len(),
+            3,
+            "each write should surface as its own chunk"
+        );
         let joined: Vec<u8> = chunks.concat();
         assert_eq!(&joined[..], b"data: 1\n\ndata: 2\n\ndata: 3\n\n");
     }
@@ -1938,7 +2111,12 @@ mod passthrough_tests {
             };
         "#;
         let config = json!({ "responseStreaming": true });
-        let mut resp = run(Message::request(http::Method::GET, "/x", "t1"), config, code).await;
+        let mut resp = run(
+            Message::request(http::Method::GET, "/x", "t1"),
+            config,
+            code,
+        )
+        .await;
         assert_eq!(resp.status.unwrap(), http::StatusCode::CREATED);
         assert_eq!(resp.headers.get("x-stream").unwrap(), "yes");
         let body = resp.body.as_mut().unwrap();
@@ -1955,7 +2133,12 @@ mod passthrough_tests {
             };
         "#;
         let config = json!({ "responseStreaming": true });
-        let mut resp = run(Message::request(http::Method::GET, "/x", "t1"), config, code).await;
+        let mut resp = run(
+            Message::request(http::Method::GET, "/x", "t1"),
+            config,
+            code,
+        )
+        .await;
         let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
         assert_eq!(&bytes[..], b"plain");
     }
@@ -1976,11 +2159,20 @@ mod passthrough_tests {
         let mut limits = InvocationLimits::default();
         limits.materialized_body_bytes = 8;
         let config = json!({ "responseStreaming": true });
-        let resp = run_limited(Message::request(http::Method::GET, "/x", "t1"), config, code, limits)
-            .await
-            .unwrap();
+        let resp = run_limited(
+            Message::request(http::Method::GET, "/x", "t1"),
+            config,
+            code,
+            limits,
+        )
+        .await
+        .unwrap();
         let chunks = collect_chunks(resp).await;
         let joined: Vec<u8> = chunks.concat();
-        assert_eq!(&joined[..], b"aaaabbbb", "the over-cap chunk must not be delivered");
+        assert_eq!(
+            &joined[..],
+            b"aaaabbbb",
+            "the over-cap chunk must not be delivered"
+        );
     }
 }

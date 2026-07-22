@@ -497,7 +497,9 @@ async fn data_dataset_schema_inlines_into_openapi() {
     let put = req(Method::PUT, "/data/orders/.schema.json").with_json(&schema);
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::OK));
 
-    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let mut openapi = rt
+        .handle(req(Method::GET, "/.well-known/rs2/openapi"))
+        .await;
     let doc = body_json(&mut openapi).await;
 
     // The generic templated child remains (schema-less datasets).
@@ -511,7 +513,10 @@ async fn data_dataset_schema_inlines_into_openapi() {
     let schema_ref = put_op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
         .as_str()
         .unwrap_or_else(|| panic!("schema-bound request body: {put_op}"));
-    assert!(schema_ref.starts_with("#/components/schemas/"), "{schema_ref}");
+    assert!(
+        schema_ref.starts_with("#/components/schemas/"),
+        "{schema_ref}"
+    );
     let key = schema_ref.rsplit('/').next().unwrap();
     // The inlined schema is the live one — resolvable in-document, no drift.
     assert_eq!(doc["components"]["schemas"][key]["required"][0], "status");
@@ -544,9 +549,14 @@ async fn pipeline_io_schema_surfaces() {
         .find(|a| a["path"] == "/summary")
         .unwrap_or_else(|| panic!("pipeline action missing: {doc}"));
     assert_eq!(action["inputSchema"]["properties"]["id"]["type"], "string");
-    assert_eq!(action["outputSchema"]["properties"]["status"]["type"], "string");
+    assert_eq!(
+        action["outputSchema"]["properties"]["status"]["type"],
+        "string"
+    );
 
-    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let mut openapi = rt
+        .handle(req(Method::GET, "/.well-known/rs2/openapi"))
+        .await;
     let doc = body_json(&mut openapi).await;
     let post = &doc["paths"]["/summary/{path}"]["post"];
     assert_eq!(
@@ -574,11 +584,16 @@ async fn operations_advertise_media_types() {
         ] }),
     );
 
-    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let mut openapi = rt
+        .handle(req(Method::GET, "/.well-known/rs2/openapi"))
+        .await;
     let doc = body_json(&mut openapi).await;
     let content = &doc["paths"]["/logs"]["get"]["responses"]["200"]["content"];
     assert!(content["application/json"].is_object(), "{doc}");
-    assert!(content["text/plain"].is_object(), "NDJSON via Accept: {content}");
+    assert!(
+        content["text/plain"].is_object(),
+        "NDJSON via Accept: {content}"
+    );
 }
 
 /// A deployed `code:` mount with a declared manifest appears on both the agent
@@ -606,7 +621,10 @@ async fn code_manifest_surfaces_on_discovery() {
     deploy.set_header("x-rs2-manifest", &manifest.to_string());
     let mut resp = rt.handle(deploy).await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
-    let code_ref = body_json(&mut resp).await["ref"].as_str().unwrap().to_string();
+    let code_ref = body_json(&mut resp).await["ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let mut config = surface_config();
     config["mounts"].as_array_mut().unwrap().push(json!({
@@ -631,7 +649,9 @@ async fn code_manifest_surfaces_on_discovery() {
     assert_eq!(action["outputSchema"]["properties"]["n"]["type"], "number");
 
     // OpenAPI: a path item carrying the manifest's request/response schemas.
-    let mut openapi = rt.handle(req(Method::GET, "/.well-known/rs2/openapi")).await;
+    let mut openapi = rt
+        .handle(req(Method::GET, "/.well-known/rs2/openapi"))
+        .await;
     let doc = body_json(&mut openapi).await;
     let post = &doc["paths"]["/lookup/{path}"]["post"];
     assert!(post.is_object(), "code path item missing: {doc}");

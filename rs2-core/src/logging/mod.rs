@@ -137,7 +137,10 @@ impl LogRecord {
 
     /// String value of an attribute (reader filters on `rs2.mount` etc.).
     pub fn attr_str(&self, key: &str) -> Option<&str> {
-        self.attributes.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_str())
+        self.attributes
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.as_str())
     }
 
     /// Serialize to one OTLP-shaped JSON object (one NDJSON line). `tenant`
@@ -167,29 +170,56 @@ impl LogRecord {
         let v: Value = serde_json::from_str(line).ok()?;
         let time_unix_nano = v
             .get("timeUnixNano")
-            .and_then(|t| t.as_str().and_then(|s| s.parse::<u128>().ok()).or_else(|| t.as_u64().map(u128::from)))
+            .and_then(|t| {
+                t.as_str()
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .or_else(|| t.as_u64().map(u128::from))
+            })
             .unwrap_or(0);
         let severity = v
             .get("severityNumber")
             .and_then(|n| n.as_u64())
             .map(Severity::from_number)
             .unwrap_or(Severity::Info);
-        let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("").to_string();
-        let trace_id = v.get("traceId").and_then(|t| t.as_str()).unwrap_or("").to_string();
-        let span_id = v.get("spanId").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let body = v
+            .get("body")
+            .and_then(|b| b.as_str())
+            .unwrap_or("")
+            .to_string();
+        let trace_id = v
+            .get("traceId")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        let span_id = v
+            .get("spanId")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
         let attributes = v
             .get("attributes")
             .and_then(|a| a.as_object())
             .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
-        Some(LogRecord { time_unix_nano, severity, body, tenant: tenant.to_string(), trace_id, span_id, attributes })
+        Some(LogRecord {
+            time_unix_nano,
+            severity,
+            body,
+            tenant: tenant.to_string(),
+            trace_id,
+            span_id,
+            attributes,
+        })
     }
 }
 
 /// Wall-clock nanoseconds since the Unix epoch.
 pub fn now_unix_nano() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// A logging sink: fire-and-forget emit. Implementations MUST NOT block the
@@ -323,12 +353,18 @@ pub struct MultiSink {
 impl MultiSink {
     /// Back the reader with `store`, and emit to it.
     pub fn new(store: Arc<dyn LogStore>) -> MultiSink {
-        MultiSink { queryable: Some(store), extra: Vec::new() }
+        MultiSink {
+            queryable: Some(store),
+            extra: Vec::new(),
+        }
     }
 
     /// Write-only: forward to `sinks` only; reads report not-queryable.
     pub fn write_only(sinks: Vec<Arc<dyn LogSink>>) -> MultiSink {
-        MultiSink { queryable: None, extra: sinks }
+        MultiSink {
+            queryable: None,
+            extra: sinks,
+        }
     }
 
     /// Add another sink (e.g. an OTLP exporter) alongside.
@@ -351,7 +387,10 @@ impl LogSink for MultiSink {
         }
     }
     fn enabled(&self) -> bool {
-        self.queryable.as_ref().map(|q| q.enabled()).unwrap_or(false)
+        self.queryable
+            .as_ref()
+            .map(|q| q.enabled())
+            .unwrap_or(false)
             || self.extra.iter().any(|s| s.enabled())
     }
 }
@@ -377,7 +416,10 @@ impl LogStore for MultiSink {
         }
     }
     fn is_queryable(&self) -> bool {
-        self.queryable.as_ref().map(|s| s.is_queryable()).unwrap_or(false)
+        self.queryable
+            .as_ref()
+            .map(|s| s.is_queryable())
+            .unwrap_or(false)
     }
     async fn flush(&self) {
         if let Some(s) = &self.queryable {
@@ -516,14 +558,47 @@ mod tests {
     #[test]
     fn query_filters() {
         let trace = TraceContext::new();
-        let rec = LogRecord::now(Severity::Info, "acme", &trace, "hello world").attr("rs2.mount", "/api");
-        assert!(LogQuery { take: 10, ..Default::default() }.matches(&rec));
-        assert!(LogQuery { min_severity: Some(Severity::Info), ..Default::default() }.matches(&rec));
-        assert!(!LogQuery { min_severity: Some(Severity::Warn), ..Default::default() }.matches(&rec));
-        assert!(LogQuery { service: Some("/api".into()), ..Default::default() }.matches(&rec));
-        assert!(!LogQuery { service: Some("/other".into()), ..Default::default() }.matches(&rec));
-        assert!(LogQuery { contains: Some("world".into()), ..Default::default() }.matches(&rec));
-        assert!(!LogQuery { contains: Some("xyz".into()), ..Default::default() }.matches(&rec));
-        assert!(!LogQuery { trace_id: Some("nope".into()), ..Default::default() }.matches(&rec));
+        let rec =
+            LogRecord::now(Severity::Info, "acme", &trace, "hello world").attr("rs2.mount", "/api");
+        assert!(LogQuery {
+            take: 10,
+            ..Default::default()
+        }
+        .matches(&rec));
+        assert!(LogQuery {
+            min_severity: Some(Severity::Info),
+            ..Default::default()
+        }
+        .matches(&rec));
+        assert!(!LogQuery {
+            min_severity: Some(Severity::Warn),
+            ..Default::default()
+        }
+        .matches(&rec));
+        assert!(LogQuery {
+            service: Some("/api".into()),
+            ..Default::default()
+        }
+        .matches(&rec));
+        assert!(!LogQuery {
+            service: Some("/other".into()),
+            ..Default::default()
+        }
+        .matches(&rec));
+        assert!(LogQuery {
+            contains: Some("world".into()),
+            ..Default::default()
+        }
+        .matches(&rec));
+        assert!(!LogQuery {
+            contains: Some("xyz".into()),
+            ..Default::default()
+        }
+        .matches(&rec));
+        assert!(!LogQuery {
+            trace_id: Some("nope".into()),
+            ..Default::default()
+        }
+        .matches(&rec));
     }
 }

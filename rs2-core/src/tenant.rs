@@ -168,7 +168,9 @@ impl Adapters {
             builtins,
             catalogue: None,
             schedule: Arc::new(crate::scheduler::MemScheduleStore::new()),
-            infras: Arc::new(std::sync::RwLock::new(Arc::new(crate::infra::InfraSet::default()))),
+            infras: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::infra::InfraSet::default(),
+            ))),
             infra_loader: None,
         }
     }
@@ -202,10 +204,7 @@ impl Adapters {
 
     /// Swap the scheduler coordination store (e.g. a shared Redis adapter for
     /// HA fire-once). Defaults to the in-memory single-node store.
-    pub fn with_schedule_store(
-        mut self,
-        store: Arc<dyn crate::scheduler::ScheduleStore>,
-    ) -> Self {
+    pub fn with_schedule_store(mut self, store: Arc<dyn crate::scheduler::ScheduleStore>) -> Self {
         self.schedule = store;
         self
     }
@@ -421,9 +420,11 @@ impl Tenant {
             // adapters; a `data`/`query` mount may instead name a loadable
             // adapter (`"store": {"adapter":"code:…"}`, G13 Phase 2/3) backed by
             // a resident JS bundle. The stock service runs unchanged on either.
-            let files = file_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
+            let files =
+                file_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
             let data = data_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
-            let query = query_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
+            let query =
+                query_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
             let sms = sms_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
 
             // Resolve secrets and outbound credential injectors once, host-side,
@@ -443,8 +444,12 @@ impl Tenant {
                 sms,
                 http: adapters.http.clone(),
                 cache_policy: crate::wrapper::CachePolicy::from_config(mount.config.get("caching")),
-                cache_openly_readable: crate::wrapper::CachePolicy::mount_is_openly_readable(&mount.config),
-                cors: Arc::new(crate::wrapper::CorsPolicy::from_config(config.cors.as_ref())),
+                cache_openly_readable: crate::wrapper::CachePolicy::mount_is_openly_readable(
+                    &mount.config,
+                ),
+                cors: Arc::new(crate::wrapper::CorsPolicy::from_config(
+                    config.cors.as_ref(),
+                )),
                 limits: limits.invocation_limits(),
                 requester: requester.clone(),
                 control: control.clone(),
@@ -497,7 +502,9 @@ impl Tenant {
             mounts,
             instances,
             auth: config.auth.clone(),
-            cors: Arc::new(crate::wrapper::CorsPolicy::from_config(config.cors.as_ref())),
+            cors: Arc::new(crate::wrapper::CorsPolicy::from_config(
+                config.cors.as_ref(),
+            )),
         })
     }
 
@@ -514,14 +521,19 @@ const KNOWN_PATTERNS: &[&str] = &["store", "store-transform", "store-view", "vie
 /// `pipeline`/`wrapper` mount could elevate a call into permission-changing
 /// power. Shared by both service arms.
 fn check_elevate_not_operator(mount: &Mount, operator_roles: Option<&str>) -> Result<(), RsError> {
-    if let (Some(elevate), Some(ops)) =
-        (mount.config.get("elevate").and_then(|v| v.as_str()), operator_roles)
-    {
+    if let (Some(elevate), Some(ops)) = (
+        mount.config.get("elevate").and_then(|v| v.as_str()),
+        operator_roles,
+    ) {
         if ops.split_whitespace().any(|r| r == elevate) {
             return Err(RsError::bad_request(format!(
                 "mount '{}' sets elevate role '{elevate}', which is an operator role; \
                  elevation must not confer operator authority",
-                if mount.base_path.is_empty() { "/" } else { &mount.base_path }
+                if mount.base_path.is_empty() {
+                    "/"
+                } else {
+                    &mount.base_path
+                }
             )));
         }
     }
@@ -577,7 +589,11 @@ fn expand_store(
     if mount.service != kind {
         return Ok((StoreKind::Default, serde_json::json!({})));
     }
-    let raw = mount.config.get("store").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let raw = mount
+        .config
+        .get("store")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     let expanded = crate::infra::expand_infra(&raw, infras, tenant)?.into_owned();
     Ok((classify_store(&expanded)?, expanded))
 }
@@ -607,7 +623,11 @@ fn build_file_backend(
             {
                 let loader = ScopedFileStore::new(adapters.files.clone(), tenant);
                 let guest = crate::engines::resident::GuestFileStore::from_config(
-                    &adapter_ref, store, loader, tenant, limits,
+                    &adapter_ref,
+                    store,
+                    loader,
+                    tenant,
+                    limits,
                 )?;
                 Ok(Arc::new(guest))
             }
@@ -632,7 +652,11 @@ fn resolve_spec_backend(
     limits: crate::contract::InvocationLimits,
     infras: &crate::infra::InfraSet,
 ) -> Result<Arc<dyn FileStore>, RsError> {
-    let raw = mount.config.get("specStore").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let raw = mount
+        .config
+        .get("specStore")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     let expanded = crate::infra::expand_infra(&raw, infras, tenant)?.into_owned();
     let kind = classify_store(&expanded)?;
     build_file_backend(kind, &expanded, adapters, "spec", mount, tenant, limits)
@@ -678,7 +702,9 @@ fn resolve_outbound_injectors(
     if let Some(grants) = mount.config.get("grants").and_then(|g| g.as_object()) {
         for (capability, grant) in grants {
             if let Some(inject) = grant.get("inject") {
-                if let Some(inj) = resolve_one_injector(capability, inject, infras, tenant, secrets)? {
+                if let Some(inj) =
+                    resolve_one_injector(capability, inject, infras, tenant, secrets)?
+                {
                     out.insert(capability.clone(), Arc::new(inj));
                 }
             }
@@ -688,10 +714,11 @@ fn resolve_outbound_injectors(
     // reserved key the service reads (a proxy mount has no `grants`).
     if mount.service == "proxy" {
         if let Some(inject) = mount.config.get("inject") {
-            if let Some(inj) =
-                resolve_one_injector("proxy", inject, infras, tenant, secrets)?
-            {
-                out.insert(crate::services::PROXY_INJECTOR_KEY.to_string(), Arc::new(inj));
+            if let Some(inj) = resolve_one_injector("proxy", inject, infras, tenant, secrets)? {
+                out.insert(
+                    crate::services::PROXY_INJECTOR_KEY.to_string(),
+                    Arc::new(inj),
+                );
             }
         }
     }
@@ -793,7 +820,11 @@ fn data_capability(
             {
                 let files = ScopedFileStore::new(adapters.files.clone(), name);
                 let guest = crate::engines::resident::GuestDataStore::from_config(
-                    &adapter_ref, &store, files, name, limits,
+                    &adapter_ref,
+                    &store,
+                    files,
+                    name,
+                    limits,
                 )?;
                 Ok(Some(ScopedDataStore::new(Arc::new(guest), name)))
             }
@@ -851,7 +882,9 @@ fn query_capability(
             let inner = adapters
                 .builtins
                 .build_query(&builtin, &store)?
-                .ok_or_else(|| unknown_builtin("query", &builtin, adapters.builtins.query_names()))?;
+                .ok_or_else(|| {
+                    unknown_builtin("query", &builtin, adapters.builtins.query_names())
+                })?;
             Ok(Some(ScopedQueryStore::new(inner, name)))
         }
         StoreKind::Code(adapter_ref) => {
@@ -859,7 +892,11 @@ fn query_capability(
             {
                 let files = ScopedFileStore::new(adapters.files.clone(), name);
                 let guest = crate::engines::resident::GuestQueryStore::from_config(
-                    &adapter_ref, &store, files, name, limits,
+                    &adapter_ref,
+                    &store,
+                    files,
+                    name,
+                    limits,
                 )?;
                 Ok(Some(ScopedQueryStore::new(Arc::new(guest), name)))
             }
@@ -904,7 +941,11 @@ fn sms_capability(
             {
                 let files = ScopedFileStore::new(adapters.files.clone(), name);
                 let guest = crate::engines::resident::GuestSmsGateway::from_config(
-                    &adapter_ref, &store, files, name, limits,
+                    &adapter_ref,
+                    &store,
+                    files,
+                    name,
+                    limits,
                 )?;
                 Ok(Some(ScopedSmsGateway::new(Arc::new(guest), name)))
             }
@@ -931,6 +972,10 @@ fn loadable_without_js(kind: &str, mount: &Mount, adapter_ref: &str) -> RsError 
     RsError::engine_unavailable(format!(
         "{kind} mount '{}' uses a loadable adapter ('{adapter_ref}') but this build has no JS \
          engine (rebuild with --features js)",
-        if mount.base_path.is_empty() { "/" } else { &mount.base_path }
+        if mount.base_path.is_empty() {
+            "/"
+        } else {
+            &mount.base_path
+        }
     ))
 }

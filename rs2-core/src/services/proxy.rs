@@ -74,7 +74,8 @@ impl Service for ProxyService {
         out.body = msg.body.take();
 
         if let Some(inj) = ctx.outbound_injectors.get(PROXY_INJECTOR_KEY) {
-            inj.apply(&mut out, ctx.limits.materialized_body_bytes).await?;
+            inj.apply(&mut out, ctx.limits.materialized_body_bytes)
+                .await?;
         }
 
         http.request(out).await

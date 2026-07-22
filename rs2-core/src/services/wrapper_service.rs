@@ -47,15 +47,18 @@ impl WrapperService {
     /// and the schemas live in the mount config and are read directly by
     /// `discovery`, so only the input validator is retained here.
     pub fn from_config(config: &Value) -> Result<Self, RsError> {
-        let spec_value = config
-            .get("pipeline")
-            .ok_or_else(|| RsError::bad_request("a wrapper mount requires an inline 'pipeline' spec"))?;
+        let spec_value = config.get("pipeline").ok_or_else(|| {
+            RsError::bad_request("a wrapper mount requires an inline 'pipeline' spec")
+        })?;
         let spec = PipelineSpec::from_value(spec_value)?;
         let input_validator = compile_schema(config.get("inputSchema"), "inputSchema")?;
         // Compile-check the advisory output schema so a malformed one fails fast;
         // it is not enforced, so the compiled validator is discarded.
         compile_schema(config.get("outputSchema"), "outputSchema")?;
-        Ok(WrapperService { spec, input_validator })
+        Ok(WrapperService {
+            spec,
+            input_validator,
+        })
     }
 }
 
@@ -66,9 +69,11 @@ fn compile_schema(
 ) -> Result<Option<Arc<jsonschema::Validator>>, RsError> {
     match schema {
         None => Ok(None),
-        Some(s) => jsonschema::validator_for(s).map(|v| Some(Arc::new(v))).map_err(|e| {
-            RsError::bad_request(format!("wrapper '{label}' is not a valid JSON Schema: {e}"))
-        }),
+        Some(s) => jsonschema::validator_for(s)
+            .map(|v| Some(Arc::new(v)))
+            .map_err(|e| {
+                RsError::bad_request(format!("wrapper '{label}' is not a valid JSON Schema: {e}"))
+            }),
     }
 }
 
@@ -90,10 +95,18 @@ impl Service for WrapperService {
         // No spec-prefix matching (the inline spec governs the whole mount), so
         // the entire sub-path beyond the mount is the URL plane. `rest` is the
         // byte-exact suffix (`MsgUrl::service_path`) for transparent forwarding.
-        let peeled: Vec<String> =
-            msg.url.service_segments().iter().map(|s| s.to_string()).collect();
-        let base_segs: Vec<String> =
-            msg.url.base_segments().iter().map(|s| s.to_string()).collect();
+        let peeled: Vec<String> = msg
+            .url
+            .service_segments()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let base_segs: Vec<String> = msg
+            .url
+            .base_segments()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let url_name = peeled.last().cloned();
         let url_query = msg.url.query.clone();
         let rest = msg.url.service_path.clone();
@@ -101,7 +114,14 @@ impl Service for WrapperService {
             &self.spec,
             msg,
             ctx,
-            ExecInputs { peeled, base_segs, url_name, url_query, rest, envelope_retry: None },
+            ExecInputs {
+                peeled,
+                base_segs,
+                url_name,
+                url_query,
+                rest,
+                envelope_retry: None,
+            },
         )
         .await
     }

@@ -29,7 +29,12 @@ impl MemDataStore {
 
 #[async_trait]
 impl DataStore for MemDataStore {
-    async fn get(&self, tenant: &str, dataset: &str, key: &str) -> Result<serde_json::Value, RsError> {
+    async fn get(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        key: &str,
+    ) -> Result<serde_json::Value, RsError> {
         self.tenants
             .read()
             .await
@@ -40,7 +45,13 @@ impl DataStore for MemDataStore {
             .ok_or_else(|| RsError::not_found(format!("no record '{key}' in dataset '{dataset}'")))
     }
 
-    async fn put(&self, tenant: &str, dataset: &str, key: &str, value: serde_json::Value) -> Result<bool, RsError> {
+    async fn put(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<bool, RsError> {
         let mut tenants = self.tenants.write().await;
         let ds = tenants
             .entry(tenant.to_string())
@@ -60,7 +71,13 @@ impl DataStore for MemDataStore {
             .ok_or_else(|| RsError::not_found(format!("no record '{key}' in dataset '{dataset}'")))
     }
 
-    async fn list_keys(&self, tenant: &str, dataset: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
+    async fn list_keys(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError> {
         let tenants = self.tenants.read().await;
         let ds = tenants
             .get(tenant)
@@ -71,7 +88,12 @@ impl DataStore for MemDataStore {
         Ok((keys, total))
     }
 
-    async fn list_datasets(&self, tenant: &str, take: usize, skip: usize) -> Result<(Vec<String>, u64), RsError> {
+    async fn list_datasets(
+        &self,
+        tenant: &str,
+        take: usize,
+        skip: usize,
+    ) -> Result<(Vec<String>, u64), RsError> {
         let tenants = self.tenants.read().await;
         let Some(t) = tenants.get(tenant) else {
             return Ok((vec![], 0));
@@ -81,7 +103,11 @@ impl DataStore for MemDataStore {
         Ok((names, total))
     }
 
-    async fn get_schema(&self, tenant: &str, dataset: &str) -> Result<Option<serde_json::Value>, RsError> {
+    async fn get_schema(
+        &self,
+        tenant: &str,
+        dataset: &str,
+    ) -> Result<Option<serde_json::Value>, RsError> {
         Ok(self
             .tenants
             .read()
@@ -91,7 +117,12 @@ impl DataStore for MemDataStore {
             .and_then(|ds| ds.schema.clone()))
     }
 
-    async fn put_schema(&self, tenant: &str, dataset: &str, schema: serde_json::Value) -> Result<(), RsError> {
+    async fn put_schema(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        schema: serde_json::Value,
+    ) -> Result<(), RsError> {
         let mut tenants = self.tenants.write().await;
         tenants
             .entry(tenant.to_string())

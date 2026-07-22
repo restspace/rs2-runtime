@@ -1,4 +1,4 @@
-﻿//! rs2-server: the supported v1 packaging of `rs2-core` (PRD 5.1) —
+//! rs2-server: the supported v1 packaging of `rs2-core` (PRD 5.1) —
 //! a hyper HTTP listener + config loading + adapter wiring + ops endpoints.
 
 use std::collections::HashMap;
@@ -104,7 +104,11 @@ struct FileLogConfig {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        LoggingConfig { sink: default_log_sink(), file: FileLogConfig::default(), level: default_log_level() }
+        LoggingConfig {
+            sink: default_log_sink(),
+            file: FileLogConfig::default(),
+            level: default_log_level(),
+        }
     }
 }
 
@@ -254,8 +258,9 @@ impl ConfigLoader for FileConfigLoader {
         let text = tokio::fs::read_to_string(&path)
             .await
             .map_err(|_| RsError::not_found(format!("unknown tenant '{tenant}'")))?;
-        let value = serde_json::from_str(&text)
-            .map_err(|e| RsError::internal(format!("tenant config for '{tenant}' is invalid: {e}")))?;
+        let value = serde_json::from_str(&text).map_err(|e| {
+            RsError::internal(format!("tenant config for '{tenant}' is invalid: {e}"))
+        })?;
         Ok((value, Self::version_of(&text)))
     }
 
@@ -274,8 +279,8 @@ impl ConfigLoader for FileConfigLoader {
                 ));
             }
         }
-        let text = serde_json::to_string_pretty(config)
-            .map_err(|e| RsError::internal(e.to_string()))?;
+        let text =
+            serde_json::to_string_pretty(config).map_err(|e| RsError::internal(e.to_string()))?;
         // Write-then-rename so a crash never leaves a torn config.
         let tmp = self.dir.join(format!("{tenant}.json.tmp"));
         tokio::fs::write(&tmp, &text)
@@ -323,7 +328,12 @@ fn hyper_request_to_message(req: hyper::Request<Incoming>, tenant: &str) -> Mess
             })
             .boxed();
         // Ingress bodies are Ephemeral: no replayable source (PRD 6.3).
-        msg.body = Some(Body::from_stream(stream, media_type, size, Provenance::Ephemeral));
+        msg.body = Some(Body::from_stream(
+            stream,
+            media_type,
+            size,
+            Provenance::Ephemeral,
+        ));
     }
     msg
 }
@@ -338,7 +348,11 @@ fn message_to_hyper_response(msg: Message) -> Response<OutBody> {
     }
     match msg.body {
         None => builder
-            .body(http_body_util::Empty::new().map_err(std::io::Error::other).boxed_unsync())
+            .body(
+                http_body_util::Empty::new()
+                    .map_err(std::io::Error::other)
+                    .boxed_unsync(),
+            )
             .unwrap(),
         Some(body) => {
             let media_type = body.media_type.to_string();
@@ -368,7 +382,11 @@ fn ops_response(status: StatusCode, content_type: &'static str, body: String) ->
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, content_type)
-        .body(http_body_util::Full::new(Bytes::from(body)).map_err(std::io::Error::other).boxed_unsync())
+        .body(
+            http_body_util::Full::new(Bytes::from(body))
+                .map_err(std::io::Error::other)
+                .boxed_unsync(),
+        )
         .unwrap()
 }
 
@@ -389,12 +407,19 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// The bearer/token presented for a node admin request: `Authorization: Bearer
 /// <t>` or `X-Admin-Token: <t>`.
 fn presented_admin_token(req: &hyper::Request<Incoming>) -> Option<String> {
-    if let Some(v) = req.headers().get(http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(v) = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Some(tok) = v.strip_prefix("Bearer ") {
             return Some(tok.trim().to_string());
         }
     }
-    req.headers().get("x-admin-token").and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+    req.headers()
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 async fn serve_request(
@@ -407,7 +432,11 @@ async fn serve_request(
     if path == "/healthz" || path == "/readyz" {
         return Response::builder()
             .status(StatusCode::OK)
-            .body(http_body_util::Full::new(Bytes::from_static(b"ok")).map_err(std::io::Error::other).boxed_unsync())
+            .body(
+                http_body_util::Full::new(Bytes::from_static(b"ok"))
+                    .map_err(std::io::Error::other)
+                    .boxed_unsync(),
+            )
             .unwrap();
     }
     // Node admin: reload infras without restarting (PRD §9.1). Operator-gated by
@@ -463,7 +492,11 @@ async fn serve_request(
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(http::header::CONTENT_TYPE, "application/problem+json")
-            .body(http_body_util::Full::new(Bytes::from(problem)).map_err(std::io::Error::other).boxed_unsync())
+            .body(
+                http_body_util::Full::new(Bytes::from(problem))
+                    .map_err(std::io::Error::other)
+                    .boxed_unsync(),
+            )
             .unwrap();
     };
     let msg = hyper_request_to_message(req, &tenant);
@@ -503,7 +536,10 @@ async fn seed_bootstrap_admin(
             .filter(|s| !s.is_empty())
     }
     let email = resolve("RS2_ADMIN_EMAIL", bootstrap.and_then(|b| b.email.as_ref()));
-    let password = resolve("RS2_ADMIN_PASSWORD", bootstrap.and_then(|b| b.password.as_ref()));
+    let password = resolve(
+        "RS2_ADMIN_PASSWORD",
+        bootstrap.and_then(|b| b.password.as_ref()),
+    );
 
     let (email, password) = match (email, password) {
         (None, None) => return Ok(()), // opted out
@@ -562,7 +598,9 @@ async fn seed_bootstrap_admin(
         "kind": "user",
     });
     data.put(&tenant, &dataset, &email, record).await?;
-    println!("seeded bootstrap admin '{email}' (role A) into dataset '{dataset}' of tenant '{tenant}'");
+    println!(
+        "seeded bootstrap admin '{email}' (role A) into dataset '{dataset}' of tenant '{tenant}'"
+    );
     Ok(())
 }
 
@@ -592,7 +630,10 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     // absolute base, then rewrite the path-bearing fields in place.
     let config_abs = std::fs::canonicalize(config_path)
         .map_err(|e| format!("cannot resolve server config path '{config_path}': {e}"))?;
-    let base_dir = config_abs.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let base_dir = config_abs
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     config.tenants_dir = resolve_against(&base_dir, &config.tenants_dir);
     config.file_root = resolve_against(&base_dir, &config.file_root);
     config.data_root = resolve_against(&base_dir, &config.data_root);
@@ -601,7 +642,13 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     let tenancy = match config.tenancy {
         TenancyConfig::Single { tenant } => Tenancy::Single { tenant },
-        TenancyConfig::Multi { domain_map, main_domain } => Tenancy::Multi { domain_map, main_domain },
+        TenancyConfig::Multi {
+            domain_map,
+            main_domain,
+        } => Tenancy::Multi {
+            domain_map,
+            main_domain,
+        },
     };
     // Log sink (PRD §14): file store (default) or a no-op. The severity floor
     // governs boundary-log volume; 5xx always emit.
@@ -658,19 +705,33 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     // Infras (PRD §9.1): seed from `infras.json` and keep the loader so the
     // admin endpoint can hot-reload it. A malformed file fails startup.
-    let infra_loader = Arc::new(FileInfraLoader { path: PathBuf::from(&config.infras_path) });
+    let infra_loader = Arc::new(FileInfraLoader {
+        path: PathBuf::from(&config.infras_path),
+    });
     let infras = rs2_core::infra::InfraLoader::load(infra_loader.as_ref())
         .map_err(|e| format!("loading infras '{}': {}", config.infras_path, e.detail))?;
     if !infras.is_empty() {
-        println!("loaded {} infra(s): {}", infras.len(), infras.names().join(", "));
+        println!(
+            "loaded {} infra(s): {}",
+            infras.len(),
+            infras.names().join(", ")
+        );
     }
     let adapters = adapters.with_infras(infras).with_infra_loader(infra_loader);
 
-    let loader = Arc::new(FileConfigLoader { dir: PathBuf::from(&config.tenants_dir) });
+    let loader = Arc::new(FileConfigLoader {
+        dir: PathBuf::from(&config.tenants_dir),
+    });
 
     // Seed the bootstrap admin (single-tenant) before serving, so a locked
     // `services` mount always has an `A`-role principal to manage it.
-    seed_bootstrap_admin(&tenancy, config.bootstrap_admin.as_ref(), &loader, &adapters.data).await?;
+    seed_bootstrap_admin(
+        &tenancy,
+        config.bootstrap_admin.as_ref(),
+        &loader,
+        &adapters.data,
+    )
+    .await?;
 
     let runtime = Runtime::new(tenancy, adapters, loader, LimitTable::default());
 
@@ -738,9 +799,15 @@ mod tests {
         )
         .unwrap();
         match config.tenancy {
-            TenancyConfig::Multi { domain_map, main_domain } => {
+            TenancyConfig::Multi {
+                domain_map,
+                main_domain,
+            } => {
                 assert_eq!(main_domain.as_deref(), Some("rs2.example.com"));
-                assert_eq!(domain_map.get("api.acme.com").map(String::as_str), Some("acme"));
+                assert_eq!(
+                    domain_map.get("api.acme.com").map(String::as_str),
+                    Some("acme")
+                );
             }
             other => panic!("expected multi tenancy, got {other:?}"),
         }
@@ -755,4 +822,3 @@ mod tests {
         assert!(constant_time_eq(b"", b""));
     }
 }
-

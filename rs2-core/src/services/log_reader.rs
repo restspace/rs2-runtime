@@ -88,8 +88,11 @@ impl Service for LogReaderService {
 
         let body = if wants_text {
             // One OTLP-JSON record per line (NDJSON).
-            let text =
-                records.iter().map(|r| r.to_otlp_json().to_string()).collect::<Vec<_>>().join("\n");
+            let text = records
+                .iter()
+                .map(|r| r.to_otlp_json().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
             Body::from_bytes(text, MediaType::new("text/plain; charset=utf-8"))
         } else {
             let arr = serde_json::Value::Array(records.iter().map(|r| r.to_otlp_json()).collect());

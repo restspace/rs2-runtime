@@ -40,17 +40,29 @@ fn as_admin(mut msg: Message) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 fn runtime(dir: &std::path::Path) -> Arc<Runtime> {
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir)), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
         { "path": "/pipe", "service": "pipeline",
           "config": { "access": { "invoke": "all", "write": "A" } } }
     ]})));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 async fn author(rt: &Runtime, pipeline: serde_json::Value) {
@@ -58,7 +70,10 @@ async fn author(rt: &Runtime, pipeline: serde_json::Value) {
         .with_json(&json!({ "pipeline": pipeline }));
     let resp = rt.handle(put).await;
     assert!(
-        matches!(resp.status, Some(StatusCode::CREATED) | Some(StatusCode::OK)),
+        matches!(
+            resp.status,
+            Some(StatusCode::CREATED) | Some(StatusCode::OK)
+        ),
         "author: {:?}",
         resp.status
     );
@@ -81,8 +96,15 @@ async fn envelope_sets_status_headers_and_media_type() {
     )
     .await;
 
-    let mut resp = rt.handle(req(Method::POST, "/pipe").with_json(&json!({}))).await;
-    assert_eq!(resp.status, Some(StatusCode::CREATED), "status from envelope: {:?}", resp.body);
+    let mut resp = rt
+        .handle(req(Method::POST, "/pipe").with_json(&json!({})))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::CREATED),
+        "status from envelope: {:?}",
+        resp.body
+    );
     assert_eq!(resp.header("location"), Some("/things/1"));
     assert_eq!(
         resp.body.as_ref().unwrap().media_type.essence(),
@@ -99,15 +121,22 @@ async fn string_body_is_raw_text_and_plain_objects_stay_200() {
 
     // v1 `to-text`: JSON in, text/plain out.
     author(&rt, json!([{ "$response": { "body": "'rendered text'" } }])).await;
-    let mut resp = rt.handle(req(Method::POST, "/pipe").with_json(&json!({}))).await;
+    let mut resp = rt
+        .handle(req(Method::POST, "/pipe").with_json(&json!({})))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
-    assert_eq!(resp.body.as_ref().unwrap().media_type.essence(), "text/plain");
+    assert_eq!(
+        resp.body.as_ref().unwrap().media_type.essence(),
+        "text/plain"
+    );
     let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
     assert_eq!(&bytes[..], b"rendered text");
 
     // A plain transform output is unaffected: body + forced 200.
     author(&rt, json!([{ "shaped": "false" }])).await;
-    let mut resp = rt.handle(req(Method::POST, "/pipe").with_json(&json!({}))).await;
+    let mut resp = rt
+        .handle(req(Method::POST, "/pipe").with_json(&json!({})))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     assert_eq!(body_json(&mut resp).await["shaped"], false);
 }
@@ -127,8 +156,15 @@ async fn captured_envelopes_are_data_not_directives() {
     )
     .await;
 
-    let mut resp = rt.handle(req(Method::POST, "/pipe").with_json(&json!({}))).await;
-    assert_eq!(resp.status, Some(StatusCode::OK), "capture path shapes nothing: {:?}", resp.body);
+    let mut resp = rt
+        .handle(req(Method::POST, "/pipe").with_json(&json!({})))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "capture path shapes nothing: {:?}",
+        resp.body
+    );
     assert_eq!(body_json(&mut resp).await["captured"], true);
 }
 
@@ -138,6 +174,13 @@ async fn invalid_status_is_a_structured_400() {
     let rt = runtime(dir.path());
     author(&rt, json!([{ "$response": { "status": "1000" } }])).await;
 
-    let resp = rt.handle(req(Method::POST, "/pipe").with_json(&json!({}))).await;
-    assert_eq!(resp.status, Some(StatusCode::BAD_REQUEST), "bad status surfaces: {:?}", resp.body);
+    let resp = rt
+        .handle(req(Method::POST, "/pipe").with_json(&json!({})))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::BAD_REQUEST),
+        "bad status surfaces: {:?}",
+        resp.body
+    );
 }

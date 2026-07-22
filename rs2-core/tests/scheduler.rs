@@ -48,7 +48,12 @@ impl LogStore for RecordingLog {
 
 impl RecordingLog {
     fn fires(&self) -> usize {
-        self.lines.lock().unwrap().iter().filter(|l| l.contains("POST /job")).count()
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("POST /job"))
+            .count()
     }
 }
 
@@ -164,7 +169,9 @@ fn build_with(
         ]
     });
     Runtime::new(
-        Tenancy::Single { tenant: "t1".into() },
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
         adapters,
         Arc::new(Loader(config)),
         LimitTable::default(),
@@ -176,7 +183,11 @@ fn build(
     rec: RecordingLog,
     schedule_store: Option<Arc<dyn ScheduleStore>>,
 ) -> Arc<Runtime> {
-    build_with(Arc::new(LocalFsFileStore::new(file_root)), rec, schedule_store)
+    build_with(
+        Arc::new(LocalFsFileStore::new(file_root)),
+        rec,
+        schedule_store,
+    )
 }
 
 #[tokio::test]
@@ -202,7 +213,10 @@ async fn claim_denied_skips_firing() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    assert!(deny.calls.load(Ordering::SeqCst) >= 1, "scheduler should attempt to claim");
+    assert!(
+        deny.calls.load(Ordering::SeqCst) >= 1,
+        "scheduler should attempt to claim"
+    );
     assert_eq!(rec.fires(), 0, "a lost claim must not fire");
 }
 
@@ -228,7 +242,13 @@ async fn overlap_guard_serializes_fires_of_one_mount() {
     // The slow path was exercised (fires happened), and the overlap guard kept
     // them from ever running concurrently — exactly one fire of /job at a time.
     let peak = max_concurrent.load(Ordering::SeqCst);
-    assert!(peak >= 1, "expected the scheduled fire to exercise the (slow) store");
-    assert_eq!(peak, 1, "overlap guard must serialize a mount's fires, saw {peak} concurrent");
+    assert!(
+        peak >= 1,
+        "expected the scheduled fire to exercise the (slow) store"
+    );
+    assert_eq!(
+        peak, 1,
+        "overlap guard must serialize a mount's fires, saw {peak} concurrent"
+    );
     assert!(rec.fires() >= 1, "expected at least one completed fire");
 }

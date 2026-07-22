@@ -54,20 +54,27 @@ pub fn json_object_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars
         instance_type: Some(schemars::schema::InstanceType::Object.into()),
         ..Default::default()
     };
-    obj.extensions.insert("editor".to_string(), serde_json::json!("json"));
+    obj.extensions
+        .insert("editor".to_string(), serde_json::json!("json"));
     schemars::schema::Schema::Object(obj)
 }
 
 /// Schema for a wrapper's inline `pipeline`: a JSON value edited as raw JSON,
 /// but either an object (the typed spec) or an array (the string DSL) —
 /// `{ "type": ["object", "array"], "editor": "json" }`.
-pub fn pipeline_value_schema(_gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+pub fn pipeline_value_schema(
+    _gen: &mut schemars::gen::SchemaGenerator,
+) -> schemars::schema::Schema {
     use schemars::schema::{InstanceType, SingleOrVec};
     let mut obj = schemars::schema::SchemaObject {
-        instance_type: Some(SingleOrVec::Vec(vec![InstanceType::Object, InstanceType::Array])),
+        instance_type: Some(SingleOrVec::Vec(vec![
+            InstanceType::Object,
+            InstanceType::Array,
+        ])),
         ..Default::default()
     };
-    obj.extensions.insert("editor".to_string(), serde_json::json!("json"));
+    obj.extensions
+        .insert("editor".to_string(), serde_json::json!("json"));
     schemars::schema::Schema::Object(obj)
 }
 
@@ -391,8 +398,16 @@ mod tests {
         let props = &schema["properties"];
         // inputSchema/outputSchema are always objects.
         for field in ["inputSchema", "outputSchema"] {
-            assert_eq!(props[field]["type"], "object", "{field} type: {}", props[field]);
-            assert_eq!(props[field]["editor"], "json", "{field} editor: {}", props[field]);
+            assert_eq!(
+                props[field]["type"], "object",
+                "{field} type: {}",
+                props[field]
+            );
+            assert_eq!(
+                props[field]["editor"], "json",
+                "{field} editor: {}",
+                props[field]
+            );
         }
         // pipeline is an object (typed spec) or an array (string DSL).
         assert_eq!(props["pipeline"]["editor"], "json", "{}", props["pipeline"]);
@@ -441,7 +456,11 @@ mod tests {
     fn jwt_secret_is_marked_write_only() {
         let auth = schema_of::<AuthSettings>();
         let jwt = &auth["properties"]["jwtSecret"];
-        assert_eq!(jwt["writeOnly"], serde_json::json!(true), "schema: {auth:#}");
+        assert_eq!(
+            jwt["writeOnly"],
+            serde_json::json!(true),
+            "schema: {auth:#}"
+        );
         assert_eq!(jwt["format"], serde_json::json!("password"));
     }
 }

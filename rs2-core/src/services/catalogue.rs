@@ -78,10 +78,16 @@ impl HttpCatalogueClient {
     fn check_host(&self, url: &str) -> Result<(), RsError> {
         let host = crate::outbound::url_host(url)
             .ok_or_else(|| RsError::bad_request(format!("catalogue URL '{url}' has no host")))?;
-        if self.hosts.iter().any(|p| crate::outbound::host_matches(p, &host)) {
+        if self
+            .hosts
+            .iter()
+            .any(|p| crate::outbound::host_matches(p, &host))
+        {
             Ok(())
         } else {
-            Err(RsError::capability_denied(&format!("catalogue fetch to '{host}'")))
+            Err(RsError::capability_denied(&format!(
+                "catalogue fetch to '{host}'"
+            )))
         }
     }
 
@@ -110,7 +116,9 @@ impl CatalogueClient for HttpCatalogueClient {
     async fn fetch_catalogue(&self, url: &str) -> Result<CatalogueDoc, RsError> {
         let bytes = self.get_bytes(url).await?;
         serde_json::from_slice(&bytes).map_err(|e| {
-            RsError::bad_request(format!("catalogue '{url}' is not a valid catalogue document: {e}"))
+            RsError::bad_request(format!(
+                "catalogue '{url}' is not a valid catalogue document: {e}"
+            ))
         })
     }
 

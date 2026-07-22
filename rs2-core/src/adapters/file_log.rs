@@ -58,7 +58,12 @@ impl FileLogStore {
             last_reported: 0,
         };
         tokio::spawn(writer.run(rx));
-        FileLogStore { tx, dropped, root, backups }
+        FileLogStore {
+            tx,
+            dropped,
+            root,
+            backups,
+        }
     }
 
     /// Open a store under `root` with default rotation (8 MiB × 5 backups).
@@ -135,7 +140,16 @@ fn sanitize(tenant: &str) -> String {
         return "_invalid".to_string();
     }
     if tenant.chars().any(|c| matches!(c, '/' | '\\' | '.')) {
-        tenant.chars().map(|c| if matches!(c, '/' | '\\' | '.') { '_' } else { c }).collect()
+        tenant
+            .chars()
+            .map(|c| {
+                if matches!(c, '/' | '\\' | '.') {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect()
     } else {
         tenant.to_string()
     }
@@ -206,7 +220,9 @@ impl Writer {
     /// live file to `.1`. The next write reopens a fresh live file.
     async fn rotate(&self, name: &str) {
         if self.backups == 0 {
-            tokio::fs::remove_file(self.root.join(format!("{name}.ndjson"))).await.ok();
+            tokio::fs::remove_file(self.root.join(format!("{name}.ndjson")))
+                .await
+                .ok();
             return;
         }
         let oldest = self.root.join(format!("{name}.ndjson.{}", self.backups));
@@ -234,13 +250,19 @@ impl Writer {
         if total > self.last_reported {
             let n = total - self.last_reported;
             self.last_reported = total;
-            eprintln!("rs2 logging: dropped {n} log record(s) under write pressure (total {total})");
+            eprintln!(
+                "rs2 logging: dropped {n} log record(s) under write pressure (total {total})"
+            );
         }
     }
 }
 
 async fn open_append(path: &Path) -> std::io::Result<FileHandle> {
-    let file = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await?;
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
     let size = file.metadata().await?.len();
     Ok(FileHandle { file, size })
 }

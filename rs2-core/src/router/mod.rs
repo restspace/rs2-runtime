@@ -11,8 +11,13 @@ use crate::error::RsError;
 /// explicit domain map → `{tenant}.{main_domain}` subdomain.
 #[derive(Debug, Clone)]
 pub enum Tenancy {
-    Single { tenant: String },
-    Multi { domain_map: HashMap<String, String>, main_domain: Option<String> },
+    Single {
+        tenant: String,
+    },
+    Multi {
+        domain_map: HashMap<String, String>,
+        main_domain: Option<String>,
+    },
 }
 
 impl Tenancy {
@@ -21,7 +26,10 @@ impl Tenancy {
         let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
         match self {
             Tenancy::Single { tenant } => Some(tenant.clone()),
-            Tenancy::Multi { domain_map, main_domain } => {
+            Tenancy::Multi {
+                domain_map,
+                main_domain,
+            } => {
                 if let Some(tenant) = domain_map.get(&host) {
                     return Some(tenant.clone());
                 }
@@ -54,14 +62,16 @@ pub fn validate_path(path: &str) -> Result<(), RsError> {
         if candidate.chars().any(|c| c.is_control()) {
             return Err(RsError::path_unsafe("path contains control characters"));
         }
-        if candidate.split('/').any(|seg| seg.len() >= 2 && seg.chars().all(|c| c == '.')) {
+        if candidate
+            .split('/')
+            .any(|seg| seg.len() >= 2 && seg.chars().all(|c| c == '.'))
+        {
             return Err(RsError::path_unsafe("path contains a traversal segment"));
         }
         // Windows drive letters, e.g. `C:` anywhere in a segment start.
-        if candidate
-            .split('/')
-            .any(|seg| seg.len() >= 2 && seg.as_bytes()[1] == b':' && seg.as_bytes()[0].is_ascii_alphabetic())
-        {
+        if candidate.split('/').any(|seg| {
+            seg.len() >= 2 && seg.as_bytes()[1] == b':' && seg.as_bytes()[0].is_ascii_alphabetic()
+        }) {
             return Err(RsError::path_unsafe("path contains a drive letter"));
         }
     }
@@ -89,14 +99,22 @@ impl MountTable {
     pub fn new(mut mounts: Vec<Mount>) -> Result<Self, RsError> {
         for m in &mut mounts {
             let normalized = format!("/{}", m.base_path.trim_matches('/'));
-            m.base_path = if normalized == "/" { String::new() } else { normalized };
+            m.base_path = if normalized == "/" {
+                String::new()
+            } else {
+                normalized
+            };
         }
         let mut seen = std::collections::HashSet::new();
         for m in &mounts {
             if !seen.insert(m.base_path.clone()) {
                 return Err(RsError::bad_request(format!(
                     "duplicate mount path '{}'",
-                    if m.base_path.is_empty() { "/" } else { &m.base_path }
+                    if m.base_path.is_empty() {
+                        "/"
+                    } else {
+                        &m.base_path
+                    }
                 )));
             }
         }
@@ -126,8 +144,13 @@ mod tests {
 
     #[test]
     fn resolves_tenancy() {
-        let single = Tenancy::Single { tenant: "main".into() };
-        assert_eq!(single.resolve("anything.example:8080").as_deref(), Some("main"));
+        let single = Tenancy::Single {
+            tenant: "main".into(),
+        };
+        assert_eq!(
+            single.resolve("anything.example:8080").as_deref(),
+            Some("main")
+        );
 
         let multi = Tenancy::Multi {
             domain_map: HashMap::from([("api.acme.com".to_string(), "acme".to_string())]),
@@ -153,9 +176,21 @@ mod tests {
     #[test]
     fn longest_prefix_wins_on_segment_boundaries() {
         let table = MountTable::new(vec![
-            Mount { base_path: "/files".into(), service: "file".into(), config: json!({}) },
-            Mount { base_path: "/files/special".into(), service: "data".into(), config: json!({}) },
-            Mount { base_path: "/".into(), service: "file".into(), config: json!({}) },
+            Mount {
+                base_path: "/files".into(),
+                service: "file".into(),
+                config: json!({}),
+            },
+            Mount {
+                base_path: "/files/special".into(),
+                service: "data".into(),
+                config: json!({}),
+            },
+            Mount {
+                base_path: "/".into(),
+                service: "file".into(),
+                config: json!({}),
+            },
         ])
         .unwrap();
         assert_eq!(table.route("/files/special/x").unwrap().service, "data");
@@ -167,8 +202,16 @@ mod tests {
     #[test]
     fn rejects_duplicate_mounts() {
         assert!(MountTable::new(vec![
-            Mount { base_path: "/x".into(), service: "file".into(), config: json!({}) },
-            Mount { base_path: "x/".into(), service: "data".into(), config: json!({}) },
+            Mount {
+                base_path: "/x".into(),
+                service: "file".into(),
+                config: json!({})
+            },
+            Mount {
+                base_path: "x/".into(),
+                service: "data".into(),
+                config: json!({})
+            },
         ])
         .is_err());
     }

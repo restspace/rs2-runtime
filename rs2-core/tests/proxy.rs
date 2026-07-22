@@ -26,7 +26,11 @@ struct MockHttp {
 
 impl MockHttp {
     fn new() -> Self {
-        MockHttp { url: Mutex::new(Vec::new()), auth: Mutex::new(Vec::new()), cookie: Mutex::new(Vec::new()) }
+        MockHttp {
+            url: Mutex::new(Vec::new()),
+            auth: Mutex::new(Vec::new()),
+            cookie: Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -39,8 +43,14 @@ impl HttpOut for MockHttp {
             format!("{}?{}", msg.url.path, msg.url.query)
         };
         self.url.lock().unwrap().push(url);
-        self.auth.lock().unwrap().push(msg.header("authorization").map(String::from));
-        self.cookie.lock().unwrap().push(msg.header("cookie").map(String::from));
+        self.auth
+            .lock()
+            .unwrap()
+            .push(msg.header("authorization").map(String::from));
+        self.cookie
+            .lock()
+            .unwrap()
+            .push(msg.header("cookie").map(String::from));
         Ok(msg.ok_json(&json!({ "object": "charge", "paid": true })))
     }
 }
@@ -97,23 +107,46 @@ async fn proxy_forwards_to_target_with_injected_auth_and_no_secret_leak() {
         LimitTable::default(),
     );
 
-    let mut resp = rt.handle(Message::request(Method::GET, "/stripe/v1/charges?limit=3", "t")).await;
+    let mut resp = rt
+        .handle(Message::request(
+            Method::GET,
+            "/stripe/v1/charges?limit=3",
+            "t",
+        ))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
-    assert_eq!(resp.body.as_mut().unwrap().as_json(65536).await.unwrap()["paid"], true);
+    assert_eq!(
+        resp.body.as_mut().unwrap().as_json(65536).await.unwrap()["paid"],
+        true
+    );
 
     // The request reached the target host with the remaining path + query…
     let url = http.url.lock().unwrap();
     assert_eq!(url.len(), 1);
     assert_eq!(url[0], "https://api.stripe.com/v1/charges?limit=3");
     // …and carried the operator credential, injected host-side.
-    assert_eq!(http.auth.lock().unwrap()[0].as_deref(), Some("Bearer sk_live_42"));
+    assert_eq!(
+        http.auth.lock().unwrap()[0].as_deref(),
+        Some("Bearer sk_live_42")
+    );
 
     // The secret never appears in the tenant config round-trip.
-    let mut raw = rt.handle(Message::request(Method::GET, "/services/raw", "t")).await;
-    let raw_text =
-        String::from_utf8_lossy(raw.body.as_mut().unwrap().materialize(1 << 20).await.unwrap())
-            .to_string();
-    assert!(!raw_text.contains("sk_live_42"), "secret leaked into /services/raw");
+    let mut raw = rt
+        .handle(Message::request(Method::GET, "/services/raw", "t"))
+        .await;
+    let raw_text = String::from_utf8_lossy(
+        raw.body
+            .as_mut()
+            .unwrap()
+            .materialize(1 << 20)
+            .await
+            .unwrap(),
+    )
+    .to_string();
+    assert!(
+        !raw_text.contains("sk_live_42"),
+        "secret leaked into /services/raw"
+    );
 }
 
 #[tokio::test]
@@ -175,6 +208,14 @@ async fn proxy_strips_caller_credentials_before_forwarding() {
     assert_eq!(resp.status, Some(StatusCode::OK), "{:?}", resp.body);
 
     // The caller's bearer and cookie were stripped, not relayed upstream.
-    assert_eq!(http.auth.lock().unwrap()[0], None, "caller Authorization leaked upstream");
-    assert_eq!(http.cookie.lock().unwrap()[0], None, "caller Cookie leaked upstream");
+    assert_eq!(
+        http.auth.lock().unwrap()[0],
+        None,
+        "caller Authorization leaked upstream"
+    );
+    assert_eq!(
+        http.cookie.lock().unwrap()[0],
+        None,
+        "caller Cookie leaked upstream"
+    );
 }

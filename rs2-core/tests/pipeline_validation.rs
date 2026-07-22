@@ -42,17 +42,29 @@ fn as_admin(mut msg: Message) -> Message {
 }
 
 async fn body_json(msg: &mut Message) -> serde_json::Value {
-    msg.body.as_mut().expect("body").as_json(1024 * 1024).await.expect("json body")
+    msg.body
+        .as_mut()
+        .expect("body")
+        .as_json(1024 * 1024)
+        .await
+        .expect("json body")
 }
 
 fn runtime(dir: &std::path::Path) -> Arc<Runtime> {
-    let adapters =
-        Adapters::new(Arc::new(LocalFsFileStore::new(dir)), Arc::new(MemDataStore::new()));
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir)),
+        Arc::new(MemDataStore::new()),
+    );
     let loader = Arc::new(StaticLoader(json!({ "mounts": [
         { "path": "/pipe", "service": "pipeline",
           "config": { "access": { "invoke": "all", "write": "A" } } }
     ]})));
-    Runtime::new(Tenancy::Single { tenant: "t".into() }, adapters, loader, LimitTable::default())
+    Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    )
 }
 
 #[tokio::test]
@@ -72,16 +84,31 @@ async fn put_rejects_invalid_expression_in_dead_branch() {
         }
     }));
     let mut resp = rt.handle(put).await;
-    assert_eq!(resp.status, Some(StatusCode::UNPROCESSABLE_ENTITY), "{:?}", resp.body);
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::UNPROCESSABLE_ENTITY),
+        "{:?}",
+        resp.body
+    );
     let problem = body_json(&mut resp).await;
     assert_eq!(problem["code"], "validation_failed");
     let errors = problem["errors"].to_string();
-    assert!(errors.contains("steps[1]"), "error names the dead branch: {errors}");
+    assert!(
+        errors.contains("steps[1]"),
+        "error names the dead branch: {errors}"
+    );
     assert!(errors.contains("invalid JSONata expression"), "{errors}");
 
     // Nothing was stored: the mount root has no spec to execute.
-    let missing = rt.handle(req(Method::POST, "/pipe").with_json(&json!({}))).await;
-    assert_eq!(missing.status, Some(StatusCode::NOT_FOUND), "{:?}", missing.body);
+    let missing = rt
+        .handle(req(Method::POST, "/pipe").with_json(&json!({})))
+        .await;
+    assert_eq!(
+        missing.status,
+        Some(StatusCode::NOT_FOUND),
+        "{:?}",
+        missing.body
+    );
 
     // The same spec with the expression fixed is accepted.
     let put = as_admin(req(Method::PUT, "/pipe/.pipelines/.root")).with_json(&json!({
@@ -95,7 +122,10 @@ async fn put_rejects_invalid_expression_in_dead_branch() {
     }));
     let resp = rt.handle(put).await;
     assert!(
-        matches!(resp.status, Some(StatusCode::CREATED) | Some(StatusCode::OK)),
+        matches!(
+            resp.status,
+            Some(StatusCode::CREATED) | Some(StatusCode::OK)
+        ),
         "{:?}",
         resp.status
     );

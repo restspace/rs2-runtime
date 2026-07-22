@@ -42,7 +42,9 @@ impl HttpOut for UreqHttpOut {
             format!("{}?{}", msg.url.path, msg.url.query)
         };
         if !url.starts_with("http://") && !url.starts_with("https://") {
-            return Err(RsError::bad_request(format!("not an absolute http(s) URL: '{url}'")));
+            return Err(RsError::bad_request(format!(
+                "not an absolute http(s) URL: '{url}'"
+            )));
         }
         let method = msg.method.to_string();
         let headers: Vec<(String, String)> = msg
@@ -71,8 +73,12 @@ impl HttpOut for UreqHttpOut {
                 // Status errors still carry a response to surface.
                 Err(ureq::Error::Status(_, resp)) => resp,
                 Err(e) => {
-                    let mut err =
-                        RsError::new(502, crate::error::codes::INTERNAL, "Upstream Error", e.to_string());
+                    let mut err = RsError::new(
+                        502,
+                        crate::error::codes::INTERNAL,
+                        "Upstream Error",
+                        e.to_string(),
+                    );
                     err.retryable = true;
                     return Err(err);
                 }

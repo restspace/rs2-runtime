@@ -64,14 +64,16 @@ impl Service for QueryService {
             .query
             .as_ref()
             .ok_or_else(|| RsError::internal("query service has no QueryStore capability"))?;
-        let segments: Vec<String> =
-            msg.url.service_segments().iter().map(|s| s.to_string()).collect();
+        let segments: Vec<String> = msg
+            .url
+            .service_segments()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let Some((doc, split)) = self.store.resolve(&segments).await? else {
             return Err(RsError::not_found(format!(
                 "no stored query matches '{}' (author one at {}{}/…)",
-                msg.url.service_path,
-                msg.url.base_path,
-                QUERY_SUBTREE,
+                msg.url.service_path, msg.url.base_path, QUERY_SUBTREE,
             )));
         };
         let envelope = QueryEnvelope::parse(&doc)?;

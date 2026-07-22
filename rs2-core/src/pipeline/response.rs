@@ -34,7 +34,9 @@ impl<'a> ResponseEnvelope<'a> {
         if obj.len() != 1 {
             return None;
         }
-        obj.get("$response")?.as_object().map(|inner| ResponseEnvelope { inner })
+        obj.get("$response")?
+            .as_object()
+            .map(|inner| ResponseEnvelope { inner })
     }
 
     /// Apply the directive to the response message. Invalid directives are
@@ -52,11 +54,18 @@ impl<'a> ResponseEnvelope<'a> {
         let status = match self.inner.get("status") {
             None => http::StatusCode::OK,
             Some(v) => {
-                let code = v.as_u64().and_then(|n| u16::try_from(n).ok()).ok_or_else(|| {
-                    RsError::bad_request(format!("$response.status must be an integer, got {v}"))
-                })?;
+                let code = v
+                    .as_u64()
+                    .and_then(|n| u16::try_from(n).ok())
+                    .ok_or_else(|| {
+                        RsError::bad_request(format!(
+                            "$response.status must be an integer, got {v}"
+                        ))
+                    })?;
                 http::StatusCode::from_u16(code).map_err(|_| {
-                    RsError::bad_request(format!("$response.status {code} is not a valid HTTP status"))
+                    RsError::bad_request(format!(
+                        "$response.status {code} is not a valid HTTP status"
+                    ))
                 })?
             }
         };
@@ -75,7 +84,9 @@ impl<'a> ResponseEnvelope<'a> {
             // A string body is raw text (v1 `to-text`), not a JSON-encoded
             // string; other JSON stays JSON.
             Some(Value::String(s)) => {
-                let mt = media_type.clone().unwrap_or_else(|| MediaType::new("text/plain"));
+                let mt = media_type
+                    .clone()
+                    .unwrap_or_else(|| MediaType::new("text/plain"));
                 msg.body = Some(Body::from_string(s.clone(), mt));
             }
             Some(v) => {
@@ -95,7 +106,9 @@ impl<'a> ResponseEnvelope<'a> {
 
         if let Some(headers) = self.inner.get("headers") {
             let headers = headers.as_object().ok_or_else(|| {
-                RsError::bad_request(format!("$response.headers must be an object, got {headers}"))
+                RsError::bad_request(format!(
+                    "$response.headers must be an object, got {headers}"
+                ))
             })?;
             for (name, value) in headers {
                 let value = match value {
@@ -108,10 +121,12 @@ impl<'a> ResponseEnvelope<'a> {
                         )))
                     }
                 };
-                let name = http::header::HeaderName::from_bytes(name.as_bytes())
-                    .map_err(|_| RsError::bad_request(format!("$response: invalid header name '{name}'")))?;
-                let value = http::HeaderValue::from_str(&value)
-                    .map_err(|_| RsError::bad_request(format!("$response: invalid value for header '{name}'")))?;
+                let name = http::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                    RsError::bad_request(format!("$response: invalid header name '{name}'"))
+                })?;
+                let value = http::HeaderValue::from_str(&value).map_err(|_| {
+                    RsError::bad_request(format!("$response: invalid value for header '{name}'"))
+                })?;
                 msg.headers.insert(name, value);
             }
         }
@@ -150,7 +165,10 @@ mod tests {
             "body": { "ok": true }
         }});
         let mut m = msg();
-        ResponseEnvelope::detect(&out).unwrap().apply(&mut m).unwrap();
+        ResponseEnvelope::detect(&out)
+            .unwrap()
+            .apply(&mut m)
+            .unwrap();
         assert_eq!(m.status, Some(http::StatusCode::CREATED));
         assert_eq!(m.header("location"), Some("/things/1"));
         assert_eq!(m.header("x-count"), Some("3"));
@@ -162,7 +180,10 @@ mod tests {
     fn string_body_becomes_raw_text() {
         let out = json!({ "$response": { "body": "plain words" } });
         let mut m = msg();
-        ResponseEnvelope::detect(&out).unwrap().apply(&mut m).unwrap();
+        ResponseEnvelope::detect(&out)
+            .unwrap()
+            .apply(&mut m)
+            .unwrap();
         assert_eq!(m.status, Some(http::StatusCode::OK));
         let body = m.body.as_ref().unwrap();
         assert_eq!(body.media_type.essence(), "text/plain");
@@ -172,13 +193,19 @@ mod tests {
     fn media_type_overrides_and_retypes_in_place() {
         let out = json!({ "$response": { "body": "<b>hi</b>", "mediaType": "text/html" } });
         let mut m = msg();
-        ResponseEnvelope::detect(&out).unwrap().apply(&mut m).unwrap();
+        ResponseEnvelope::detect(&out)
+            .unwrap()
+            .apply(&mut m)
+            .unwrap();
         assert_eq!(m.body.as_ref().unwrap().media_type.essence(), "text/html");
 
         // No body: retype the existing one (set-status/to-text combo).
         let out = json!({ "$response": { "status": 202, "mediaType": "text/plain" } });
         let mut m = msg().with_json(&json!({ "kept": true }));
-        ResponseEnvelope::detect(&out).unwrap().apply(&mut m).unwrap();
+        ResponseEnvelope::detect(&out)
+            .unwrap()
+            .apply(&mut m)
+            .unwrap();
         assert_eq!(m.status, Some(http::StatusCode::ACCEPTED));
         assert_eq!(m.body.as_ref().unwrap().media_type.essence(), "text/plain");
     }
@@ -195,8 +222,10 @@ mod tests {
             json!({ "$response": { "statuss": 200 } }),
         ];
         for out in cases {
-            let err =
-                ResponseEnvelope::detect(&out).unwrap().apply(&mut msg()).unwrap_err();
+            let err = ResponseEnvelope::detect(&out)
+                .unwrap()
+                .apply(&mut msg())
+                .unwrap_err();
             assert_eq!(err.status, 400, "case {out}");
         }
     }

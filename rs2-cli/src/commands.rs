@@ -36,8 +36,8 @@ pub fn login(
         return Err(format!("login failed: {}", resp.error_detail()));
     }
 
-    let json: serde_json::Value =
-        serde_json::from_str(&resp.body).map_err(|e| format!("login response was not JSON: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(&resp.body)
+        .map_err(|e| format!("login response was not JSON: {e}"))?;
     let token = json
         .get("token")
         .and_then(|v| v.as_str())
@@ -50,7 +50,10 @@ pub fn login(
     config::save(&loaded.path, &loaded.config)?;
 
     let mins = ((exp - config::now_secs()).max(0)) / 60;
-    println!("logged in — token saved to {} (expires in ~{mins} min)", loaded.path.display());
+    println!(
+        "logged in — token saved to {} (expires in ~{mins} min)",
+        loaded.path.display()
+    );
     Ok(())
 }
 
@@ -62,16 +65,31 @@ pub fn send(server_path: &str, file: &str, content_type: Option<&str>) -> Result
 
     let bytes = std::fs::read(file).map_err(|e| format!("cannot read {file}: {e}"))?;
     let content_type = content_type.map(str::to_string).unwrap_or_else(|| {
-        mime_guess::from_path(file).first_raw().unwrap_or("application/octet-stream").to_string()
+        mime_guess::from_path(file)
+            .first_raw()
+            .unwrap_or("application/octet-stream")
+            .to_string()
     });
 
     let had_token = token.is_some();
     let client = Client::new(host, token);
     let resp = client.put(server_path, &content_type, &bytes, None)?;
     match resp.status {
-        201 => println!("created {server_path} ({} bytes, {content_type})", bytes.len()),
-        200 => println!("overwritten {server_path} ({} bytes, {content_type})", bytes.len()),
-        _ => return Err(format!("send failed: {}{}", resp.error_detail(), login_hint(resp.status, had_token))),
+        201 => println!(
+            "created {server_path} ({} bytes, {content_type})",
+            bytes.len()
+        ),
+        200 => println!(
+            "overwritten {server_path} ({} bytes, {content_type})",
+            bytes.len()
+        ),
+        _ => {
+            return Err(format!(
+                "send failed: {}{}",
+                resp.error_detail(),
+                login_hint(resp.status, had_token)
+            ))
+        }
     }
     Ok(())
 }
@@ -87,9 +105,11 @@ pub fn service_add(file: &str, path_override: Option<&str>) -> Result<(), String
     let client = Client::new(host, token);
 
     // The mount spec from the local file.
-    let mount_text = std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
-    let mut mount: serde_json::Value = serde_json::from_str(mount_text.trim_start_matches('\u{feff}'))
-        .map_err(|e| format!("{file} is not valid JSON: {e}"))?;
+    let mount_text =
+        std::fs::read_to_string(file).map_err(|e| format!("cannot read {file}: {e}"))?;
+    let mut mount: serde_json::Value =
+        serde_json::from_str(mount_text.trim_start_matches('\u{feff}'))
+            .map_err(|e| format!("{file} is not valid JSON: {e}"))?;
     if !mount.is_object() {
         return Err(format!("{file} must be a JSON object (a mount spec)"));
     }
@@ -103,9 +123,7 @@ pub fn service_add(file: &str, path_override: Option<&str>) -> Result<(), String
         None => mount
             .get("path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                format!("no mount path — pass --path or set \"path\" in {file}")
-            })?
+            .ok_or_else(|| format!("no mount path — pass --path or set \"path\" in {file}"))?
             .to_string(),
     };
     mount["path"] = serde_json::Value::String(target_path.clone());
@@ -117,7 +135,9 @@ pub fn service_add(file: &str, path_override: Option<&str>) -> Result<(), String
             .iter()
             .any(|m| m.get("path").and_then(|v| v.as_str()) == Some(target_path.as_str()))
         {
-            return Err(format!("a mount already exists at {target_path} — nothing changed"));
+            return Err(format!(
+                "a mount already exists at {target_path} — nothing changed"
+            ));
         }
         mounts.push(mount.clone());
         Ok(true)
@@ -145,7 +165,8 @@ pub fn service_set_access(path: &str, access: &str, sets: &[String]) -> Result<(
         let (k, v) = kv
             .split_once('=')
             .ok_or_else(|| format!("--set must be key=value, got '{kv}'"))?;
-        let val = serde_json::from_str(v).unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
+        let val =
+            serde_json::from_str(v).unwrap_or_else(|_| serde_json::Value::String(v.to_string()));
         extra.push((k.to_string(), val));
     }
 
@@ -179,7 +200,10 @@ pub fn auth_enable(
     let client = Client::new(host, token);
 
     let user_dataset = user_dataset.unwrap_or("users").to_string();
-    let data_mount = data_mount.unwrap_or("/data").trim_end_matches('/').to_string();
+    let data_mount = data_mount
+        .unwrap_or("/data")
+        .trim_end_matches('/')
+        .to_string();
     let operator_roles = operator_roles.to_string();
     // Set once, shared across merge_config retries so a 409 re-run reuses the
     // same secret rather than generating a fresh one each attempt.
@@ -244,7 +268,9 @@ pub fn auth_enable(
 
     match generated {
         Some(secret) if show_secret => println!("auth enabled — generated jwtSecret: {secret}"),
-        Some(_) => println!("auth enabled — generated a jwtSecret (re-run with --show-secret to print it)"),
+        Some(_) => {
+            println!("auth enabled — generated a jwtSecret (re-run with --show-secret to print it)")
+        }
         None => println!("auth enabled — kept the existing jwtSecret"),
     }
     Ok(())
@@ -271,7 +297,10 @@ pub fn auth_create_admin(
         .as_ref()
         .and_then(|l| l.password.clone());
     let password = resolve_admin_password(password, stored_pw.as_deref())?;
-    let data_mount = data_mount.unwrap_or("/data").trim_end_matches('/').to_string();
+    let data_mount = data_mount
+        .unwrap_or("/data")
+        .trim_end_matches('/')
+        .to_string();
     let user_dataset = user_dataset.unwrap_or("users");
     let client = Client::new(host, token);
 
@@ -338,14 +367,35 @@ pub fn auth_init(
 ) -> Result<(), String> {
     // Resolve the password once so create-admin and login use the same value.
     let loaded = config::load()?;
-    let stored_pw = loaded.config.login.as_ref().and_then(|l| l.password.clone());
+    let stored_pw = loaded
+        .config
+        .login
+        .as_ref()
+        .and_then(|l| l.password.clone());
     let password = resolve_admin_password(admin_password, stored_pw.as_deref())?;
-    let data_mount_path = data_mount.unwrap_or("/data").trim_end_matches('/').to_string();
+    let data_mount_path = data_mount
+        .unwrap_or("/data")
+        .trim_end_matches('/')
+        .to_string();
 
     // 1. Enable auth (jwtSecret, operatorRoles, /auth + temp-open /data).
-    auth_enable(host, operator_roles, user_dataset, None, data_mount, show_secret)?;
+    auth_enable(
+        host,
+        operator_roles,
+        user_dataset,
+        None,
+        data_mount,
+        show_secret,
+    )?;
     // 2. Create the first admin while /data is write-open and schema-free.
-    auth_create_admin(host, admin_email, Some(&password), operator_roles, data_mount, user_dataset)?;
+    auth_create_admin(
+        host,
+        admin_email,
+        Some(&password),
+        operator_roles,
+        data_mount,
+        user_dataset,
+    )?;
     // 3. Log in as that admin so the lockdown PUT carries operator authority.
     login(host, Some(admin_email), Some(&password))?;
 
@@ -524,10 +574,18 @@ mod tests {
     #[test]
     fn ensure_mount_is_idempotent() {
         let mut mounts = vec![json!({ "path": "/services", "service": "services" })];
-        ensure_mount(&mut mounts, "/auth", json!({ "path": "/auth", "service": "auth" }));
+        ensure_mount(
+            &mut mounts,
+            "/auth",
+            json!({ "path": "/auth", "service": "auth" }),
+        );
         assert_eq!(mounts.len(), 2);
         // A second call for the same path is a no-op (leaves the existing one).
-        ensure_mount(&mut mounts, "/auth", json!({ "path": "/auth", "service": "OTHER" }));
+        ensure_mount(
+            &mut mounts,
+            "/auth",
+            json!({ "path": "/auth", "service": "OTHER" }),
+        );
         assert_eq!(mounts.len(), 2);
         assert_eq!(mounts[1]["service"], "auth");
     }
@@ -566,8 +624,14 @@ mod tests {
 
     #[test]
     fn resolve_admin_password_prefers_flag_then_stored() {
-        assert_eq!(resolve_admin_password(Some("flagpw"), Some("storedpw")).unwrap(), "flagpw");
-        assert_eq!(resolve_admin_password(None, Some("storedpw")).unwrap(), "storedpw");
+        assert_eq!(
+            resolve_admin_password(Some("flagpw"), Some("storedpw")).unwrap(),
+            "flagpw"
+        );
+        assert_eq!(
+            resolve_admin_password(None, Some("storedpw")).unwrap(),
+            "storedpw"
+        );
         // Only error when neither env-var fallback is set in this environment.
         if std::env::var("RS2_ADMIN_PASSWORD").is_err() && std::env::var("RS2_PASSWORD").is_err() {
             assert!(resolve_admin_password(None, None).is_err());

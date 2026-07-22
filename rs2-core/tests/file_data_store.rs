@@ -145,11 +145,11 @@ fn runtime_with(
     adapters.builtins.register_data(
         "file",
         Arc::new(move |cfg| {
-            let backed: Arc<dyn FileStore> = match rs2_core::capabilities::sanitized_store_root(cfg)?
-            {
-                Some(root) => Arc::new(PrefixedFileStore::new(data_fs.clone(), root)),
-                None => data_fs.clone(),
-            };
+            let backed: Arc<dyn FileStore> =
+                match rs2_core::capabilities::sanitized_store_root(cfg)? {
+                    Some(root) => Arc::new(PrefixedFileStore::new(data_fs.clone(), root)),
+                    None => data_fs.clone(),
+                };
             Ok(Arc::new(FileDataStore::new(backed)) as Arc<dyn DataStore>)
         }),
     );
@@ -322,7 +322,10 @@ async fn separate_root_mount_cannot_reach_default_users_dataset() {
     // The default users dataset still holds exactly the seeded admin.
     let mut resp = rt.handle(req(Method::GET, "/data/users/")).await;
     let listing = resp.body.as_mut().unwrap().as_json(65536).await.unwrap();
-    assert_eq!(listing["total"], 1, "default users dataset gained a forged record: {listing}");
+    assert_eq!(
+        listing["total"], 1,
+        "default users dataset gained a forged record: {listing}"
+    );
 }
 
 /// Back-compat: a `data` mount with **no** `store` block keeps using the shared
@@ -358,10 +361,10 @@ async fn unsafe_or_missing_root_is_rejected_for_builtin_file() {
     let data = tempfile::tempdir().unwrap();
 
     for bad in [
-        json!({ "adapter": "builtin:file" }),               // missing root
-        json!({ "adapter": "builtin:file", "root": "" }),   // empty root
+        json!({ "adapter": "builtin:file" }),             // missing root
+        json!({ "adapter": "builtin:file", "root": "" }), // empty root
         json!({ "adapter": "builtin:file", "root": "../escape" }), // traversal
-        json!({ "adapter": "builtin:file", "root": "/abs" }),      // absolute
+        json!({ "adapter": "builtin:file", "root": "/abs" }), // absolute
     ] {
         let rt = runtime_with(
             files.path(),
@@ -370,6 +373,10 @@ async fn unsafe_or_missing_root_is_rejected_for_builtin_file() {
         );
         // The mount fails to build, so any request to it errors (not 2xx).
         let status = rt.handle(req(Method::GET, "/x/ds/k")).await.status;
-        assert_ne!(status, Some(StatusCode::OK), "unsafe root unexpectedly built a working mount");
+        assert_ne!(
+            status,
+            Some(StatusCode::OK),
+            "unsafe root unexpectedly built a working mount"
+        );
     }
 }

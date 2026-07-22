@@ -22,7 +22,9 @@ impl FileService {
     }
 
     pub fn from_config(config: &serde_json::Value) -> Self {
-        FileService { site: SiteOptions::from_config(config) }
+        FileService {
+            site: SiteOptions::from_config(config),
+        }
     }
 
     /// Serve one stored file with Range/ETag/304 semantics. Takes owned
@@ -49,8 +51,10 @@ impl FileService {
                     Provenance::Replayable { version, .. } => Some(format!("\"{version}\"")),
                     _ => None,
                 },
-                b.last_modified
-                    .and_then(|lm| lm.format(&time::format_description::well_known::Rfc2822).ok()),
+                b.last_modified.and_then(|lm| {
+                    lm.format(&time::format_description::well_known::Rfc2822)
+                        .ok()
+                }),
             ),
             None => (None, None),
         };
@@ -194,9 +198,17 @@ fn wants_dir_listing(accept: Option<&str>) -> bool {
             let media = params.next()?.trim();
             let (t, s) = media.split_once('/')?;
             let q = params
-                .find_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.trim().parse::<f32>().ok()))
+                .find_map(|p| {
+                    p.trim()
+                        .strip_prefix("q=")
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                })
                 .unwrap_or(1.0);
-            Some((t.trim().to_ascii_lowercase(), s.trim().to_ascii_lowercase(), q))
+            Some((
+                t.trim().to_ascii_lowercase(),
+                s.trim().to_ascii_lowercase(),
+                q,
+            ))
         })
         // Exact type+subtype only — no wildcard match.
         .any(|(t, s, q)| q > 0.0 && t == dtype && s == dsubtype)
@@ -208,8 +220,7 @@ fn wants_dir_listing(accept: Option<&str>) -> bool {
 fn accept_match_q(essence: &str, range: &(String, String, f32)) -> f32 {
     let (rtype, rsubtype, q) = range;
     let (etype, esubtype) = essence.split_once('/').unwrap_or((essence, ""));
-    let matches = (rtype == "*" || rtype == etype)
-        && (rsubtype == "*" || rsubtype == esubtype);
+    let matches = (rtype == "*" || rtype == etype) && (rsubtype == "*" || rsubtype == esubtype);
     if matches {
         *q
     } else {
@@ -233,9 +244,17 @@ fn negotiate_extensions(accept: Option<&str>, priority: &[String]) -> Vec<String
             let media = params.next()?.trim();
             let (t, s) = media.split_once('/')?;
             let q = params
-                .find_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.trim().parse::<f32>().ok()))
+                .find_map(|p| {
+                    p.trim()
+                        .strip_prefix("q=")
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                })
                 .unwrap_or(1.0);
-            Some((t.trim().to_ascii_lowercase(), s.trim().to_ascii_lowercase(), q))
+            Some((
+                t.trim().to_ascii_lowercase(),
+                s.trim().to_ascii_lowercase(),
+                q,
+            ))
         })
         .collect();
 
@@ -278,7 +297,11 @@ fn parse_range(header: &str) -> Option<ByteRange> {
     }
     let (start, end) = spec.split_once('-')?;
     let start: u64 = start.trim().parse().ok()?;
-    let end: Option<u64> = if end.trim().is_empty() { None } else { end.trim().parse().ok() };
+    let end: Option<u64> = if end.trim().is_empty() {
+        None
+    } else {
+        end.trim().parse().ok()
+    };
     Some(ByteRange { start, end })
 }
 
@@ -301,7 +324,9 @@ impl Service for FileService {
         // mount's store space (cross-mount moves aren't supported).
         if msg.method.as_str() == "MOVE" {
             if msg.url.is_directory() {
-                return Err(RsError::bad_request("MOVE source must be a file, not a directory"));
+                return Err(RsError::bad_request(
+                    "MOVE source must be a file, not a directory",
+                ));
             }
             let dest_raw = msg
                 .header("destination")
@@ -309,13 +334,21 @@ impl Service for FileService {
                 .to_string();
             let base = msg.url.base_path.as_str();
             let rel = dest_raw.strip_prefix(base).unwrap_or(&dest_raw);
-            let dest = if rel.starts_with('/') { rel.to_string() } else { format!("/{rel}") };
+            let dest = if rel.starts_with('/') {
+                rel.to_string()
+            } else {
+                format!("/{rel}")
+            };
             if dest.ends_with('/') {
                 return Err(RsError::bad_request("MOVE destination must be a file path"));
             }
             let created = files.rename(&path, &dest).await?;
             let mut resp = msg.response(
-                if created { StatusCode::CREATED } else { StatusCode::OK },
+                if created {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
                 None,
             );
             resp.set_header("location", &format!("{base}{dest}"));
@@ -381,14 +414,23 @@ impl Service for FileService {
                     "entries": entries,
                     "total": total,
                 });
-                let mut resp = msg.ok(Some(Body::from_bytes(listing.to_string(), MediaType::dir_json())));
+                let mut resp = msg.ok(Some(Body::from_bytes(
+                    listing.to_string(),
+                    MediaType::dir_json(),
+                )));
                 resp.set_header("x-total-count", &total.to_string());
                 resp.set_header("vary", "accept");
                 Ok(resp)
             }
             Method::GET => {
                 match self
-                    .serve_file(msg.response(StatusCode::OK, None), range, if_none_match.clone(), files, &path)
+                    .serve_file(
+                        msg.response(StatusCode::OK, None),
+                        range,
+                        if_none_match.clone(),
+                        files,
+                        &path,
+                    )
                     .await
                 {
                     Ok(resp) => Ok(resp),
@@ -481,7 +523,10 @@ impl Service for FileService {
                 resp.set_header("accept-ranges", "bytes");
                 resp.set_header("content-type", &MediaType::for_path(&real).to_string());
                 if real != path {
-                    resp.set_header("content-location", &format!("{}{}", msg.url.base_path, real));
+                    resp.set_header(
+                        "content-location",
+                        &format!("{}{}", msg.url.base_path, real),
+                    );
                 }
                 Ok(resp)
             }
@@ -531,7 +576,11 @@ impl Service for FileService {
                             "extension-less write requires a configured 'extensionPriority'",
                         )
                     })?;
-                    format!("{}.{}", path, e1.trim_start_matches('.').to_ascii_lowercase())
+                    format!(
+                        "{}.{}",
+                        path,
+                        e1.trim_start_matches('.').to_ascii_lowercase()
+                    )
                 } else {
                     path.clone()
                 };
@@ -542,7 +591,11 @@ impl Service for FileService {
                 let outcome = files.write_cond(&store_path, body, precondition).await?;
                 let template = Message::request(msg.method.clone(), &msg.url.path, &msg.tenant);
                 let mut resp = template.response(
-                    if outcome.created { StatusCode::CREATED } else { StatusCode::OK },
+                    if outcome.created {
+                        StatusCode::CREATED
+                    } else {
+                        StatusCode::OK
+                    },
                     None,
                 );
                 resp.trace = msg.trace.clone();
@@ -565,7 +618,8 @@ impl Service for FileService {
                     // Store contract guard: non-empty containers delete only
                     // with `?confirm=<container name>` (matching `data`).
                     let dir_name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-                    if msg.url.query_param("confirm").as_deref() == Some(dir_name) && !dir_name.is_empty()
+                    if msg.url.query_param("confirm").as_deref() == Some(dir_name)
+                        && !dir_name.is_empty()
                     {
                         files.delete_dir_all(&path).await?;
                     } else {
