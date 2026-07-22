@@ -271,11 +271,11 @@ impl ScheduleStore for MemScheduleStore {
         let now = std::time::Instant::now();
         let mut claimed = self.claimed.lock().unwrap();
         claimed.retain(|_, exp| *exp > now);
-        if claimed.contains_key(&composite) {
-            Ok(false)
-        } else {
-            claimed.insert(composite, now + ttl);
+        if let std::collections::hash_map::Entry::Vacant(e) = claimed.entry(composite) {
+            e.insert(now + ttl);
             Ok(true)
+        } else {
+            Ok(false)
         }
     }
 }

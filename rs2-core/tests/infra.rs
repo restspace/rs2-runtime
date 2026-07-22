@@ -73,7 +73,7 @@ fn req(tenant: &str, method: Method, path: &str) -> Message {
 
 async fn body_text(resp: &mut Message) -> String {
     match resp.body.as_mut() {
-        Some(b) => String::from_utf8_lossy(&b.materialize(65536).await.unwrap()).to_string(),
+        Some(b) => String::from_utf8_lossy(b.materialize(65536).await.unwrap()).to_string(),
         None => String::new(),
     }
 }

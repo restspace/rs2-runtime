@@ -655,7 +655,7 @@ async fn scheduler_loop(
         tokio::time::sleep(tick).await;
         let Some(rt) = weak.upgrade() else { return };
 
-        if last_reconcile.map_or(true, |t| t.elapsed() >= reconcile) {
+        if last_reconcile.is_none_or(|t| t.elapsed() >= reconcile) {
             last_reconcile = Some(tokio::time::Instant::now());
             reconcile_schedules(&rt, &mut desired, &mut config_versions).await;
         }

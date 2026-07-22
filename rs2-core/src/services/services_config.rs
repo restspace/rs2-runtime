@@ -36,47 +36,6 @@ fn catalogue() -> serde_json::Value {
 /// stored value".
 pub const SECRET_MASK: &str = "<secret>";
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn secrets_redact_and_round_trip() {
-        let stored = json!({
-            "auth": { "jwtSecret": "real-secret", "sessionMinutes": 60 },
-            "secrets": { "stripe": "sk_live_x", "nested": { "k": "v" } },
-            "mounts": []
-        });
-
-        // Read: secrets masked, structure intact.
-        let mut read = stored.clone();
-        redact_secrets(&mut read);
-        assert_eq!(read["auth"]["jwtSecret"], SECRET_MASK);
-        assert_eq!(read["auth"]["sessionMinutes"], 60);
-        assert_eq!(read["secrets"]["stripe"], SECRET_MASK);
-        assert_eq!(read["secrets"]["nested"]["k"], SECRET_MASK);
-
-        // Write-back of the masked doc restores the stored values.
-        let mut incoming = read.clone();
-        incoming["mounts"] = json!([{ "path": "/x", "service": "file" }]);
-        restore_secrets(&mut incoming, &stored).unwrap();
-        assert_eq!(incoming["auth"]["jwtSecret"], "real-secret");
-        assert_eq!(incoming["secrets"]["nested"]["k"], "v");
-        assert_eq!(incoming["mounts"][0]["path"], "/x", "edits preserved");
-
-        // Supplying a new real value is untouched.
-        let mut rotated = read.clone();
-        rotated["auth"]["jwtSecret"] = json!("new-secret");
-        restore_secrets(&mut rotated, &stored).unwrap();
-        assert_eq!(rotated["auth"]["jwtSecret"], "new-secret");
-
-        // A mask with no stored counterpart is refused, not stored.
-        let mut orphan = json!({ "auth": { "jwtSecret": SECRET_MASK }, "mounts": [] });
-        assert!(restore_secrets(&mut orphan, &json!({ "mounts": [] })).is_err());
-    }
-}
-
 /// Walk the config and mask secret values: `auth.jwtSecret`, plus every
 /// string leaf under a top-level `secrets` object (forward-compatible with
 /// the PRD's encrypted tenant-secrets block).
@@ -863,5 +822,46 @@ impl Service for ServicesService {
                 msg.url.service_path
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn secrets_redact_and_round_trip() {
+        let stored = json!({
+            "auth": { "jwtSecret": "real-secret", "sessionMinutes": 60 },
+            "secrets": { "stripe": "sk_live_x", "nested": { "k": "v" } },
+            "mounts": []
+        });
+
+        // Read: secrets masked, structure intact.
+        let mut read = stored.clone();
+        redact_secrets(&mut read);
+        assert_eq!(read["auth"]["jwtSecret"], SECRET_MASK);
+        assert_eq!(read["auth"]["sessionMinutes"], 60);
+        assert_eq!(read["secrets"]["stripe"], SECRET_MASK);
+        assert_eq!(read["secrets"]["nested"]["k"], SECRET_MASK);
+
+        // Write-back of the masked doc restores the stored values.
+        let mut incoming = read.clone();
+        incoming["mounts"] = json!([{ "path": "/x", "service": "file" }]);
+        restore_secrets(&mut incoming, &stored).unwrap();
+        assert_eq!(incoming["auth"]["jwtSecret"], "real-secret");
+        assert_eq!(incoming["secrets"]["nested"]["k"], "v");
+        assert_eq!(incoming["mounts"][0]["path"], "/x", "edits preserved");
+
+        // Supplying a new real value is untouched.
+        let mut rotated = read.clone();
+        rotated["auth"]["jwtSecret"] = json!("new-secret");
+        restore_secrets(&mut rotated, &stored).unwrap();
+        assert_eq!(rotated["auth"]["jwtSecret"], "new-secret");
+
+        // A mask with no stored counterpart is refused, not stored.
+        let mut orphan = json!({ "auth": { "jwtSecret": SECRET_MASK }, "mounts": [] });
+        assert!(restore_secrets(&mut orphan, &json!({ "mounts": [] })).is_err());
     }
 }

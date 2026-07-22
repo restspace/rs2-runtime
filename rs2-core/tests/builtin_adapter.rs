@@ -56,7 +56,7 @@ async fn error_text(resp: &mut Message) -> String {
         .materialize(65536)
         .await
         .unwrap();
-    String::from_utf8_lossy(&bytes).to_string()
+    String::from_utf8_lossy(bytes).to_string()
 }
 
 #[tokio::test]

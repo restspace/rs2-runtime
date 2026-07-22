@@ -12,7 +12,7 @@
 //! - `${url.path[1:]}`  segments 1..end, `/`-joined (Python-style slice)
 //! - `${url.path}`      whole service path, segments `/`-joined (no leading/trailing slash)
 //! - `${url.rest}`      verbatim service-path remainder (leading slash, exact
-//!                      trailing slash) — for transparent path forwarding
+//!   trailing slash) — for transparent path forwarding
 //! - `${url.base[0]}`   mount-prefix segments; `${url.full}` = base+path
 //! - `${url.name}`      last service segment (resource name)
 //! - `${url.query.id}`  one query param; `${url.query}` the whole query string

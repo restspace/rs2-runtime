@@ -56,7 +56,7 @@ fn matches(
             .as_f64()
             .zip(b.as_f64())
             .and_then(|(a, b)| a.partial_cmp(&b)),
-        (Some(serde_json::Value::String(a)), serde_json::Value::String(b)) => Some(a.cmp(b).into()),
+        (Some(serde_json::Value::String(a)), serde_json::Value::String(b)) => Some(a.cmp(b)),
         _ => None,
     };
     Ok(match op {

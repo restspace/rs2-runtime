@@ -193,10 +193,10 @@ fn enforce_write_rules(
     for (name, read, write) in field_rules(schema) {
         let readable = read
             .as_deref()
-            .map_or(true, |r| crate::wrapper::satisfies_role_spec(r, msg));
+            .is_none_or(|r| crate::wrapper::satisfies_role_spec(r, msg));
         let writable = write
             .as_deref()
-            .map_or(true, |w| crate::wrapper::satisfies_role_spec(w, msg));
+            .is_none_or(|w| crate::wrapper::satisfies_role_spec(w, msg));
         if !readable {
             match stored.get(&name) {
                 Some(v) => {
@@ -230,7 +230,7 @@ impl Service for DataService {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let schema_base = format!("{}", msg.url.base_path);
+        let schema_base = msg.url.base_path.to_string();
 
         match segments.as_slice() {
             // ---- mount root: enumerate datasets (store contract: every

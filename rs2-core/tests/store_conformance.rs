@@ -16,6 +16,7 @@
 //! - `GET <child>` → the resource, with `ETag`.
 //! - `DELETE <child>` → 204; subsequent GET → 404.
 //! - `DELETE <container>` non-empty → 409; with `?confirm=<name>` → 204.
+//!
 //! Facets (`range`, `patch`, `schema`, `echo`) are additive capabilities
 //! and never change the core shape.
 

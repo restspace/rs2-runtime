@@ -129,9 +129,11 @@ async fn infra_bearer_is_injected_host_side_and_secret_never_leaks() {
     assert_eq!(out["ok"], true);
 
     // The outbound request carried the operator credential, injected host-side.
-    let auth = http.auth.lock().unwrap();
-    assert_eq!(auth.len(), 1);
-    assert_eq!(auth[0].as_deref(), Some("Bearer sk_secret_123"));
+    {
+        let auth = http.auth.lock().unwrap();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].as_deref(), Some("Bearer sk_secret_123"));
+    }
 
     // The secret never reached the guest's view of its config…
     assert!(

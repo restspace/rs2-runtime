@@ -173,7 +173,7 @@ impl IdempotencyStore for MemIdempotencyStore {
             .begins
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut entries = self.entries.lock().unwrap();
-        if n % SWEEP_EVERY == 0 || entries.len() >= self.max_entries {
+        if n.is_multiple_of(SWEEP_EVERY) || entries.len() >= self.max_entries {
             self.sweep(&mut entries, true);
         }
         // Opportunistic expiry of the addressed slot.

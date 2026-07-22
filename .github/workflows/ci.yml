@@ -14,11 +14,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # NOTE: rustfmt + clippy (-D warnings) gates are deferred. The toolchain is
-  # pinned (rust-toolchain.toml, 1.92.0) but the code predates that pin and
-  # carries fmt drift (~800 hunks) plus a handful of new-lint clippy errors
-  # (is_none_or, is_multiple_of, ...). Enable both gates after a one-time
-  # `cargo fmt --all` + clippy cleanup commit establishes a clean baseline.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - run: cargo fmt --all -- --check
+      # Default features; the js/wasm feature builds are linted implicitly by
+      # their test jobs' compiles and are too heavy to duplicate here.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test-native:
     name: test (native)

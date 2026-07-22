@@ -121,9 +121,11 @@ async fn proxy_forwards_to_target_with_injected_auth_and_no_secret_leak() {
     );
 
     // The request reached the target host with the remaining path + query…
-    let url = http.url.lock().unwrap();
-    assert_eq!(url.len(), 1);
-    assert_eq!(url[0], "https://api.stripe.com/v1/charges?limit=3");
+    {
+        let url = http.url.lock().unwrap();
+        assert_eq!(url.len(), 1);
+        assert_eq!(url[0], "https://api.stripe.com/v1/charges?limit=3");
+    }
     // …and carried the operator credential, injected host-side.
     assert_eq!(
         http.auth.lock().unwrap()[0].as_deref(),

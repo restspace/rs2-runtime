@@ -266,7 +266,7 @@ async fn read_logs(rt: &Runtime, path: &str) -> Vec<Value> {
         .materialize(1 << 20)
         .await
         .unwrap();
-    serde_json::from_slice::<Value>(&bytes)
+    serde_json::from_slice::<Value>(bytes)
         .unwrap()
         .as_array()
         .cloned()
