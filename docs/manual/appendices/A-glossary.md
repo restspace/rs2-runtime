@@ -18,7 +18,7 @@ point to where each is introduced.
 | **Facet** | An optional capability within a pattern (`range`, `schema`, `static-site`, …) (3.4) |
 | **Capability** | A pre-scoped handle a service uses to reach infrastructure; default-deny (3.5) |
 | **Grant** | A per-mount authorization of a capability — an internal prefix or outbound HTTP (8.5) |
-| **Instruction plane** | What fully describes a tenant: config + `.rs2-code/` + `.rs2-pipelines/` + `.rs2-queries/` (3.6) |
+| **Instruction plane** | What fully describes a tenant: config + pinned code + every discovered spec subtree (pipelines, queries, templates) (3.6) |
 | **Pipeline** | A declared multi-step flow composing service calls (Part 7) |
 | **Step** | One unit of a pipeline: a call, transform, subpipeline, or split (7.3) |
 | **In-flight message** | The value flowing through a pipeline, replaced or augmented by each step (7.3) |
@@ -26,7 +26,7 @@ point to where each is introduced.
 | **Segment** | The atomic retry unit of a pipeline, bounded at materialization points (7.8) |
 | **Effect class** | A call's retry-safety category: pure / idempotent / keyed / unsafe (7.7) |
 | **Idempotency key** | A client- or runtime-supplied key that makes an operation at-most-once (9.3) |
-| **Role spec** | A mount's `access` rules: read/write/create/manage roles (5.4) |
+| **Role spec** | A mount's `access` rules: read/write/delete/invoke roles (5.4) |
 | **Principal** | An authenticated caller: `{id, roles, kind}` (5.1) |
 | **Facet vs. service name** | Clients feature-detect facets; they never branch on the service name (3.4) |
 | **Trace id** | A per-request id (`X-Trace-Id`) correlating responses, logs, and internal hops (9.6) |
@@ -35,7 +35,10 @@ point to where each is introduced.
 | **Socket grant** | A capability letting custom JS open gated raw TCP/TLS connections for non-HTTP protocols (8.5) |
 | **Loadable adapter** | Deployed code backing a `file`/`data`/`query` mount's persistence via the store pattern (8.9) |
 | **Resident runtime** | A warm, pooled isolate kept alive between requests so an adapter's connections pool (8.9, App. G) |
-| **Elevate** | A `call`-step flag that drops the caller's principal so a pipeline can mediate access to a locked mount (7.3) |
+| **Elevate** | A `call`-step flag that adds the mount's configured mediation role while retaining caller identity (7.3) |
+| **Wrapper** | One inline pipeline that fronts every verb/path of a mount and declares the pattern it presents (7.10) |
+| **Infra** | An operator-managed adapter or credential config referenced by a tenant as `infra:<name>` without revealing its values (10.7) |
+| **Schedule** | A host-generated periodic POST to a mount, configured by interval or UTC cron (7.11) |
 
 ---
 

@@ -11,6 +11,7 @@ explanation.
   "auth":   { … },         // optional — enables token verification + the auth service
   "cors":   { … },         // optional — browser clients
   "retry":  { … },         // optional — tenant-default retry policy
+  "catalogues": [ … ],     // optional — external service/adapter catalogues
   "secrets": { … },        // optional — write-only secret values
   "operatorRoles": "A",    // optional — roles that confer operator status
   "mounts": [ … ]          // required
@@ -23,6 +24,7 @@ explanation.
 | `auth` | no | Presence + `jwtSecret` turns on auth (5.1) |
 | `cors` | no | `trustedOrigins` / `allowedOrigins` (5.5) |
 | `retry` | no | Default policy; overridden per mount/call (7.7) |
+| `catalogues` | no | Named external catalogue URLs; usable only when the operator allowlists their hosts (8.11, 10.7) |
 | `secrets` | no | Write-only block (10.6) |
 | `operatorRoles` | no | Space-separated roles that confer **operator** status — the only principals who may change authorization (mount/spec `access`, role assignment). Absent ⇒ no API operator (5.0) |
 
@@ -30,7 +32,8 @@ explanation.
 
 ```json
 "auth": { "jwtSecret": "…", "sessionMinutes": 60, "maxAttempts": 5,
-          "lockMinutes": 10, "userDataset": "users", "allowedLoginOrigins": [] }
+          "lockMinutes": 10, "userDataset": "users", "allowedLoginOrigins": [],
+          "jwtUserProps": ["accountId"] }
 ```
 
 See 5.1 (endpoints), 5.3 (sessions/lockout), 5.5 (`allowedLoginOrigins`).
@@ -48,14 +51,19 @@ Trusted = credentialed CORS + cookie lane; allowed = bearer-only. See 5.5.
 ## A mount
 
 ```json
-{ "path": "/data", "service": "data", "config": { … } }
+{ "path": "/data", "service": "data",
+  "config": { "access": { "read": "all", "write": "A" }, … } }
 ```
 
 | Field | Notes |
 | --- | --- |
 | `path` | URL prefix; longest-prefix routing on segment boundaries (3.2). Duplicates rejected |
-| `service` | `file` \| `data` \| `pipeline` \| `query` \| `auth` \| `services` \| `log` \| `code:<name>@<version>` |
+| `service` | `file` \| `data` \| `pipeline` \| `wrapper` \| `query` \| `template` \| `auth` \| `proxy` \| `sms` \| `services` \| `log` \| `code:<name>@<version>` |
 | `config` | Service-specific + standard keys (below) |
+
+`access` is operationally essential: omitting it makes the mount unreachable
+(fail closed). Within an access object, omitted action keys follow the defaults
+in 5.4.
 
 ## Standard config keys (any mount)
 
@@ -65,6 +73,8 @@ Trusted = credentialed CORS + cookie lane; allowed = bearer-only. See 5.5.
 | `elevate` | (pipeline mounts) role an `elevate` step adds to the caller — operator-set, not an operator role | 5.0, 7.3 |
 | `retry` | Retry policy for calls this mount makes | 7.7 |
 | `caching` | `mode`/`maxAgeSeconds`/`public`/`immutable` | 9.4 |
+| `schedule` | Exactly one of `{every: "60s"}` or `{cron: "0 9 * * *"}` (UTC) | 7.11 |
+| `secrets` | Names from the top-level write-only secrets block this mount may use | 7.11, 10.6 |
 | `grants` | Capability grants: `{prefix}`, `{type:"httpOut",hosts}`, `{type:"socket",hosts}` — code mounts (8.5); `httpOut` also on pipeline/wrapper mounts for external `call` steps (7.3) | 8.5 |
 | `x-agent`, `x-policy`, `x-expose`, `x-render`, `x-context`, `description` | Agent-surface metadata | 9.1 |
 
@@ -74,12 +84,16 @@ Trusted = credentialed CORS + cookie lane; allowed = bearer-only. See 5.5.
 | --- | --- |
 | `file` | `defaultResource`, `spaFallback`, `listings`, `friendlyUrls`, `extensionPriority` (static-site, 4.3); `store: {adapter}` for a loadable backend (8.9) |
 | `data` | `enforceSchema` (4.4); `fieldLevelAuthz` — per-field `x-rs-read`/`x-rs-write` schema rules (4.5); `store: {adapter}` for a loadable backend (8.9) |
-| `pipeline` | `retry`, `store: {root}` (relocate spec storage) (7.1); `grants` (`httpOut`) for external `call` steps (7.3) |
-| `query` | `store: {root}` (6.1); `store: {adapter}` for a loadable backend (8.9) |
+| `pipeline` | `retry`, `store: {root}`, or `specStore: {adapter, root}` for authoring storage (7.1, 10.7); `grants` (`httpOut`) for external calls (7.3) |
+| `wrapper` | Inline `pipeline`; declared `pattern`/`facets`; enforced `inputSchema`, advisory `outputSchema`; optional `elevate` (7.10) |
+| `query` | `store: {adapter, root}` selects execution backend/legacy spec root; `specStore` selects authoring storage (6.1, 8.9, 10.7) |
+| `template` | `store: {root}` or `specStore` for compiled template envelopes; requires JS (6.6) |
 | `auth` | usually just `access`; tenant-level `auth` holds the real settings (5.1) |
+| `proxy` | Fixed external `target` plus host-side credential `inject` (8.10) |
+| `sms` | Provider under `store.adapter` (`code:` or `infra:`); no built-in provider (8.10) |
 | `services` | `access` with `write: "A"`; config changes are operator-only (5.0, 10.4) |
 | `log` | `access` (10.3) |
-| `code:<name>@<version>` | `grants`, `access` (8.5) |
+| `code:<name>@<version>` | `grants`, `access`, plus JS `bodyPassthrough` / `requestStreaming` / `responseStreaming` (8.2, 8.5) |
 
 ## Loadable adapter `store` block (`file` / `data` / `query`, 8.9)
 
@@ -96,7 +110,7 @@ Trusted = credentialed CORS + cookie lane; allowed = bearer-only. See 5.5.
 
 | Key | Notes |
 | --- | --- |
-| `adapter` | `code:<name>@<version>` of a deployed store-pattern bundle (JS engine only; `501` on a non-JS build) |
+| `adapter` | `builtin:<name>`, `code:<name>@<version>`, or `infra:<name>` (4.7, 8.9, 10.7) |
 | `grants` | The adapter's capabilities — typically just its `socket` grant |
 | `maxRuntimes` | Max warm runtimes per mount (resident pool); grows lazily under concurrency |
 | `idleMs` / `idleSeconds` | Idle-eviction window; `0` keeps runtimes resident indefinitely |

@@ -1,8 +1,9 @@
 # Appendix E — The `rs2` CLI command reference
 
-The `rs2` CLI is the developer loop — scaffold, run, validate, deploy, migrate.
-It is **not** an API client; you call tenants over plain HTTP (Appendix C / Part
-9). Run it as the installed `rs2` binary or `cargo run -p rs2-cli -- <args>`.
+The `rs2` CLI covers the developer loop plus a small set of admin/ops tasks. It
+is not a general API client — use plain HTTP for everything outside these
+commands. Run it as the installed `rs2` binary or
+`cargo run -p rs2-cli -- <args>`.
 
 ## Verbs
 
@@ -11,10 +12,39 @@ It is **not** an API client; you call tenants over plain HTTP (Appendix C / Part
 | `rs2 new <name> [--js]` | Scaffold a custom-service project. Default Rust/Wasm against the published WIT (compiles as-is with `cargo build --target wasm32-wasip2 --release`); `--js` is a single-file ESM scaffold with `manifest.json` |
 | `rs2 dev [serverConfig.json]` | Run a local node (same code as `rs2-server`) |
 | `rs2 test [projectDir] [--component <path>]` | Validate `manifest.json` and the built component (wasm header; engine compile-check when built `--features wasm`) |
-| `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Upload to `PUT <server>/code/<n>`. `.js`/`.mjs` → JS bundle; `\0asm` → component. `--bundle` runs `npx esbuild … --bundle --format=esm --platform=browser` first |
+| `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Keyless `POST` to `<server>/code/<n>/`; the content-addressed store derives the version. `.js`/`.mjs` → JS bundle; `\0asm` → component. `--bundle` runs `npx esbuild … --bundle --format=esm --platform=browser` first |
+| `rs2 template build <entry.jsx|tsx> [--out <file>]` | Bundle a Preact component into the `{source, contentType}` envelope stored by a `template` mount (6.6) |
 | `rs2 migrate <services.json> [-o tenant.json]` | Convert a v1 Restspace config to an RS2 tenant config (Part 11) |
+| `rs2 login [--host <url>] [--email <e>] [--password <p>]` | Log in through `/auth/login` and save the token, expiry, and issuing host to `rsconfig.json` |
+| `rs2 send <path> --file <local> [--content-type <ct>]` | PUT one local file to the configured host; content type is inferred when omitted; uses a saved valid token when present |
+| `rs2 service add <mount.json> [--path <p>]` | ETag-safe read/append/write of one new mount; refuses an occupied path |
+| `rs2 service set-access <path> --access <json> [--set k=v]…` | ETag-safe update of an existing mount's access and optional config keys |
+| `rs2 auth init --admin-email <e> [options]` | One-shot auth bootstrap on a fresh open node: enable auth, create/login first admin, lock user store and services mount |
+| `rs2 auth enable [options]` | Idempotently add auth settings/mount and temporarily open a user store for bootstrap |
+| `rs2 auth create-admin --email <e> [options]` | Hash a password locally and seed the first operator while that user store is open; skips an existing visible record |
 | `rs2 pull [--host <url>] [--dir <d>]` | Mirror the tenant's instruction plane (config + every `specSubtree` store + code pins) into a local `rs2/` directory for git-based editing; records baseline ETags in `rs2/mirror.json` (§3.6) |
 | `rs2 push [--dir <d>] [--dry-run] [--allow-secret-rotation]` | Push local instruction-plane edits back through the validated APIs (config `If-Match`, spec `If-Match`/412); aborts on a remote change rather than clobbering. `--dry-run` shows the diff; refuses a real secret value in a `"<secret>"` slot without `--allow-secret-rotation` |
+| `rs2 run <script>` | Run one `rs2` command per line, skipping blanks/comments and aborting on the first failure; `dev` is rejected because it never returns |
+
+## `rsconfig.json`
+
+The admin commands walk upward from the current directory to the nearest
+`rsconfig.json`:
+
+```json
+{
+  "host": "https://api.example.com",
+  "login": { "email": "admin@example.com" },
+  "auth": { "token": "<jwt>", "exp": 1799999999,
+            "host": "https://api.example.com" }
+}
+```
+
+`login` writes `auth`; other commands reuse it only while it is unexpired and
+matches `host`. Prefer `RS2_PASSWORD` (or the command flag) to storing
+`login.password` in this file. `send` and `service add` also work anonymously
+when the server's access policy permits it, which is useful during first-node
+bootstrap.
 
 ## `rs2 deploy` flags
 
@@ -44,6 +74,18 @@ cargo build --target wasm32-wasip2 --release
 rs2 test my-svc
 rs2 deploy target/wasm32-wasip2/release/my_svc.wasm --name my-svc
 ```
+
+**Bootstrap a fresh node, then make a small change:**
+
+```powershell
+rs2 auth init --admin-email admin@example.com
+rs2 service add notes.mount.json --path /notes
+rs2 send /notes/welcome.txt --file .\welcome.txt
+```
+
+For a multi-file/versioned config change, use `rs2 pull`, edit the local `rs2/`
+mirror, inspect `rs2 push --dry-run`, then push. The mirror contains config,
+specs, and code pins — not data, site assets, or bundle bytes.
 
 **Migrate from v1:**
 

@@ -50,7 +50,7 @@ The headline design decision:
 
 > **RS2 builds a brand-new isolate for every single invocation of a JS service,
 > then throws it away when the request finishes.** (The exception is loadable
-> adapters — see §8.)
+> adapters and compiled templates — see §10.)
 
 This is the most conservative possible choice, and it's deliberate (PRD open
 question 2, resolved in favour of full isolation). The consequences you can
@@ -68,10 +68,10 @@ is similar: assume nothing survives between calls, and put anything durable in
 explicit storage.
 
 "Build a whole JavaScript engine instance per request" sounds expensive, but
-isolate creation is cheap (microseconds-to-low-milliseconds), and it buys
-airtight isolation. Reusing warm isolates is a known later optimization — it can
-slot in behind the same internal engine interface without changing your
-service's contract.
+RS2 boots it from a checked-in prelude snapshot rather than re-evaluating all
+compat code on every call. That keeps the isolation boundary while avoiding
+most setup work. Warm isolates remain reserved for the service types whose
+contract calls for residency.
 
 ---
 
@@ -144,6 +144,11 @@ web-style APIs (`fetch`, `console`, `Buffer`, etc.) on top of the ops. It's the
 implementation behind Appendix... well, behind §5 below and manual §8.3. Because
 it runs *before* your bundle, by the time your code executes those globals simply
 exist.
+
+In the production path, the stable bootstrap/prelude state is restored from a
+generated V8 snapshot. The source and snapshot hash are checked together in the
+test suite, so changing the supported API requires regenerating the snapshot;
+the diagram above remains the conceptual order.
 
 **Step 4 — your bundle.** Your module is loaded and evaluated *as a module*.
 This is why **module top-level code runs at this point, before any request data
@@ -230,14 +235,21 @@ way.
 Your handler doesn't receive RS2's internal message object directly; it receives
 a plain JavaScript object. The engine **marshals** (translates) between the two:
 
-**Inbound.** Before your code runs, RS2 takes the request message and, subject
+**Inbound (default).** Before your code runs, RS2 takes the request message and, subject
 to the body-size cap (see §9), materializes the body. If the body is JSON it's
 parsed into a real JavaScript value; otherwise it arrives as a string. Headers
 become a plain object, and you get:
 
 ```js
-{ method, url, headers, body, mediaType }
+{ method, url, headers, body, bodySize, mediaType }
 ```
+
+Three JS mount flags change that crossing. `bodyPassthrough` carries the body
+around the isolate unchanged; `requestStreaming` lets the guest pull chunks with
+`ctx.readBody`/`ctx.body`; `responseStreaming` lets it open a host-backed writer
+with `ctx.beginStream`. The guest never receives a host stream object — chunks
+cross through bounded ops — which preserves backpressure and the same byte and
+wall-clock limits. See manual §8.2 for the public contract.
 
 **Outbound.** Whatever your handler returns is normalized into a response:
 
@@ -358,8 +370,8 @@ time, not at first request.
 
 Everything above describes the per-request model: build an isolate, run one
 handler, discard it. There is one important variation — **loadable adapters**
-(G13), where a deployed JS bundle backs a *data store's persistence* rather than
-serving requests directly (e.g. a custom Redis or Postgres adapter).
+(G13), where a deployed JS bundle backs a file/data/query store, an SMS
+provider, or a compiled template rather than serving ordinary one-shot requests.
 
 The per-request model has a problem for this use case: if the isolate is
 destroyed after every request, a database connection opened during one request
@@ -368,8 +380,9 @@ connection requires the isolate to *stay alive*.
 
 So adapters run as **resident runtimes**:
 
-- The bundle is evaluated **once** on its own dedicated, long-lived OS thread.
-- That thread then loops, servicing many "jobs" against the **same** isolate.
+- The bundle is evaluated **once** per resident runtime on its own long-lived
+  thread.
+- Each runtime then loops, servicing many "jobs" against the **same** isolate.
 - Because the isolate persists, a socket the adapter opens during job N is still
   open for job N+1. The adapter caches the connection in an ordinary
   module-level JavaScript variable, and it pools naturally — the proof case
@@ -380,12 +393,12 @@ the same "dispatch one call" step, just arranged as *build-once, dispatch-many*
 instead of *build-once, dispatch-once*. Host socket I/O still hops back to the
 main runtime exactly as in §5.
 
-Lifecycle is tied to the tenant: the resident runtime lives as long as the
-tenant is loaded, and a config change that rebuilds the tenant drops the old
-runtime (closing its pooled connections) and lets the next request spin up the
-new one. There's no node-global pool to manage. The trade-off carried into a
-later phase: today there's one runtime per adapter mount, so its jobs serialize;
-a small per-mount pool is a future throughput improvement.
+Lifecycle is tied to the tenant. An adapter mount grows a small pool lazily under
+concurrent load, up to `store.maxRuntimes` (default 4); each member serializes
+its own jobs and dispatch chooses a least-busy member. Members idle beyond
+`store.idleMs`/`idleSeconds` (default 60 seconds, `0` disables eviction) are
+dropped, closing their sockets. A config change drops the whole pool and lets
+the next request start the new version. There is no node-global guest pool.
 
 ---
 
@@ -395,7 +408,8 @@ A single JS request, end to end:
 
 1. Dispatch routes the request to a JS `code:` mount and assembles the granted
    capabilities for it (default-deny).
-2. The request body is materialized (capped) and marshaled to a plain `msg`.
+2. The request body is materialized (capped) and marshaled to a plain `msg`, or
+   crosses through the selected passthrough/streaming mode.
 3. RS2 builds a fresh isolate on its own thread, installs ops, runs the
    bootstrap + compat prelude, and loads + evaluates your bundle.
 4. It calls your handler. Each `ctx.request`/`fetch`/socket op parks the isolate
@@ -403,7 +417,8 @@ A single JS request, end to end:
    driven to settle in virtual time.
 5. A watchdog and a heap cap stand ready to kill a runaway or memory-bomb
    handler into a structured limit error.
-6. Your return value is normalized and marshaled back into a response message.
+6. Your return value is normalized and marshaled back into a response message,
+   or the host-backed response writer completes its stream.
 7. The isolate is discarded (or, for a resident adapter, kept warm for the next
    job).
 

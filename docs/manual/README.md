@@ -44,6 +44,7 @@ before, so a first read works front-to-back; later it doubles as a reference.
 - [4.4 The `data` service: schema-validated JSON records](part-4-storing-files-and-data/4.4-the-data-service.md)
 - [4.5 Schemas, validation errors, and JSON merge PATCH](part-4-storing-files-and-data/4.5-schemas-validation-patch.md)
 - [4.6 Listings, pagination, and the `?confirm=` delete guard](part-4-storing-files-and-data/4.6-listings-pagination-delete.md)
+- [4.7 Choosing a storage backend and isolating mounts](part-4-storing-files-and-data/4.7-choosing-a-storage-backend.md)
 
 ### Part 5 — Authentication & Access Control
 
@@ -54,13 +55,14 @@ before, so a first read works front-to-back; later it doubles as a reference.
 - [5.4 Role specs on mounts](part-5-auth-and-access-control/5.4-role-specs-on-mounts.md) (read/write/delete/invoke, path-scoped grants, per-spec access)
 - [5.5 CORS, trusted vs. allowed origins, and the CSRF guard](part-5-auth-and-access-control/5.5-cors-and-csrf.md)
 
-### Part 6 — Querying Data
+### Part 6 — Querying and Rendering Data
 
 - [6.1 The `query` service: stored queries authored like files](part-6-querying-data/6.1-the-query-service.md)
 - [6.2 Parameters: URL segments, query strings, and request bodies](part-6-querying-data/6.2-parameters.md)
 - [6.3 JSON templates (structural, injection-safe substitution)](part-6-querying-data/6.3-json-templates.md)
 - [6.4 String/SQL templates and bind parameters](part-6-querying-data/6.4-string-sql-templates.md)
 - [6.5 Param schemas, defaults, and validation](part-6-querying-data/6.5-param-schemas.md)
+- [6.6 Rendering HTML with the `template` service](part-6-querying-data/6.6-rendering-html-with-templates.md)
 
 ### Part 7 — Composing with Pipelines
 
@@ -73,6 +75,8 @@ before, so a first read works front-to-back; later it doubles as a reference.
 - [7.7 Retries, effect classes, and idempotency](part-7-pipelines/7.7-retries-effects-idempotency.md)
 - [7.8 Segments and the `?$plan` introspection](part-7-pipelines/7.8-segments-and-plan.md)
 - [7.9 Debugging a pipeline](part-7-pipelines/7.9-debugging-a-pipeline.md)
+- [7.10 Wrappers and response shaping](part-7-pipelines/7.10-wrappers-and-response-shaping.md)
+- [7.11 Webhooks, schedules, and polling connectors](part-7-pipelines/7.11-webhooks-and-schedules.md)
 
 ### Part 8 — Custom Services (Your Own Code)
 
@@ -85,6 +89,8 @@ before, so a first read works front-to-back; later it doubles as a reference.
 - [8.7 Versioning, rollback, and mounting `code:` refs](part-8-custom-services/8.7-versioning-and-mounting.md)
 - [8.8 Limits inside the sandbox and diagnosing failures](part-8-custom-services/8.8-limits-and-diagnosing.md)
 - [8.9 Loadable storage adapters (bring your own backend)](part-8-custom-services/8.9-loadable-storage-adapters.md)
+- [8.10 The `proxy` and `sms` services](part-8-custom-services/8.10-proxy-and-sms.md)
+- [8.11 Discovery manifests and external catalogues](part-8-custom-services/8.11-manifests-and-catalogues.md)
 
 ### Part 9 — The HTTP API & Cross-Cutting Behavior
 
@@ -103,6 +109,7 @@ before, so a first read works front-to-back; later it doubles as a reference.
 - [10.4 Editing config safely](part-10-operating-a-node/10.4-editing-config-safely.md) (`PUT /services/raw`, dry-build, hot-swap)
 - [10.5 Deploying and rotating custom code on a running node](part-10-operating-a-node/10.5-deploying-and-rotating-code.md)
 - [10.6 Secrets handling (write-only config fields)](part-10-operating-a-node/10.6-secrets-handling.md)
+- [10.7 Operator infras, first-admin bootstrap, and production boundaries](part-10-operating-a-node/10.7-infras-bootstrap-and-production.md)
 
 ### Part 11 — Migrating from v1 Restspace
 

@@ -8,11 +8,15 @@ serve adjacent audiences.
 | Resource | Audience / contents |
 | --- | --- |
 | `README.md` | Repo layout, build/test/run commands, and milestone status — the authoritative summary of what's implemented |
+| `LICENSE` / `LICENSING.md` | AGPL-3.0-only terms and the commercial-license option for closed-source embedding/hosting |
 | `AGENTS.md` | The agent working guide for developing the runtime itself |
 | `docs/agents/architecture.md` | The design throughline: capabilities, host choke points, the store/spec patterns, the instruction plane (the *why* behind Part 3) |
 | `docs/agents/conventions.md` | Editing, commit, and workflow rules for contributors |
 | `docs/agents/pitfalls.md` | Rust + engine traps encountered building the runtime |
 | `docs/agents/testing.md` | The test matrix, conformance suite, and benchmarks |
+| `docs/agents/loadable-adapters.md` | The resident-runtime and loadable-adapter design arc |
+| `deploy/README.md` / `deploy/build-from-source-ubuntu.md` | Release install, systemd/reverse-proxy deployment, and source builds on Ubuntu |
+| `SECURITY.md` | Supported security-reporting process |
 
 ## The operator skill
 
