@@ -6,7 +6,7 @@ RS2 is a backend you configure rather than write. A single Rust server hosts
 **services** — file store, JSON data store, queries, auth, pipelines — that you
 **mount at URL paths** with a JSON config, **compose into pipelines**, and
 extend with **your own code running in a sandbox**. It is the second-generation
-runtime for [Restspace](https://github.com/restspace), rebuilt in Rust.
+runtime for [Restspace](https://restspace.io), rebuilt in Rust.
 
 ```jsonc
 // tenants/main.json — this is a working backend
