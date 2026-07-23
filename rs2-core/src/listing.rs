@@ -202,6 +202,94 @@ fn insert_path(obj: &mut Map<String, Value>, path: &[String], value: Value) {
     }
 }
 
+/// A sortable listing-metadata field (`$sort=@name` on file-pattern stores):
+/// what the listing already knows about an entry without reading its content.
+/// `@`-prefixed to keep the namespace disjoint from content field paths
+/// (which are stage-2 for file stores and live on `data` today).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaField {
+    Name,
+    Size,
+    LastModified,
+    ContentType,
+    Dir,
+}
+
+impl MetaField {
+    fn parse(key: &str) -> Result<MetaField, RsError> {
+        match key {
+            "@name" => Ok(MetaField::Name),
+            "@size" => Ok(MetaField::Size),
+            "@lastModified" => Ok(MetaField::LastModified),
+            "@contentType" => Ok(MetaField::ContentType),
+            "@dir" => Ok(MetaField::Dir),
+            _ => Err(RsError::bad_request(format!(
+                "unknown listing sort key '{key}': metadata keys are @name, @size, \
+                 @lastModified, @contentType, @dir"
+            ))),
+        }
+    }
+
+    /// The entry's value for this field, `None` where the entry doesn't have
+    /// one (a directory's contentType, an adapter without timestamps) — which
+    /// sorts as "missing" per the contract.
+    fn value(&self, e: &crate::capabilities::DirEntry) -> Option<Value> {
+        match self {
+            MetaField::Name => Some(Value::String(e.name.clone())),
+            MetaField::Size => Some(Value::Number(e.size.into())),
+            MetaField::LastModified => e.last_modified.clone().map(Value::String),
+            MetaField::ContentType => e.content_type.clone().map(Value::String),
+            MetaField::Dir => Some(Value::Bool(e.dir)),
+        }
+    }
+}
+
+/// A parsed metadata sort (`$sort=-@lastModified,@name`). Every key must be a
+/// metadata key — mixing content paths into a file-listing sort is an error,
+/// not a silent no-op.
+#[derive(Debug, Clone)]
+pub struct MetaSort(pub Vec<(MetaField, Dir)>);
+
+impl MetaSort {
+    pub fn parse(sort: &str) -> Result<MetaSort, RsError> {
+        let keys = sort
+            .split(',')
+            .map(|k| {
+                let k = k.trim();
+                let (dir, key) = match k.strip_prefix('-') {
+                    Some(rest) => (Dir::Desc, rest),
+                    None => (Dir::Asc, k),
+                };
+                Ok((MetaField::parse(key)?, dir))
+            })
+            .collect::<Result<Vec<_>, RsError>>()?;
+        if keys.is_empty() {
+            return Err(RsError::bad_request("$sort requires at least one key"));
+        }
+        Ok(MetaSort(keys))
+    }
+
+    /// Sort entries by the metadata keys, entry name ascending as the final
+    /// tiebreak (the listing analogue of the record-key tiebreak). RFC 3339
+    /// `lastModified` strings sort chronologically under the binary string
+    /// compare, so no date parsing is involved.
+    pub fn sort(&self, entries: &mut [crate::capabilities::DirEntry]) {
+        entries.sort_by(|a, b| {
+            for (field, dir) in &self.0 {
+                let ord = compare_optional(field.value(a).as_ref(), field.value(b).as_ref());
+                let ord = match dir {
+                    Dir::Asc => ord,
+                    Dir::Desc => ord.reverse(),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.name.cmp(&b.name)
+        });
+    }
+}
+
 /// The host-side reference pipeline over a full dataset: sort (stably, by key
 /// order as the final tiebreak for determinism), page, project. `records` are
 /// `(key, record)` pairs; returns `(projected page, total)`. This is what the
@@ -313,6 +401,41 @@ mod tests {
         assert_eq!(spec.sort[1], (path("title"), Dir::Asc));
         assert!(ListSpec::parse("", None, 10, 0).is_err());
         assert!(ListSpec::parse("a", Some("-"), 10, 0).is_err());
+    }
+
+    #[test]
+    fn meta_sort_orders_entries_with_name_tiebreak() {
+        use crate::capabilities::DirEntry;
+        let entry = |name: &str, size: u64, dir: bool, ct: Option<&str>, lm: Option<&str>| DirEntry {
+            name: name.to_string(),
+            size,
+            last_modified: lm.map(str::to_string),
+            dir,
+            content_type: ct.map(str::to_string),
+        };
+        let mut entries = vec![
+            entry("b.txt", 10, false, Some("text/plain"), Some("2026-07-02T00:00:00Z")),
+            entry("a.json", 300, false, Some("application/json"), Some("2026-07-01T00:00:00Z")),
+            entry("sub/", 0, true, None, Some("2026-07-03T00:00:00Z")),
+            entry("c.txt", 10, false, Some("text/plain"), None),
+        ];
+        let names = |es: &[DirEntry]| es.iter().map(|e| e.name.clone()).collect::<Vec<_>>();
+
+        MetaSort::parse("-@size,@name").unwrap().sort(&mut entries);
+        assert_eq!(names(&entries), ["a.json", "b.txt", "c.txt", "sub/"]);
+
+        // Missing lastModified sorts first ascending; RFC 3339 strings sort
+        // chronologically.
+        MetaSort::parse("@lastModified").unwrap().sort(&mut entries);
+        assert_eq!(names(&entries), ["c.txt", "a.json", "b.txt", "sub/"]);
+
+        // A directory's missing contentType sorts first; name breaks ties.
+        MetaSort::parse("@contentType,@name").unwrap().sort(&mut entries);
+        assert_eq!(names(&entries), ["sub/", "a.json", "b.txt", "c.txt"]);
+
+        assert!(MetaSort::parse("@nope").is_err());
+        assert!(MetaSort::parse("name").is_err(), "unprefixed keys are errors");
+        assert!(MetaSort::parse("").is_err());
     }
 
     #[test]

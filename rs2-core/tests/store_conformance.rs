@@ -473,6 +473,138 @@ async fn assert_listing_contract(rt: &Runtime, mount: &str) {
     assert_eq!(resp.status, Some(StatusCode::NO_CONTENT));
 }
 
+/// The metadata-sort contract (the `meta-sort` facet): `$sort` over
+/// `@`-prefixed listing metadata orders any file-pattern listing without
+/// content reads — same comparison semantics as the projected-listing
+/// contract (binary strings, missing-first ascending, name tiebreak),
+/// pagination after the sort, unknown/unprefixed keys a 400.
+async fn assert_meta_sort_contract(rt: &Runtime, mount: &str, make_body: impl Fn(usize) -> Body) {
+    // Distinct sizes (body length scales with i) + a subdirectory.
+    for (name, i) in [("bb", 3), ("aa", 1), ("cc", 2)] {
+        let resp = rt
+            .handle(req(Method::PUT, &format!("{mount}/msort/{name}")).with_body(make_body(i)))
+            .await;
+        assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {name}");
+    }
+    let resp = rt
+        .handle(req(Method::PUT, &format!("{mount}/msort/sub/inner")).with_body(make_body(1)))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::CREATED), "seed sub/inner");
+
+    let names = |listing: &serde_json::Value| -> Vec<String> {
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // @name descending (code-point order, dirs by their slashed name).
+    let mut resp = rt
+        .handle(req(Method::GET, &format!("{mount}/msort/?$sort=-@name")))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] -@name lists");
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["sub/", "cc", "bb", "aa"],
+        "[{mount}] -@name order"
+    );
+
+    // -@size with @name tiebreak: sizes scale with the seed index; the dir
+    // (size 0) and the smallest file tie region stays name-deterministic.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/msort/?$sort=-@size,@name"),
+        ))
+        .await;
+    let listing = body_json(&mut resp).await;
+    let got = names(&listing);
+    assert_eq!(got[0], "bb", "[{mount}] largest first: {got:?}");
+    assert_eq!(got[1], "cc", "[{mount}] then next: {got:?}");
+
+    // Pagination applies after the sort; total is the full count.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/msort/?$sort=-@name&$take=2&$skip=1"),
+        ))
+        .await;
+    let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
+    assert_eq!(total, 4, "[{mount}] meta-sorted total is the full count");
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["cc", "bb"],
+        "[{mount}] pagination after the meta sort"
+    );
+
+    // @lastModified sorts without error and keeps every entry (mtime
+    // granularity makes strict order assertions flaky; the name tiebreak
+    // keeps the result deterministic per run).
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/msort/?$sort=-@lastModified"),
+        ))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::OK));
+    let listing = body_json(&mut resp).await;
+    assert_eq!(listing["entries"].as_array().unwrap().len(), 4);
+
+    // Unknown and unprefixed keys are client errors, never ignored.
+    for bad in ["@nope", "name", "-size"] {
+        let resp = rt
+            .handle(req(Method::GET, &format!("{mount}/msort/?$sort={bad}")))
+            .await;
+        assert_eq!(
+            resp.status,
+            Some(StatusCode::BAD_REQUEST),
+            "[{mount}] $sort={bad} is 400"
+        );
+    }
+
+    // The plain listing is untouched by the feature existing.
+    let mut resp = rt.handle(req(Method::GET, &format!("{mount}/msort/"))).await;
+    assert_eq!(resp.status, Some(StatusCode::OK));
+    let listing = body_json(&mut resp).await;
+    assert_eq!(listing["entries"].as_array().unwrap().len(), 4);
+
+    // Cleanup.
+    let resp = rt
+        .handle(req(
+            Method::DELETE,
+            &format!("{mount}/msort/?confirm=msort"),
+        ))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::NO_CONTENT));
+}
+
+#[tokio::test]
+async fn file_service_satisfies_the_meta_sort_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt(dir.path());
+    assert_meta_sort_contract(&rt, "/files", |i| {
+        Body::from_string("x".repeat(i * 100), MediaType::new("text/plain"))
+    })
+    .await;
+}
+
+/// Spec stores delegate their authoring subtrees to an owned FileService, so
+/// they inherit the meta-sort facet — held to it here through the query
+/// store's door.
+#[tokio::test]
+async fn query_authoring_subtree_satisfies_the_meta_sort_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt(dir.path());
+    assert_meta_sort_contract(&rt, "/q/.queries", |i| {
+        Body::from_json(&json!({ "query": { "dataset": "orders", "pad": "x".repeat(i * 100) } }))
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn data_service_satisfies_the_listing_contract_mem() {
     let dir = tempfile::tempdir().unwrap();

@@ -426,7 +426,23 @@ impl Service for FileService {
                     return Err(RsError::not_found(format!("'{path}' does not exist")));
                 }
                 let (take, skip) = pagination(&msg);
-                let (entries, total) = files.list(&path, take, skip).await?;
+                // Metadata sort (the `meta-sort` facet): order by what the
+                // listing already knows (@name/@size/@lastModified/
+                // @contentType/@dir) — no content reads. A sort needs the
+                // whole directory before paging (a page of the natural order
+                // can't be re-sorted), so fetch unpaged, sort, then slice;
+                // the plain path stays adapter-paginated as before.
+                let (entries, total) = match msg.url.query_param("$sort") {
+                    Some(sort) => {
+                        let sort = crate::listing::MetaSort::parse(&sort)?;
+                        let (mut entries, total) = files.list(&path, usize::MAX, 0).await?;
+                        sort.sort(&mut entries);
+                        let entries: Vec<_> =
+                            entries.into_iter().skip(skip).take(take).collect();
+                        (entries, total)
+                    }
+                    None => files.list(&path, take, skip).await?,
+                };
                 let listing = json!({
                     "path": path,
                     "entries": entries,

@@ -266,7 +266,9 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
     }
     let (pattern, facets): (&str, Vec<&str>) = match mount.service.as_str() {
         "file" => {
-            let mut facets = vec!["range", "confirm-delete", "move"];
+            // `meta-sort`: directory listings take `$sort` over listing
+            // metadata (@name/@size/@lastModified/@contentType/@dir).
+            let mut facets = vec!["range", "confirm-delete", "move", "meta-sort"];
             if mount.config.get("defaultResource").is_some()
                 || mount.config.get("spaFallback").is_some()
             {
@@ -281,14 +283,22 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
             // native pushdown; see `listProjection` in the services doc).
             vec!["schema", "patch", "echo", "confirm-delete", "list-projection"],
         ),
-        "pipeline" => ("store-transform", vec!["any-verb"]),
+        // Spec stores' authoring subtrees delegate to an owned FileService,
+        // so their listings inherit `meta-sort`.
+        "pipeline" => ("store-transform", vec!["any-verb", "meta-sort"]),
         "query" => (
             "store-view",
-            vec!["positional-params", "url-params", "any-verb"],
+            vec!["positional-params", "url-params", "any-verb", "meta-sort"],
         ),
         "template" => (
             "store-view",
-            vec!["positional-params", "url-params", "json-props", "any-verb"],
+            vec![
+                "positional-params",
+                "url-params",
+                "json-props",
+                "any-verb",
+                "meta-sort",
+            ],
         ),
         "log" => ("view", vec!["url-params", "time-range", "trace-scoped"]),
         "auth" | "services" => ("api", vec![]),
@@ -900,7 +910,7 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                 // PATCH, schemas) are facets declared per mount on the
                 // discovery surface — feature-detect, don't special-case.
                 "StoreContainer": {
-                    "get": op("List children (application/vnd.rs2.dir+json: {path, entries: [{name, dir, ...}], total}; $take/$skip paginate; X-Total-Count). Stores with the 'list-projection' facet also take $select=<field,dot.path,...> (entries gain a 'fields' object) and $sort=<-field,...> (contractual field-sorted paging)", "pure"),
+                    "get": op("List children (application/vnd.rs2.dir+json: {path, entries: [{name, dir, ...}], total}; $take/$skip paginate; X-Total-Count). Stores with the 'list-projection' facet also take $select=<field,dot.path,...> (entries gain a 'fields' object) and $sort=<-field,...> (contractual field-sorted paging); stores with 'meta-sort' take $sort over listing metadata (@name, @size, @lastModified, @contentType, @dir)", "pure"),
                     "post": op("Keyless create: store the body under a generated child name; 201 + Location (stores with the 'echo' facet return the stored representation)", "unsafe"),
                     "delete": op("Delete the container; non-empty containers require ?confirm=<container name> (409 without it)", "idempotent"),
                 },
