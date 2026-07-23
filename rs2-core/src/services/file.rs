@@ -94,12 +94,30 @@ impl FileService {
         for ext in negotiate_extensions(accept, priority) {
             let candidate = format!("{path}.{ext}");
             match files.head(&candidate).await {
+                // A directory that happens to carry the extension is not a
+                // servable file — keep probing.
+                Ok(meta) if meta.is_dir => continue,
                 Ok(_) => return Ok(Some(candidate)),
                 Err(e) if e.code == crate::error::codes::NOT_FOUND => continue,
                 Err(e) => return Err(e),
             }
         }
         Ok(None)
+    }
+
+    /// 301 to the trailing-slash form of a directory addressed without one
+    /// (the DirectorySlash convention: relative URLs in the served default
+    /// document only resolve correctly against the slash form). `url.path`
+    /// is the full external path, so the Location works across mounts.
+    fn slash_redirect(msg: &Message) -> Message {
+        let mut resp = msg.response(StatusCode::MOVED_PERMANENTLY, None);
+        let location = if msg.url.query.is_empty() {
+            format!("{}/", msg.url.path)
+        } else {
+            format!("{}/?{}", msg.url.path, msg.url.query)
+        };
+        resp.set_header("location", &location);
+        resp
     }
 }
 
@@ -423,7 +441,7 @@ impl Service for FileService {
                 Ok(resp)
             }
             Method::GET => {
-                match self
+                let e = match self
                     .serve_file(
                         msg.response(StatusCode::OK, None),
                         range,
@@ -433,63 +451,74 @@ impl Service for FileService {
                     )
                     .await
                 {
-                    Ok(resp) => Ok(resp),
-                    Err(e)
-                        if e.code == crate::error::codes::NOT_FOUND && is_extensionless(&path) =>
-                    {
-                        // Friendly URL: resolve `/docs/readme` to a stored
-                        // `docs/readme.<ext>` (Accept-negotiated). A real file
-                        // beats the SPA shell, so try this first.
-                        if site.friendly_urls {
-                            if let Some(real) = self
-                                .resolve_friendly(
-                                    &path,
-                                    accept.as_deref(),
-                                    files,
-                                    &site.extension_priority,
-                                )
-                                .await?
-                            {
-                                let mut resp = self
-                                    .serve_file(
-                                        msg.response(StatusCode::OK, None),
-                                        range,
-                                        if_none_match,
-                                        files,
-                                        &real,
-                                    )
-                                    .await?;
-                                resp.set_header(
-                                    "content-location",
-                                    &format!("{}{}", msg.url.base_path, real),
-                                );
-                                return Ok(resp);
-                            }
-                        }
-                        // SPA fallback: an extension-less miss is a client-side
-                        // route — serve the root default with 200. Asset misses
-                        // (paths with extensions) stay honest 404s.
-                        if site.spa_fallback {
-                            let default = site.default_resource.as_deref().unwrap_or("index.html");
-                            return self
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => e,
+                };
+                // The path may name a directory without the trailing slash.
+                // Redirect to the slash form, whose arm decides what a
+                // directory URL yields (default doc, listing, or 404).
+                // Checked before friendly URLs / SPA so a directory always
+                // beats a same-named `.html` probe.
+                if matches!(files.head(&path).await, Ok(m) if m.is_dir) {
+                    return Ok(Self::slash_redirect(&msg));
+                }
+                if e.code == crate::error::codes::NOT_FOUND && is_extensionless(&path) {
+                    // Friendly URL: resolve `/docs/readme` to a stored
+                    // `docs/readme.<ext>` (Accept-negotiated). A real file
+                    // beats the SPA shell, so try this first.
+                    if site.friendly_urls {
+                        if let Some(real) = self
+                            .resolve_friendly(
+                                &path,
+                                accept.as_deref(),
+                                files,
+                                &site.extension_priority,
+                            )
+                            .await?
+                        {
+                            let mut resp = self
                                 .serve_file(
                                     msg.response(StatusCode::OK, None),
                                     range,
                                     if_none_match,
                                     files,
-                                    &format!("/{default}"),
+                                    &real,
                                 )
-                                .await;
+                                .await?;
+                            resp.set_header(
+                                "content-location",
+                                &format!("{}{}", msg.url.base_path, real),
+                            );
+                            return Ok(resp);
                         }
-                        Err(e)
                     }
-                    Err(e) => Err(e),
+                    // SPA fallback: an extension-less miss is a client-side
+                    // route — serve the root default with 200. Asset misses
+                    // (paths with extensions) stay honest 404s.
+                    if site.spa_fallback {
+                        let default = site.default_resource.as_deref().unwrap_or("index.html");
+                        return self
+                            .serve_file(
+                                msg.response(StatusCode::OK, None),
+                                range,
+                                if_none_match,
+                                files,
+                                &format!("/{default}"),
+                            )
+                            .await;
+                    }
                 }
+                Err(e)
             }
             Method::HEAD => {
                 // Resolve the same way GET does: exact match, then (if the path
                 // is extension-less and friendly URLs are on) a negotiated probe.
                 let resolved = match files.head(&path).await {
+                    // Same DirectorySlash redirect as GET (the old behavior —
+                    // a 200 with a path-guessed content type — was bogus).
+                    Ok(meta) if meta.is_dir && !msg.url.is_directory() => {
+                        return Ok(Self::slash_redirect(&msg));
+                    }
                     Ok(meta) => Some((path.clone(), meta)),
                     Err(e)
                         if e.code == crate::error::codes::NOT_FOUND
