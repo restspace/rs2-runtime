@@ -23,3 +23,4 @@ examples/*/data-store/
 # Stray agent worktrees.
 /.claude/
 /PUBLIC-RELEASE-HANDOFF.md
+/PUBLICITY-PLAN.md
