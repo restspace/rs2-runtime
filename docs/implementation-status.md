@@ -45,6 +45,14 @@ Done:
   pushdown for `builtin:mem`. Field-level read rules redact projections like
   record GETs. Discovery: `list-projection` facet + `listProjection:
   native|fallback` in the services doc.
+- **Metadata sort on file-pattern listings** (`$sort=@key`, the `meta-sort`
+  facet): directory listings on `file` mounts and spec-store authoring
+  subtrees (inherited via FileService delegation) sort by listing metadata —
+  `@name`/`@size`/`@lastModified`/`@contentType`/`@dir` — with the same pinned
+  comparison semantics, name tiebreak, and page-after-sort pagination; no
+  content reads; unknown/unprefixed keys are a 400. `MetaSort` in
+  `listing.rs`; conformance-tested through the file mount and the query
+  authoring subtree.
 - **Static-site mode on `file`** (no separate service — config):
   `defaultResource` serves a default document for directory GETs,
   `spaFallback` serves the root app shell for extension-less misses
