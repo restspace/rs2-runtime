@@ -307,6 +307,204 @@ async fn query_authoring_subtree_satisfies_the_store_contract() {
     .await;
 }
 
+/// The projected-listing contract (the `list-projection` facet): `$select`
+/// projects fields into entries, `$sort` orders by the pinned semantics
+/// (binary UTF-8 code points; missing < null < false < true < numbers <
+/// strings; key as final tiebreak), pagination pages the sorted whole. Every
+/// `DataStore` — host fallback or native pushdown — must produce exactly
+/// this output over the same records.
+async fn assert_listing_contract(rt: &Runtime, mount: &str) {
+    let put = |key: &str, val: serde_json::Value| {
+        let path = format!("{mount}/posts/{key}");
+        async move {
+            let resp = rt
+                .handle(req(Method::PUT, &path).with_body(Body::from_json(&val)))
+                .await;
+            assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {path}");
+        }
+    };
+    put("ka", json!({ "title": "apple",  "n": 5,  "meta": { "date": "2026-01-02" } })).await;
+    put("kb", json!({ "title": "Zebra",  "n": 2,  "meta": { "date": "2026-01-03" } })).await;
+    put("kc", json!({ "title": "banana", "n": 2 })).await;
+    put("kd", json!({ "title": "cherry", "n": 10, "meta": { "date": "2026-01-01" } })).await;
+
+    let names = |listing: &serde_json::Value| -> Vec<String> {
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // $select: dir+json entries gain `fields` (projected, nested shape kept,
+    // absent paths omitted); no `.schema.json` fixed entry in table data.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title,meta.date"),
+        ))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] $select lists");
+    assert_eq!(
+        resp.body.as_ref().unwrap().media_type.essence(),
+        "application/vnd.rs2.dir+json",
+        "[{mount}] projected listing keeps the listing media type"
+    );
+    let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
+    assert_eq!(total, 4, "[{mount}] projected listing counts records");
+    let listing = body_json(&mut resp).await;
+    assert_eq!(listing["total"].as_u64(), Some(4));
+    let entries = listing["entries"].as_array().unwrap();
+    assert!(
+        entries.iter().all(|e| e["name"] != ".schema.json"),
+        "[{mount}] no fixed entries in a projected listing: {listing}"
+    );
+    let ka = entries.iter().find(|e| e["name"] == "ka").unwrap();
+    assert_eq!(
+        ka["fields"],
+        json!({ "title": "apple", "meta": { "date": "2026-01-02" } }),
+        "[{mount}] projection keeps nested shape"
+    );
+    let kc = entries.iter().find(|e| e["name"] == "kc").unwrap();
+    assert_eq!(
+        kc["fields"],
+        json!({ "title": "banana" }),
+        "[{mount}] absent path omitted, not an error"
+    );
+
+    // $sort asc: binary code-point order — "Zebra" before "apple".
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=title"),
+        ))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["kb", "ka", "kc", "kd"],
+        "[{mount}] code-point ascending sort"
+    );
+
+    // Multi-key with direction: -n then title; the n=2 tie breaks by title.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=-n,title"),
+        ))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["kd", "ka", "kb", "kc"],
+        "[{mount}] multi-key sort with descending first key"
+    );
+
+    // A missing sort field is smallest: first ascending.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=meta.date"),
+        ))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["kc", "kd", "ka", "kb"],
+        "[{mount}] missing sort field sorts first ascending"
+    );
+
+    // Pagination pages the *sorted* sequence; total stays the full count.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=title&$take=2&$skip=1"),
+        ))
+        .await;
+    let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
+    assert_eq!(total, 4, "[{mount}] paged projected total is the full count");
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["ka", "kc"],
+        "[{mount}] pagination applies after the sort"
+    );
+
+    // Malformed specs are client errors, never silently ignored.
+    let resp = rt
+        .handle(req(Method::GET, &format!("{mount}/posts/?$select=a..b")))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::BAD_REQUEST),
+        "[{mount}] malformed $select path is 400"
+    );
+    let resp = rt
+        .handle(req(Method::GET, &format!("{mount}/posts/?$sort=title")))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::BAD_REQUEST),
+        "[{mount}] $sort without $select is 400, not ignored"
+    );
+
+    // A plain listing is unchanged by the feature existing: no `fields`.
+    let mut resp = rt
+        .handle(req(Method::GET, &format!("{mount}/posts/")))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert!(
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("fields").is_none()),
+        "[{mount}] plain listing carries no fields objects: {listing}"
+    );
+
+    // Cleanup so the caller's store is reusable.
+    let resp = rt
+        .handle(req(
+            Method::DELETE,
+            &format!("{mount}/posts/?confirm=posts"),
+        ))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::NO_CONTENT));
+}
+
+#[tokio::test]
+async fn data_service_satisfies_the_listing_contract_mem() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt(dir.path());
+    assert_listing_contract(&rt, "/data").await;
+}
+
+/// The same contract over the file-backed `DataStore` (the production node
+/// default) — the default trait fallback through a second adapter.
+#[tokio::test]
+async fn data_service_satisfies_the_listing_contract_file_backed() {
+    use rs2_core::adapters::FileDataStore;
+    let file_dir = tempfile::tempdir().unwrap();
+    let data_dir = tempfile::tempdir().unwrap();
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(file_dir.path())),
+        Arc::new(FileDataStore::new(Arc::new(LocalFsFileStore::new(
+            data_dir.path(),
+        )))),
+    );
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/data", "service": "data", "config": { "access": "open" } }
+    ]})));
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
+    assert_listing_contract(&rt, "/data").await;
+}
+
 #[tokio::test]
 async fn pipeline_authoring_subtree_satisfies_the_store_contract() {
     let dir = tempfile::tempdir().unwrap();

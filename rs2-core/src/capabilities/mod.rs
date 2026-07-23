@@ -232,6 +232,45 @@ pub trait DataStore: Send + Sync {
         }
         Ok(out)
     }
+
+    /// Projected dataset listing (`$select`/`$sort`): `(key, projected)`
+    /// pairs plus the dataset's total count, per the [`crate::listing`]
+    /// contract. The default composes `list_keys` + `get`: with a sort it
+    /// must walk the whole dataset (a page of keys can't be sorted by field);
+    /// without one it fetches only the requested page. Adapters override to
+    /// push projection/sort down to the backing engine — the override must
+    /// match the default's output exactly (the conformance suite holds both
+    /// to one answer).
+    async fn list_records(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        spec: &crate::listing::ListSpec,
+    ) -> Result<(Vec<(String, serde_json::Value)>, u64), RsError> {
+        if spec.sort.is_empty() {
+            let (keys, total) = self.list_keys(tenant, dataset, spec.take, spec.skip).await?;
+            let mut page = Vec::with_capacity(keys.len());
+            for key in keys {
+                let record = self.get(tenant, dataset, &key).await?;
+                page.push((key, crate::listing::project(&record, &spec.fields)));
+            }
+            return Ok((page, total));
+        }
+        let (keys, _) = self.list_keys(tenant, dataset, usize::MAX, 0).await?;
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            let record = self.get(tenant, dataset, &key).await?;
+            records.push((key, record));
+        }
+        Ok(crate::listing::sort_page_project(records, spec))
+    }
+
+    /// Whether [`DataStore::list_records`] is pushed down to the backing
+    /// engine (`true`) or served by the default key-walk fallback (`false`).
+    /// Surfaced in the mount catalogue so operators can see listing cost.
+    fn listing_pushdown(&self) -> bool {
+        false
+    }
 }
 
 /// Outbound HTTP, granted with allowed-host patterns; default deny.
@@ -636,5 +675,17 @@ impl ScopedDataStore {
 
     pub async fn delete_dataset(&self, dataset: &str) -> Result<(), RsError> {
         self.inner.delete_dataset(&self.tenant, dataset).await
+    }
+
+    pub async fn list_records(
+        &self,
+        dataset: &str,
+        spec: &crate::listing::ListSpec,
+    ) -> Result<(Vec<(String, serde_json::Value)>, u64), RsError> {
+        self.inner.list_records(&self.tenant, dataset, spec).await
+    }
+
+    pub fn listing_pushdown(&self) -> bool {
+        self.inner.listing_pushdown()
     }
 }

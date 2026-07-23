@@ -274,7 +274,13 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
             }
             ("store", facets)
         }
-        "data" => ("store", vec!["schema", "patch", "echo", "confirm-delete"]),
+        "data" => (
+            "store",
+            // `list-projection`: dataset listings accept `$select`/`$sort`
+            // (always available — host fallback when the adapter has no
+            // native pushdown; see `listProjection` in the services doc).
+            vec!["schema", "patch", "echo", "confirm-delete", "list-projection"],
+        ),
         "pipeline" => ("store-transform", vec!["any-verb"]),
         "query" => (
             "store-view",
@@ -369,7 +375,22 @@ fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
             for (k, v) in meta(m) {
                 entry[k] = v;
             }
-            with_pattern(entry, m)
+            let mut entry = with_pattern(entry, m);
+            // Listing cost signal for the `list-projection` facet: whether
+            // `$select`/`$sort` push down to the backing engine or run on
+            // the host key-walk fallback.
+            if m.service == "data" {
+                if let Some((_, ctx)) = tenant.instance(&m.base_path) {
+                    if let Some(data) = ctx.data.as_ref() {
+                        entry["listProjection"] = json!(if data.listing_pushdown() {
+                            "native"
+                        } else {
+                            "fallback"
+                        });
+                    }
+                }
+            }
+            entry
         })
         .collect();
     // The control surface (config / catalogue / code) lives on the
@@ -879,7 +900,7 @@ async fn openapi_doc(tenant: &Tenant, mounts: Vec<&Mount>, tenant_name: String) 
                 // PATCH, schemas) are facets declared per mount on the
                 // discovery surface — feature-detect, don't special-case.
                 "StoreContainer": {
-                    "get": op("List children (application/vnd.rs2.dir+json: {path, entries: [{name, dir, ...}], total}; $take/$skip paginate; X-Total-Count)", "pure"),
+                    "get": op("List children (application/vnd.rs2.dir+json: {path, entries: [{name, dir, ...}], total}; $take/$skip paginate; X-Total-Count). Stores with the 'list-projection' facet also take $select=<field,dot.path,...> (entries gain a 'fields' object) and $sort=<-field,...> (contractual field-sorted paging)", "pure"),
                     "post": op("Keyless create: store the body under a generated child name; 201 + Location (stores with the 'echo' facet return the stored representation)", "unsafe"),
                     "delete": op("Delete the container; non-empty containers require ?confirm=<container name> (409 without it)", "idempotent"),
                 },

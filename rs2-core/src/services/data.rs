@@ -286,7 +286,58 @@ impl Service for DataService {
             [dataset] => {
                 let dataset = dataset.clone();
                 match msg.method {
+                    // Projected listing (`$select`, optional `$sort`): entries
+                    // carry a `fields` object per the `listing` contract.
+                    // Record entries only — the `.schema.json` fixed child is
+                    // a plain-listing affordance, not table data.
+                    Method::GET if msg.url.query_param("$select").is_some() => {
+                        let (take, skip) = pagination(&msg);
+                        let select = msg.url.query_param("$select").unwrap();
+                        let sort = msg.url.query_param("$sort");
+                        let spec =
+                            crate::listing::ListSpec::parse(&select, sort.as_deref(), take, skip)?;
+                        let (page, total) = data.list_records(&dataset, &spec).await?;
+                        // Field-level read rules apply to projections too — a
+                        // listing must not leak what a record GET would redact.
+                        let schema = if field_authz {
+                            data.get_schema(&dataset).await?
+                        } else {
+                            None
+                        };
+                        let entries: Vec<Value> = page
+                            .into_iter()
+                            .map(|(key, mut fields)| {
+                                if let Some(schema) = &schema {
+                                    redact_fields(&mut fields, schema, &msg);
+                                }
+                                json!({
+                                    "name": key,
+                                    "dir": false,
+                                    "contentType": "application/json",
+                                    "fields": fields,
+                                })
+                            })
+                            .collect();
+                        let listing = json!({
+                            "path": format!("/{dataset}/"),
+                            "entries": entries,
+                            "total": total,
+                        });
+                        let mut resp = msg.ok(Some(Body::from_bytes(
+                            listing.to_string(),
+                            MediaType::dir_json(),
+                        )));
+                        resp.set_header("x-total-count", &total.to_string());
+                        Ok(resp)
+                    }
                     Method::GET => {
+                        // No silent parameter-dropping: sorting is only
+                        // defined over a projected listing.
+                        if msg.url.query_param("$sort").is_some() {
+                            return Err(RsError::bad_request(
+                                "$sort requires $select (projected listing)",
+                            ));
+                        }
                         let (take, skip) = pagination(&msg);
                         let (keys, total) = data.list_keys(&dataset, take, skip).await?;
                         // One listing shape across all stores (PRD patterns):
