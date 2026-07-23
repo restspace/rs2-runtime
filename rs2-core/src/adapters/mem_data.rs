@@ -142,6 +142,47 @@ impl DataStore for MemDataStore {
             .ok_or_else(|| RsError::not_found(format!("no dataset '{dataset}'")))
     }
 
+    /// Projected listing under one read lock: sort by reference over the
+    /// whole dataset, then clone/project only the requested page — the
+    /// default fallback cloned every record before sorting.
+    async fn list_records(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        spec: &crate::listing::ListSpec,
+    ) -> Result<(Vec<(String, serde_json::Value)>, u64), RsError> {
+        let tenants = self.tenants.read().await;
+        let ds = tenants
+            .get(tenant)
+            .and_then(|t| t.get(dataset))
+            .ok_or_else(|| RsError::not_found(format!("no dataset '{dataset}'")))?;
+        let total = ds.records.len() as u64;
+        let page: Vec<(String, serde_json::Value)> = if spec.sort.is_empty() {
+            // BTreeMap iterates in key order — the natural listing order.
+            ds.records
+                .iter()
+                .skip(spec.skip)
+                .take(spec.take)
+                .map(|(k, r)| (k.clone(), crate::listing::project(r, &spec.fields)))
+                .collect()
+        } else {
+            let mut refs: Vec<(&String, &serde_json::Value)> = ds.records.iter().collect();
+            refs.sort_by(|(ka, a), (kb, b)| {
+                crate::listing::compare_records(a, b, &spec.sort).then_with(|| ka.cmp(kb))
+            });
+            refs.into_iter()
+                .skip(spec.skip)
+                .take(spec.take)
+                .map(|(k, r)| (k.clone(), crate::listing::project(r, &spec.fields)))
+                .collect()
+        };
+        Ok((page, total))
+    }
+
+    fn listing_pushdown(&self) -> bool {
+        true
+    }
+
     /// One pass under one read lock, cloning only the records that match —
     /// the default (`list_keys` + `get`) took the lock and deep-cloned once
     /// per record, matching or not.
