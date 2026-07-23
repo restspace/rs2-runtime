@@ -91,10 +91,14 @@ impl MsgUrl {
         }
     }
 
-    /// First value of a query parameter, percent-decoded.
+    /// First value of a query parameter, percent-decoded. The *key* is
+    /// decoded too: standards-compliant clients (browser `URLSearchParams`,
+    /// form serializers) percent-encode `$` and `@`, so `%24take` must match
+    /// `$take`.
     pub fn query_param(&self, name: &str) -> Option<String> {
         self.query.split('&').find_map(|pair| {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let k = percent_encoding::percent_decode_str(k).decode_utf8_lossy();
             if k == name {
                 Some(
                     percent_encoding::percent_decode_str(v)
@@ -264,6 +268,14 @@ mod tests {
         assert_eq!(url.query_param("$take").as_deref(), Some("5"));
         assert_eq!(url.query_param("q").as_deref(), Some("a b!"));
         assert_eq!(url.query_param("missing"), None);
+    }
+
+    #[test]
+    fn query_param_keys_match_percent_encoded() {
+        // Browser URLSearchParams encodes `$`/`@`: %24sort=-%40size ≡ $sort=-@size.
+        let url = MsgUrl::parse("/files/docs/?%24sort=-%40size&%24take=5");
+        assert_eq!(url.query_param("$sort").as_deref(), Some("-@size"));
+        assert_eq!(url.query_param("$take").as_deref(), Some("5"));
     }
 
     #[test]
