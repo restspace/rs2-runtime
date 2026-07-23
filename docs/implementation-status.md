@@ -1,0 +1,356 @@
+# Implementation status (by PRD milestone)
+
+Engineering reference: what is built, measured, and deviated from, organized by
+the PRD's milestone structure (the PRD itself is an internal document; section
+references are kept for traceability). For user-facing documentation see the
+[manual](manual/README.md).
+
+## M1 status (PRD §16)
+
+Done:
+- Crate skeleton with the PRD §5.1 module shape; `rs2-server` binary.
+- Message/Body model: stream-or-bytes payloads, mandatory media types,
+  schema-carrying `Content-Type` (`application/json; schema="…"`), provenance
+  (`Materialized`/`Replayable`/`Ephemeral`), capped materialization.
+- Router: single/multi tenancy (domain map + subdomain), longest-prefix
+  mounts, path safety (traversal/encoding/null/drive-letter) for all services.
+- Wrapper: per-tenant concurrency admission (fail-fast), wall-clock timeouts,
+  auth stub (`"access": "authenticated"`), RFC 9457 problem+json errors with
+  machine-readable codes everywhere.
+- Engine-neutral contract: WIT world, `HostApi`/`Engine` traits, `GrantedHost`
+  with capability default-deny + outbound budget; conformance suite pinning
+  message semantics, capability denial, wall-clock/materialization limits, and
+  state-capability persistence.
+- **Wasmtime engine** (`--features wasm`): component host with epoch-based
+  wall-clock interruption, per-store memory caps, content-hash component
+  cache; passes conformance against a real `wasm32-wasip2` guest, including
+  capability denial across the sandbox boundary.
+- `file` + `data` services with documented PRD §10 semantics (streamed writes,
+  Range/206, ETag from store versions, paginated listings, schema-validated
+  CRUD with cached compiled validators, JSON merge PATCH, keyless POST,
+  `?confirm=` dataset delete) — both implementing the **store pattern**, one
+  normative conversation shape pinned by `tests/store_conformance.rs`
+  (carried over from Restspace v1's pattern system for client polymorphism):
+  trailing-slash dir+json listings at every container level, uniform
+  PUT/POST/DELETE semantics, the 409 + `?confirm=` container guard, ETags on
+  children. Mounts declare `pattern` + `facets` on the discovery surface;
+  the generated OpenAPI `$ref`s one shared store path-item shape.
+- **Static-site mode on `file`** (no separate service — config):
+  `defaultResource` serves a default document for directory GETs,
+  `spaFallback` serves the root app shell for extension-less misses
+  (asset misses stay 404), `listings: false` disables browsing; mounts
+  with it declare the `static-site` facet. Pair with `caching` for CDN
+  headers.
+- Host-enforced tenant scoping on every store capability; local-fs and
+  in-memory adapters.
+- **OTel-compatible logging** (PRD §14): a `LogSink`/`LogStore` capability
+  with an OTLP-shaped `LogRecord` model. The host emits one boundary log per
+  dispatch at the single `Runtime::handle` choke point (external requests and
+  internal hops, severity from outcome, errors carry code/detail); prebuilt
+  services emit application logs through a mount-bound `ServiceLogger`; sandbox
+  `console.log`/Wasm `log()` land via the (now un-stubbed) `HostApi::log` —
+  all stamped with tenant/mount/service/trace, the service identity fixed by
+  the host. The default `FileLogStore` writes per-tenant rotated NDJSON off the
+  request path (bounded channel + background writer; a no-op sink is
+  allocation-free on the hot path). The `log` reader service queries it back,
+  tenant-scoped. Write-only OTLP/observability exporters are a documented
+  follow-on (swap the sink; the reader degrades to "exported, not queryable").
+
+Remaining M1 (tracked, not started):
+- S3 file-store and database data-store adapters (traits are final; slots in
+  `adapters/`).
+- WIT streaming bodies: the v0.1 world materializes bodies at the component
+  boundary (PRD open question 1); revisit when component-model streams land.
+
+## M2 status (PRD §16, "Composition & control")
+
+Done:
+- **Pipeline executor** (`pipeline/`): typed spec (PRD §8.1) with serial /
+  parallel / conditional / tee / teeWait modes, `jsonSplit` + `jsonObject`,
+  conditions (config-time-checked grammar), JSONata transforms (jsonata-rs —
+  the PRD's "evaluate Rust JSONata early in M2" risk, resolved; evaluated on the
+  blocking pool, internally timeboxed, so a heavy expression can't stall a
+  reactor worker), `try`, `as:$var` capture, `elevate` (run a call as trusted
+  internal composition — drops the caller principal so a caller-accessible
+  pipeline can front a locked-down service; the v1 gateway pattern, opt-in),
+  `${...}` interpolation, `?$to-step`, fan-out/depth/step limits + an aggregate
+  fan-out footprint cap (branch count × body bytes → `pipeline_fanout_bytes`).
+- **String DSL converter** (`pipeline/dsl.rs`): the Restspace terse form
+  (`"if (ok) GET /x :$y"`) is accepted as sugar; stored format is typed.
+- **Segments** (PRD §7.3): planned at materialization points; the segment is
+  the atomic retry unit; per-step keys derive from
+  `H(invocation-id, step-path)` so keyed effects dedupe across attempts
+  (proven in `g6_segment_retry_dedupes_keyed_effects`). `?$plan` returns the
+  plan with unsafe-mid-segment warnings.
+- **Idempotency store + replay** (PRD §7.2): `Idempotency-Key` scoped per
+  tenant+mount+method+path; replay window with `Idempotency-Replayed: true`;
+  in-flight duplicates 409; payload-hash mismatch 422; store is a capability
+  (in-memory adapter; shared adapter slot for scale-out).
+- **Retry policies** (PRD §7.3): declarative, resolved per-call → mount →
+  tenant → runtime; gated on effect classes (pure/idempotent/keyed/unsafe,
+  method-inferred defaults).
+- **`auth` service + RBAC** (PRD §10.5): HS512 JWT (constant-time verify) in
+  `rs-auth` cookie or bearer; login/refresh (sliding past 50%)/logout; login
+  lockout; argon2id hashes with bcrypt migration verify; per-mount role
+  specs (`read`/`write`/`delete`/`invoke`, path-scoped grants like
+  `"U /user/{email}"`) enforced in the wrapper; tenant `operatorRoles` gate who
+  may change authorization.
+- **Caching, host-applied** (v1's universal `caching` config): default
+  `Cache-Control: no-store` on every response; mounts opt in with
+  `{"mode": "noStore"|"revalidate"|"cache", "maxAgeSeconds", "public",
+  "immutable"}` — `public` clamps to `private` + `Vary` on authenticated
+  mounts; `Set-Cookie` and error responses are always uncacheable; `file`
+  and `data` answer matching `If-None-Match` with 304s, so `revalidate`
+  mode is always-fresh at near-zero bandwidth.
+- **CORS, host-enforced** (PRD §5.2; v1's `trustedDomains` posture): tenant
+  `cors` block — trusted origins get credentialed CORS and `SameSite=None;
+  Secure` login cookies; allowed origins get plain CORS with bearer-only
+  login (no cookie); preflights answered before routing; error responses
+  decorated; an always-on CSRF guard rejects cookie-authenticated unsafe
+  requests from untrusted cross-site origins; `auth.allowedLoginOrigins`
+  optionally allowlists login/refresh callers.
+- **`services` self-config** (PRD §10.6): `GET catalogue|services|raw`,
+  `PUT raw` validates the whole config (dry tenant build), persists through
+  the config loader, and hot-swaps atomically; `If-Match` optimistic
+  concurrency; invalid config never touches the running tenant.
+- **`pipeline` service** (PRD §10.3): mount a spec (typed or DSL);
+  `?$plan` introspection; internal calls re-enter full dispatch (authz,
+  limits, idempotency all apply).
+- Exit criteria: demo tenant e2e, G6 idempotency proof, and the G7 benchmark
+  live in `tests/m2_composition.rs` (G7: ~0.08 ms per two-step pipeline
+  invocation, release build).
+
+M2 deviations (tracked):
+- Lockout/session state is node-local (PRD wants the shared state store).
+- TOTP MFA, impersonation, data-field authorization rules, zip/unzip and
+  multipart split/join, and the audit log are deferred.
+
+## M3 status (PRD §16, "Surface & migration")
+
+Done:
+- **`pipeline` + `query` are spec stores** (v1's store-transform/store-view
+  patterns): authoring is a full store-contract surface under the reserved
+  dot-subtree (`/<mount>/.pipelines/…`, `/<mount>/.queries/…` — guard authoring
+  with `write`); every other path on **any HTTP verb** executes the
+  longest-prefix-matched spec, with a `.root` spec governing the mount root
+  (so a pipeline can transparently wrap another service — the reason verbs
+  pass through; replaces v1's modal manage header). DRY by construction:
+  the `SpecStore` façade owns a real `FileService` and delegates (validate
+  → canonicalize → forward), with `PrefixedFileStore` as the seam where
+  per-store named infra (PRD §9.1) plugs in later
+  (`"store": {"root"}` today). The instruction plane of a tenant is now
+  exactly: tenant config + `.rs2-code/` + `.rs2-pipelines/` +
+  `.rs2-queries/` — mechanically extractable for git change control.
+- **`query` service** (PRD §10.4): stored queries **authored like files**
+  (no tenant-config round trip), executable on any verb (query-string
+  params coerce to the params schema's types), language-agnostic by
+  design: JSON templates
+  (Mongo aggregates, Elastic DSL, the reference adapter) substitute
+  **structurally** — `"${name}"` nodes take the param's JSON value, so
+  templates are valid JSON at rest and injection-safe by construction;
+  `"${name?}"` optionals elide their enclosing clause (generalizing v1
+  Mongo's `ignoreEmptyVariables`); string (SQL) templates pass to the
+  adapter **unsubstituted** with validated params for real bind parameters.
+  Param schemas apply `default`s and validate before execution; positional
+  params from trailing URL segments (longest stored prefix wins); missing
+  params are 400s, never silent. `QueryStore` capability (the v1
+  `IQueryAdapter` equivalent, now bind-capable) + reference adapter
+  scanning any `DataStore`.
+- **Agent surface** (PRD §12), generated per tenant and filtered by the
+  caller's read permission and `?surface=` against `x-expose`:
+  - `/.well-known/rs2/services` — mount catalogue with x-agent/x-policy
+  - `/.well-known/rs2/agent-surface` — entities, actions (effect class +
+    Idempotency-Key guidance advertised), stored queries with their schemas
+  - `/.well-known/rs2/openapi` — OpenAPI 3.1; the schemas referenced are
+    the ones enforced at runtime (no drift by construction)
+- **Structured errors complete**: pipeline failures carry the failing step
+  and per-step statuses in the problem+json body.
+- **Custom code deployment** (PRD §10.6): `PUT /services/code/<name>`
+  stores components content-addressed and immutable per version, with a
+  compile smoke test when the engine is in the build; mounts reference
+  `code:<name>@<version>`; capability `grants` map names to internal URL
+  prefixes and re-enter full dispatch (authz/limits/idempotency apply).
+  Proven end-to-end against the real conformance component (wasm feature).
+- **`rs2` CLI** (`cargo run -p rs2-cli --` or the `rs2` binary):
+  - `rs2 new <name> [--js]` — scaffold against the published WIT (the Rust
+    scaffold compiles to a working component as-is)
+  - `rs2 dev` — run a local node (shares the rs2-server library)
+  - `rs2 test` — manifest consistency + component checks (engine compile
+    check with `--features wasm`)
+  - `rs2 deploy <wasm> --name n` — upload via the self-config API
+  - `rs2 migrate <services.json>` — Restspace config → RS2 tenant config:
+    mounts, access roles, retry policies carried over; string-DSL pipelines
+    converted to the typed spec; the result is validated by dry-building
+    the tenant; unsupported services are skipped with explicit warnings
+
+Exit criteria: **G4 (core service parity) met** — all six services
+reimplemented with documented semantics.
+
+## V8/JS engine (`--features js`)
+
+`engines/js.rs` embeds rusty_v8 (v8 150) via deno_core. Shape: **one isolate
+per invocation** on a blocking thread (PRD open question 2 resolved
+conservatively — full isolation; warm pools are a later optimization
+behind the same `Engine` trait).
+
+- **Bundle contract**: a single-file ES module whose default export is
+  `async (msg, ctx) => response` or `{ handle }`. JSON bodies arrive
+  parsed; responses are `{ status?, headers?, body?, mediaType? }` (or any
+  value as a 200 JSON body). `ctx` = `{ config, request, log, state }`.
+- **Host bridge**: `ctx.request` is synchronous from the guest (the
+  isolate thread parks on the async host future); `async/await` works via
+  microtask pumping to quiescence. No event loop: timers unavailable in v1.
+- **Limits**: wall clock via a watchdog thread + `terminate_execution`;
+  memory via isolate heap caps with a near-limit callback (an allocation
+  bomb gets a structured `limit_exceeded`, not a process abort); outbound
+  budget and materialization caps host-enforced as for every engine.
+- **Conformance (G2)**: the JS engine passes the identical invariant suite
+  (message semantics, capability denial with preserved error identity,
+  wall-clock kill, memory containment, outbound budget, state capability,
+  no global leakage between invocations) — `cargo test --features js`.
+- **Deployment**: `PUT /services/code/<name>` with
+  `application/javascript` stores the bundle (compile smoke test when the
+  engine is in the build); `code:` mounts dispatch by bundle type, so wasm
+  and JS services share grants, limits, and the host contract.
+- **Startup snapshot**: per-invocation isolates boot from a committed V8
+  snapshot with the bootstrap + compat prelude baked in — currently
+  **Windows-only**; on Linux custom-snapshot isolate creation intermittently
+  aborts inside V8's shared-heap deserializer (upstream deno_core/rusty_v8
+  bug, family of denoland/deno#15590 — full investigation in commit
+  `dbd6857`), so Linux runs the identical-semantics source-eval fallback
+  (~10 ms per isolate creation). Revisit at the deno_core upgrade.
+
+## npm-compat layer (G5)
+
+Every JS bundle runs against an injected compat prelude
+(`engines/js_prelude.js`) — the **explicit supported-API list** (PRD §17
+risk mitigation), pinned by the corpus suite in `tests/npm_compat.rs`:
+
+- `fetch` / `Headers` / `Request` / `Response` — outbound HTTP through the
+  `fetch` capability, granted per mount with host allowlists:
+  `"grants": { "fetch": { "type": "httpOut", "hosts": ["api.stripe.com",
+  "*.example.com"] } }`. Default deny; disallowed hosts fail with
+  `capability_denied` before any I/O. The server wires a ureq-backed
+  `HttpOut` adapter (`http` feature); embedders supply their own.
+- `setTimeout` / `clearTimeout` / `setInterval` / `clearInterval` —
+  **virtual time**: when the handler is otherwise idle, pending timers
+  fast-forward, so SDK retry backoffs (429 + Retry-After loops) complete
+  without real waits.
+- `console`, `queueMicrotask`, `structuredClone`, `TextEncoder`/`TextDecoder`,
+  `atob`/`btoa`, `Buffer` (from/alloc/concat/toString utf8|base64|hex),
+  `URL`/`URLSearchParams`, `AbortController`/`AbortSignal`,
+  `crypto.{getRandomValues, randomUUID}`, `process.{env, nextTick, version}`.
+
+The corpus exercises the request/auth/retry patterns the popular
+API-wrapper SDKs are built from (Stripe-style form POST + idempotency
+keys, OpenAI-style JSON + 429 backoff, Slack-style query building +
+base64 auth) — `cargo test --features js --test npm_compat`. Compat
+additions require a corpus-driven case (PRD §17).
+
+**G5 measured against the real SDKs** (`corpus/` + `tests/sdk_corpus.rs`):
+the official npm packages, bundled with esbuild (`--platform=browser
+--conditions=worker`, the same settings as `rs2 deploy --bundle`) and run
+in the engine against mocked fetch:
+
+| SDK | result |
+|---|---|
+| stripe (fetch http client) | ✅ unmodified |
+| openai | ✅ unmodified |
+| @anthropic-ai/sdk | ✅ unmodified |
+| @octokit/core | ✅ unmodified |
+| @supabase/supabase-js | ✅ unmodified |
+| resend | ✅ unmodified |
+| @google/generative-ai | ✅ unmodified |
+| @mistralai/mistralai | ✅ unmodified |
+| groq-sdk | ✅ unmodified |
+| @slack/web-api | ❌ axios transport imports `node:os`/`node:path` |
+
+**9/10 = 90% — G5 met.** Reproduce: `cd corpus; npm install;
+./build.ps1; cargo test --features js --test sdk_corpus -- --nocapture`.
+Out of scope for v1 (documented): WebSocket connections, response-body
+streaming (`ReadableStream` is presence-only), binary multipart uploads,
+real wall-clock timers.
+
+## Loadable adapters (G13, `--features js`)
+
+Bring-your-own-backend: a tenant connects a custom data backend — including
+non-HTTP wire protocols — without recompiling `rs2-core`.
+
+- **Phase 0/1** (done): the JS engine runs on `deno_core` (guest contract
+  byte-for-byte unchanged), with a host-gated TCP/TLS **socket** capability
+  (`{"type":"socket","hosts":[…]}`, default-deny, allowlisted before connect)
+  so custom JS can speak Postgres/Mongo/Redis. `RS2Socket.connect(host, port,
+  {tls})`, synchronous from the guest.
+- **Phase 2** (done): **resident adapter runtimes** + a loadable `DataStore`.
+  A `data` mount with `"store": {"adapter": "code:my-redis@v1", "grants":
+  {…socket…}}` backs its persistence with a deployed JS bundle, kept resident
+  on its own thread (`engines/resident.rs`) so the adapter pools one connection
+  across requests. The bundle implements the **store pattern** (`GET/PUT/DELETE
+  /{ds}/{key}`, listings, schema); `GuestDataStore` maps the `DataStore` trait
+  onto those messages, and the stock `DataService` runs unchanged on top
+  (schema validation, ETags, `.schemas`, the store contract). `engines/js.rs`'s
+  per-invocation and resident paths share `build_runtime` + `dispatch_once`.
+  Proof: `tests/guest_adapter.rs` runs the store contract over a Redis (RESP)
+  adapter against an in-process mock, asserting a single pooled connection.
+- **Phase 3** (in progress):
+  - **`GuestQueryStore`** — a second guest-backed capability on the same
+    `ResidentAdapter` substrate. A `query` mount with `"store": {"adapter":
+    "code:…"}` runs stored queries through a resident JS adapter (`run_query` →
+    `POST /query {query,params,take,skip}` → `{rows, total}`); the query service
+    still substitutes templates + validates params first, unchanged. Proven by a
+    Redis-backed query adapter that scans + filters a dataset over its socket.
+  - **Resident N-pool + idle eviction** — `ResidentAdapter` is a small per-mount
+    pool: it grows lazily under concurrent load to `store.maxRuntimes` (default
+    4, least-busy dispatch; a serial workload stays at one) and a background
+    sweeper evicts runtimes idle past `store.idleMs`/`idleSeconds` (default 60 s),
+    closing the isolate and its pooled sockets.
+  - **`GuestFileStore`** — a `file` mount with `"store": {"adapter": "code:…"}`
+    serves files from a resident JS adapter. All eight `FileStore` methods map to
+    store-pattern messages (`HEAD`/`GET`/`PUT`/`DELETE`/`MOVE`, listings); content
+    crosses base64-encoded and `read` rebuilds a `Replayable` `Body` so ETags/304
+    and `Range`→206 keep working. Proven by the full store contract over an
+    in-memory guest file adapter.
+  - **MongoDB adapter** — a real-wire-protocol `DataStore` adapter (OP_MSG + a
+    hand-written BSON codec over the socket), purely a JS bundle on the existing
+    `GuestDataStore`. Datasets = collections, key = string `_id`; CRUD →
+    `find`/`update`/`delete`/`count`/`drop`/`listCollections`. Proven against an
+    in-process mock `mongod`. **No-auth** (SCRAM-SHA-256 needs HMAC/PBKDF2 the JS
+    prelude doesn't expose — a `crypto.subtle` addition would unlock it).
+- **Deferred** (Phase 3): a `GuestActor` model for long-lived push connections
+  (Discord gateway), SCRAM auth for Mongo, multi-file ESM resolution.
+
+## G1 + G3 benchmarks (`tests/g_benchmarks.rs`)
+
+```powershell
+cargo test -p rs2-core --release --features js --test g_benchmarks -- --ignored --nocapture
+```
+
+**G1 — dispatch overhead** (target: p99 added < 1 ms vs the native call
+path). Measured: direct service call p99 ~7–10 µs; the full dispatch path
+(router → tenancy → token verify → access → admission → breaker →
+idempotency) p99 ~7–17 µs — **added p99 well under 10 µs**, ~100× inside
+the target.
+
+**G3 — containment** (target: a pathological service cannot push another
+tenant's p99 beyond 2× baseline). Two attacks from a hostile tenant — an
+infinite loop and an allocation bomb in sandboxed JS — under an 8-client
+flood while a neighbor tenant's data service is measured:
+
+| attack | neighbor p99 baseline | under attack | evil outcomes |
+|---|---|---|---|
+| infinite loop | 14.0 µs | 20.8 µs (1.5×) | 108 requests, all structured 503 |
+| allocation bomb | 14.0 µs | 78.8 µs | 200 requests, all structured 503 |
+
+The mechanism stack: wall-clock/heap kill inside the isolate → per-tenant
+concurrency admission → **per-tenant breach circuit breaker** (PRD §9.3,
+added by this work: repeated limit breaches trip the tenant open for a
+cooldown with 503 + Retry-After, so pathological code stops re-occupying
+engine threads — without it the attack ran 27 000 isolate restarts and
+pushed the neighbor to 3.1 ms). The assertion bound is
+`max(2× baseline, baseline + 2 ms)`: with microsecond-scale baselines,
+scheduler noise alone exceeds a bare 2×; raw numbers are printed.
+
+Bundling: `rs2 deploy entry.ts --name x --bundle` runs `npx esbuild`
+(single-file ESM; npm deps resolve at build time; native addons fail at
+build time). Timers are virtual and there is no event loop: code needing
+real wall-clock waits or background work is out of scope for v1.
