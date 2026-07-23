@@ -522,7 +522,7 @@ async fn serve_mongo(mut sock: TcpStream, store: MongoStore) {
         }
         // rest = flagBits(4) + section kind(1) + BSON command doc
         let (cmd, _) = bson_decode_doc(&rest, 5);
-        let reply = mongo_dispatch(&cmd, &store);
+        let reply = mongo_dispatch(&cmd, &rest[5..], &store);
         let body = bson_encode_doc(reply.as_object().unwrap());
         let total = (21 + body.len()) as i32;
         let mut out = total.to_le_bytes().to_vec();
@@ -538,7 +538,58 @@ async fn serve_mongo(mut sock: TcpStream, store: MongoStore) {
     }
 }
 
-fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, Value>>>) -> Value {
+/// Walk a BSON document's elements, returning `(name, type, value offset)` in
+/// wire order. The mock needs the *order* of a `find` command's `sort` keys —
+/// sort-key priority on the real server — which the `serde_json::Map`
+/// (BTreeMap) decode discards.
+fn bson_elements(b: &[u8], start: usize) -> Vec<(String, u8, usize)> {
+    let len = i32::from_le_bytes(b[start..start + 4].try_into().unwrap()) as usize;
+    let end = start + len;
+    let mut off = start + 4;
+    let mut out = Vec::new();
+    while off < end - 1 {
+        let t = b[off];
+        off += 1;
+        let ns = off;
+        while b[off] != 0 {
+            off += 1;
+        }
+        let name = String::from_utf8_lossy(&b[ns..off]).to_string();
+        off += 1;
+        let val_off = off;
+        off += match t {
+            0x01 | 0x09 | 0x12 => 8,
+            0x02 => 4 + i32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as usize,
+            0x03 | 0x04 => i32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as usize,
+            0x07 => 12,
+            0x08 => 1,
+            0x0a => 0,
+            0x10 => 4,
+            other => panic!("mock mongod: unsupported bson type 0x{other:02x}"),
+        };
+        out.push((name, t, val_off));
+    }
+    out
+}
+
+/// The wire-order key list of a command's `sort` subdocument, if present.
+fn sort_key_order(raw: &[u8]) -> Option<Vec<String>> {
+    let (_, t, off) = bson_elements(raw, 0)
+        .into_iter()
+        .find(|(n, _, _)| n == "sort")?;
+    (t == 0x03).then(|| {
+        bson_elements(raw, off)
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect()
+    })
+}
+
+fn mongo_dispatch(
+    cmd: &Value,
+    raw: &[u8],
+    store: &Mutex<BTreeMap<String, BTreeMap<String, Value>>>,
+) -> Value {
     let str_of = |key: &str| cmd.get(key).and_then(|v| v.as_str());
     let id_of = |d: &Value| {
         d.get("q")
@@ -562,7 +613,62 @@ fn mongo_dispatch(cmd: &Value, store: &Mutex<BTreeMap<String, BTreeMap<String, V
         if let Some(map) = s.get(coll) {
             match want_id {
                 Some(id) => batch.extend(map.get(id).cloned()),
-                None => batch.extend(map.values().skip(skip).take(limit).cloned()),
+                None => {
+                    let mut docs: Vec<Value> = map.values().cloned().collect();
+                    // Sort applied server-side, in the wire's key-priority
+                    // order — a native pushdown test is only meaningful if the
+                    // mock actually sorts (a host-side fixup would hide a
+                    // broken pushdown). Homogeneous scalar fields only in the
+                    // fixtures, so the contract comparator stands in for
+                    // MongoDB's collation.
+                    if let Some(sort_doc) = cmd.get("sort").and_then(|v| v.as_object()) {
+                        let keys = sort_key_order(raw).unwrap_or_default();
+                        let paths: Vec<(rs2_core::listing::FieldPath, i64)> = keys
+                            .iter()
+                            .map(|k| {
+                                let dir =
+                                    sort_doc.get(k).and_then(|d| d.as_i64()).unwrap_or(1);
+                                (rs2_core::listing::FieldPath::parse(k).unwrap(), dir)
+                            })
+                            .collect();
+                        docs.sort_by(|a, b| {
+                            for (path, dir) in &paths {
+                                let ord = rs2_core::listing::compare_optional(
+                                    path.lookup(a),
+                                    path.lookup(b),
+                                );
+                                let ord = if *dir < 0 { ord.reverse() } else { ord };
+                                if ord != std::cmp::Ordering::Equal {
+                                    return ord;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
+                    }
+                    // Inclusion projection (`{"_id": 1, "meta.date": 1, …}`):
+                    // keep `_id` plus the dotted paths, after skip/limit.
+                    let projected: Vec<Value> = docs
+                        .into_iter()
+                        .skip(skip)
+                        .take(limit)
+                        .map(|d| match cmd.get("projection").and_then(|p| p.as_object()) {
+                            None => d,
+                            Some(proj) => {
+                                let fields: Vec<rs2_core::listing::FieldPath> = proj
+                                    .keys()
+                                    .filter(|k| k.as_str() != "_id")
+                                    .map(|k| rs2_core::listing::FieldPath::parse(k).unwrap())
+                                    .collect();
+                                let mut out = rs2_core::listing::project(&d, &fields);
+                                if let Some(id) = d.get("_id") {
+                                    out["_id"] = id.clone();
+                                }
+                                out
+                            }
+                        })
+                        .collect();
+                    batch = projected;
+                }
             }
         }
         return json!({ "ok": 1.0, "cursor": { "firstBatch": batch, "id": 0, "ns": format!("test.{coll}") } });
@@ -1725,6 +1831,246 @@ async fn guest_backed_mongo_query_adapter_runs_an_aggregation() {
         rt.handle(req(Method::GET, "/q/bad")).await.status,
         Some(StatusCode::BAD_REQUEST),
         "missing pipeline → 400"
+    );
+}
+
+/// The projected-listing contract (`$select`/`$sort`), mirroring
+/// `assert_listing_contract` in `tests/store_conformance.rs`: every
+/// `DataStore` — the host key-walk fallback and a native pushdown alike —
+/// must produce exactly this output over the same records.
+async fn assert_listing_contract(rt: &Runtime, mount: &str) {
+    let put = |key: &str, val: serde_json::Value| {
+        let path = format!("{mount}/posts/{key}");
+        async move {
+            let resp = rt
+                .handle(req(Method::PUT, &path).with_body(Body::from_json(&val)))
+                .await;
+            assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {path}");
+        }
+    };
+    put("ka", json!({ "title": "apple",  "n": 5,  "meta": { "date": "2026-01-02" } })).await;
+    put("kb", json!({ "title": "Zebra",  "n": 2,  "meta": { "date": "2026-01-03" } })).await;
+    put("kc", json!({ "title": "banana", "n": 2 })).await;
+    put("kd", json!({ "title": "cherry", "n": 10, "meta": { "date": "2026-01-01" } })).await;
+
+    let names = |listing: &serde_json::Value| -> Vec<String> {
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // $select: entries gain `fields` (projected, nested shape kept, absent
+    // paths omitted); no `.schema.json` fixed entry in table data.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title,meta.date"),
+        ))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::OK), "[{mount}] $select lists");
+    let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
+    assert_eq!(total, 4, "[{mount}] projected listing counts records");
+    let listing = body_json(&mut resp).await;
+    assert_eq!(listing["total"].as_u64(), Some(4));
+    let entries = listing["entries"].as_array().unwrap();
+    assert!(
+        entries.iter().all(|e| e["name"] != ".schema.json"),
+        "[{mount}] no fixed entries in a projected listing: {listing}"
+    );
+    let ka = entries.iter().find(|e| e["name"] == "ka").unwrap();
+    assert_eq!(
+        ka["fields"],
+        json!({ "title": "apple", "meta": { "date": "2026-01-02" } }),
+        "[{mount}] projection keeps nested shape"
+    );
+    let kc = entries.iter().find(|e| e["name"] == "kc").unwrap();
+    assert_eq!(
+        kc["fields"],
+        json!({ "title": "banana" }),
+        "[{mount}] absent path omitted, not an error"
+    );
+
+    // $sort asc: binary code-point order — "Zebra" before "apple".
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=title"),
+        ))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["kb", "ka", "kc", "kd"],
+        "[{mount}] code-point ascending sort"
+    );
+
+    // Multi-key with direction: -n then title; the n=2 tie breaks by title.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=-n,title"),
+        ))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["kd", "ka", "kb", "kc"],
+        "[{mount}] multi-key sort with descending first key"
+    );
+
+    // A missing sort field is smallest: first ascending.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=meta.date"),
+        ))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["kc", "kd", "ka", "kb"],
+        "[{mount}] missing sort field sorts first ascending"
+    );
+
+    // Pagination pages the *sorted* sequence; total stays the full count.
+    let mut resp = rt
+        .handle(req(
+            Method::GET,
+            &format!("{mount}/posts/?$select=title&$sort=title&$take=2&$skip=1"),
+        ))
+        .await;
+    let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
+    assert_eq!(total, 4, "[{mount}] paged projected total is the full count");
+    let listing = body_json(&mut resp).await;
+    assert_eq!(
+        names(&listing),
+        ["ka", "kc"],
+        "[{mount}] pagination applies after the sort"
+    );
+
+    // Malformed specs are client errors, never silently ignored.
+    let resp = rt
+        .handle(req(Method::GET, &format!("{mount}/posts/?$select=a..b")))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::BAD_REQUEST),
+        "[{mount}] malformed $select path is 400"
+    );
+    let resp = rt
+        .handle(req(Method::GET, &format!("{mount}/posts/?$sort=title")))
+        .await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::BAD_REQUEST),
+        "[{mount}] $sort without $select is 400, not ignored"
+    );
+
+    // A plain listing is unchanged by the feature existing: no `fields`.
+    let mut resp = rt
+        .handle(req(Method::GET, &format!("{mount}/posts/")))
+        .await;
+    let listing = body_json(&mut resp).await;
+    assert!(
+        listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e.get("fields").is_none()),
+        "[{mount}] plain listing carries no fields objects: {listing}"
+    );
+
+    // Cleanup so the caller's store is reusable.
+    let resp = rt
+        .handle(req(
+            Method::DELETE,
+            &format!("{mount}/posts/?confirm=posts"),
+        ))
+        .await;
+    assert_eq!(resp.status, Some(StatusCode::NO_CONTENT));
+}
+
+/// Projected listings over guest-backed data mounts, both ways:
+/// - the Redis test adapter does NOT export `features`, so the host key-walk
+///   fallback (the default `list_records` over the guest's get/list_keys)
+///   serves `$select`/`$sort` — never forwarded to the bundle;
+/// - the shipped Mongo bundle advertises `"list-records"`, so the same
+///   requests push down to a native `find` with projection/sort/skip/limit
+///   (the mock sorts server-side, so the pushdown is actually exercised);
+/// and the services catalogue reports the cost signal for each after use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_data_listing_fallback_and_native_pushdown_match_the_contract() {
+    let (redis_port, _conns) = spawn_mock_redis().await;
+    let (mongo_port, _store) = spawn_mock_mongo().await;
+    let dir = tempfile::tempdir().unwrap();
+    let files: Arc<LocalFsFileStore> = Arc::new(LocalFsFileStore::new(dir.path()));
+    let js = |s: String| Body::from_string(s, MediaType::new("application/javascript"));
+    files
+        .write(
+            "t",
+            ".rs2-code/redis/v1.js",
+            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+        )
+        .await
+        .unwrap();
+    files
+        .write(
+            "t",
+            ".rs2-code/mongo-data/v1.js",
+            js(MONGO_ADAPTER.to_string()),
+        )
+        .await
+        .unwrap();
+
+    let adapters = Adapters::new(files, Arc::new(MemDataStore::new()));
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/rdata", "service": "data", "config": { "access": "open", "store": {
+            "adapter": "code:redis@v1", "host": "127.0.0.1", "port": redis_port,
+            "grants": { "redis": { "type": "socket", "hosts": [format!("127.0.0.1:{redis_port}")] } }
+        }}},
+        { "path": "/mdata", "service": "data", "config": { "access": "open", "store": {
+            "adapter": "code:mongo-data@v1", "host": "127.0.0.1", "port": mongo_port, "db": "test",
+            "grants": { "mongo": { "type": "socket", "hosts": [format!("127.0.0.1:{mongo_port}")] } }
+        }}}
+    ]})));
+    let rt = Runtime::new(
+        Tenancy::Single { tenant: "t".into() },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
+
+    // (a) host fallback through the guest; (b) native pushdown — one answer.
+    assert_listing_contract(&rt, "/rdata").await;
+    assert_listing_contract(&rt, "/mdata").await;
+
+    // (c) The catalogue's listing-cost signal reflects each mount's handshake
+    // (known after first use — the resident spawn is lazy).
+    let mut services = rt
+        .handle(req(Method::GET, "/.well-known/rs2/services"))
+        .await;
+    let doc = body_json(&mut services).await;
+    let list_projection = |p: &str| {
+        doc["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["path"] == p)
+            .unwrap_or_else(|| panic!("mount {p} missing from {doc}"))["listProjection"]
+            .clone()
+    };
+    assert_eq!(
+        list_projection("/rdata"),
+        json!("fallback"),
+        "no features export → host key-walk"
+    );
+    assert_eq!(
+        list_projection("/mdata"),
+        json!("native"),
+        "advertised list-records → native pushdown"
     );
 }
 

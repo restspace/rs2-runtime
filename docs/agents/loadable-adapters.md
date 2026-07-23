@@ -215,6 +215,25 @@ only — no first-party builtins ship yet), and a stock `sms` service
 Follow-on domains (`EmailGateway`, `SignerGateway`/KMS, an LLM trait — deferred
 as its surface is leaky/fast-moving) repeat the same six seams.
 
+**Native listing pushdown — DONE.** The projected-listing contract
+(`rs2-core/src/listing.rs`, G-series `$select`/`$sort`) reaches guest adapters
+via a **feature handshake**: a bundle may `export const features =
+["list-records"]`; `build_runtime`/`spawn_resident` read the export at module
+evaluation and `ResidentAdapter` records it (lazy spawn, so
+`listing_pushdown()` reads `false` until first use). With the feature,
+`GuestDataStore::list_records` forwards
+`GET /{ds}/?$select=…&$sort=…&$take=…&$skip=…` (values percent-encoded) and
+parses `{entries: [{name, fields}], total}`; without it, the shared
+`list_records_fallback` (`capabilities/mod.rs`) key-walks the guest's
+get/list_keys — `$select`/`$sort` are never forwarded unadvertised.
+`mongo-data.js` implements the native path (`find` + projection/sort/skip/limit
++ `count`, `_id` asc appended as the contract's key tiebreak; missing-vs-null
+collation deviation documented in `guest-adapters/README.md`). Proof:
+`guest_data_listing_fallback_and_native_pushdown_match_the_contract` in
+`tests/guest_adapter.rs` — the store-conformance listing contract over both a
+non-advertising Redis mount (fallback) and the Mongo bundle against a mock
+mongod that sorts server-side, plus the `listProjection` catalogue signal.
+
 **Remaining:** a **`GuestActor`** model for long-lived server-push connections
 (Discord gateway / Slack socket-mode — needs a continuously driven runtime, real
 wall-clock timers, and an inbound-event egress path: a sibling to the resident

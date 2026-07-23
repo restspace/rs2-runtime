@@ -30,7 +30,8 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use base64::Engine as _;
 
 use crate::capabilities::{
-    ByteRange, DataStore, DirEntry, FileMeta, FileStore, QueryStore, ScopedFileStore, SmsGateway,
+    list_records_fallback, ByteRange, DataStore, DirEntry, FileMeta, FileStore, QueryStore,
+    ScopedFileStore, SmsGateway,
 };
 use crate::contract::{GrantedHost, HostApi, InvocationLimits};
 use crate::error::{codes, RsError};
@@ -79,20 +80,21 @@ impl ResidentHandle {
 }
 
 /// Spawn a resident runtime for `source` on a dedicated thread, returning a
-/// handle once the bundle has loaded and evaluated (so a build error surfaces
-/// to the caller rather than to the first job). The thread runs a
-/// current-thread tokio runtime driving one `deno_core` isolate; `main` is the
-/// handle host ops re-enter for socket I/O.
+/// handle — plus the feature flags the bundle exported (`export const
+/// features = […]`, absent → empty) — once the bundle has loaded and
+/// evaluated (so a build error surfaces to the caller rather than to the
+/// first job). The thread runs a current-thread tokio runtime driving one
+/// `deno_core` isolate; `main` is the handle host ops re-enter for socket I/O.
 async fn spawn_resident(
     source: String,
     host: Arc<dyn HostApi>,
     limits: InvocationLimits,
     tenant: String,
     socket_allowlist: Vec<String>,
-) -> Result<ResidentHandle, RsError> {
+) -> Result<(ResidentHandle, Vec<String>), RsError> {
     let main = tokio::runtime::Handle::current();
     let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
-    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), RsError>>();
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<Vec<String>, RsError>>();
 
     std::thread::Builder::new()
         .name("rs2-resident".into())
@@ -125,9 +127,9 @@ async fn spawn_resident(
                 let oom = Arc::new(AtomicBool::new(false));
                 let (mut runtime, default_export) =
                     match build_runtime(&source, inv.clone(), &limits, oom.clone()).await {
-                        Ok(built) => {
-                            let _ = ready_tx.send(Ok(()));
-                            built
+                        Ok((runtime, default_export, features)) => {
+                            let _ = ready_tx.send(Ok(features));
+                            (runtime, default_export)
                         }
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
@@ -156,7 +158,7 @@ async fn spawn_resident(
     ready_rx
         .await
         .map_err(|_| RsError::internal("resident runtime thread exited during startup"))?
-        .map(|()| ResidentHandle { tx })
+        .map(|features| (ResidentHandle { tx }, features))
 }
 
 /// Loads a deployed adapter bundle's source from the tenant file store.
@@ -229,6 +231,12 @@ pub(crate) struct ResidentAdapter {
     tenant: String,
     socket_allowlist: Vec<String>,
     store_config: Value,
+    /// Feature flags the bundle exported (`export const features = […]`),
+    /// captured at spawn. The spawn is lazy, so before the first runtime comes
+    /// up this is empty and [`ResidentAdapter::has_feature`] reads `false` —
+    /// callers treat that as "no pushdown yet", which is safe (the fallback
+    /// path is always correct).
+    features: std::sync::Mutex<Vec<String>>,
 }
 
 impl ResidentAdapter {
@@ -293,6 +301,7 @@ impl ResidentAdapter {
             tenant: tenant.to_string(),
             socket_allowlist: socket_allowlist_from_config(store_config),
             store_config: store_config.clone(),
+            features: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -317,7 +326,14 @@ impl ResidentAdapter {
             tenant: tenant.to_string(),
             socket_allowlist: Vec::new(),
             store_config: json!({}),
+            features: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Whether the bundle advertised `name` in its `features` export. `false`
+    /// until the first runtime has spawned (lazy spawn — see `features`).
+    pub(crate) fn has_feature(&self, name: &str) -> bool {
+        self.features.lock().unwrap().iter().any(|f| f == name)
     }
 
     /// The adapter bundle source, loaded once and cached for every spawn.
@@ -355,7 +371,7 @@ impl ResidentAdapter {
             }
         }
         let source = self.cached_source().await?;
-        let handle = spawn_resident(
+        let (handle, features) = spawn_resident(
             source,
             self.host.clone(),
             self.limits.clone(),
@@ -363,6 +379,7 @@ impl ResidentAdapter {
             self.socket_allowlist.clone(),
         )
         .await?;
+        *self.features.lock().unwrap() = features;
         let inflight = Arc::new(AtomicUsize::new(1));
         entries.push(PoolEntry {
             handle: handle.clone(),
@@ -510,6 +527,19 @@ fn listing_total(body: &Value) -> u64 {
     body.get("total").and_then(|t| t.as_u64()).unwrap_or(0)
 }
 
+/// Percent-encode a `$select`/`$sort` value for the store-shaped wire form, so
+/// a field path can't smuggle separators (`,`, `&`, `=`) into the query. The
+/// guest decodes with `URLSearchParams`, which reverses this exactly.
+fn query_encode(s: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+    const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'_')
+        .remove(b'.')
+        .remove(b'~');
+    utf8_percent_encode(s, QUERY_VALUE).to_string()
+}
+
 #[async_trait]
 impl DataStore for GuestDataStore {
     async fn get(&self, _tenant: &str, dataset: &str, key: &str) -> Result<Value, RsError> {
@@ -615,6 +645,66 @@ impl DataStore for GuestDataStore {
         } else {
             Err(store_error(status, &body))
         }
+    }
+
+    async fn list_records(
+        &self,
+        tenant: &str,
+        dataset: &str,
+        spec: &crate::listing::ListSpec,
+    ) -> Result<(Vec<(String, Value)>, u64), RsError> {
+        // Never forward `$select`/`$sort` to a bundle that hasn't advertised
+        // `"list-records"` — it would misread them as a plain listing. The
+        // key-walk fallback over the guest's own get/list_keys is always
+        // correct (and is what the flag reads before the lazy first spawn).
+        if !self.inner.has_feature("list-records") {
+            return list_records_fallback(self, tenant, dataset, spec).await;
+        }
+        let select: Vec<String> = spec.fields.iter().map(|f| query_encode(&f.dotted())).collect();
+        let mut path = format!("/{dataset}/?$select={}", select.join(","));
+        if !spec.sort.is_empty() {
+            let sort: Vec<String> = spec
+                .sort
+                .iter()
+                .map(|(p, dir)| {
+                    let prefix = match dir {
+                        crate::listing::Dir::Desc => "-",
+                        crate::listing::Dir::Asc => "",
+                    };
+                    format!("{prefix}{}", query_encode(&p.dotted()))
+                })
+                .collect();
+            path.push_str(&format!("&$sort={}", sort.join(",")));
+        }
+        path.push_str(&format!("&$take={}&$skip={}", spec.take, spec.skip));
+        let (status, body) = self.call("GET", &path, None).await?;
+        if !(200..300).contains(&status) {
+            return Err(store_error(status, &body));
+        }
+        let page = body
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|e| {
+                        (
+                            e.get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            e.get("fields").cloned().unwrap_or_else(|| json!({})),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((page, listing_total(&body)))
+    }
+
+    fn listing_pushdown(&self) -> bool {
+        // Reflects the bundle's `features` export; reads `false` until the
+        // lazy first spawn has evaluated the module.
+        self.inner.has_feature("list-records")
     }
 }
 
@@ -991,9 +1081,10 @@ mod tests {
             export default async (msg, ctx) => { N += 1; return { status: 200, body: { n: N } }; };
         "#
         .to_string();
-        let h = spawn_resident(src, host, InvocationLimits::default(), "t".into(), vec![])
+        let (h, features) = spawn_resident(src, host, InvocationLimits::default(), "t".into(), vec![])
             .await
             .unwrap();
+        assert!(features.is_empty(), "no features export → empty");
         let a = h
             .call(json!({ "method": "GET", "url": "/" }), json!({}))
             .await
@@ -1004,6 +1095,23 @@ mod tests {
             .unwrap();
         assert_eq!(a["body"]["n"], 1, "first job sees N=1");
         assert_eq!(b["body"]["n"], 2, "second job reuses the same isolate: N=2");
+    }
+
+    /// The optional `features` export is read at spawn — the handshake by
+    /// which an adapter advertises native capabilities like `"list-records"`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resident_spawn_reads_the_features_export() {
+        let host: Arc<dyn HostApi> = Arc::new(GrantedHost::deny_all("resident-test"));
+        let src = r#"
+            export const features = ["list-records"];
+            export default async (msg, ctx) => ({ status: 200 });
+        "#
+        .to_string();
+        let (_h, features) =
+            spawn_resident(src, host, InvocationLimits::default(), "t".into(), vec![])
+                .await
+                .unwrap();
+        assert_eq!(features, ["list-records"]);
     }
 
     /// A bundle that fails to evaluate surfaces the error at spawn, not at the

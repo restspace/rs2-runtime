@@ -1343,7 +1343,7 @@ async fn run_invocation(
     limits: &InvocationLimits,
 ) -> Result<Value, RsError> {
     let oom = Arc::new(AtomicBool::new(false));
-    let (mut runtime, default_export) =
+    let (mut runtime, default_export, _features) =
         build_runtime(source, inv.clone(), limits, oom.clone()).await?;
     dispatch_once(
         &mut runtime,
@@ -1435,7 +1435,7 @@ pub(crate) async fn build_runtime(
     inv: Arc<InvocationState>,
     limits: &InvocationLimits,
     oom: Arc<AtomicBool>,
-) -> Result<(JsRuntime, v8::Global<v8::Value>), RsError> {
+) -> Result<(JsRuntime, v8::Global<v8::Value>, Vec<String>), RsError> {
     // When the committed snapshot is used, the bootstrap + prelude globals are
     // already baked into the isolate's heap; otherwise they run from source
     // (identical result, ~10ms slower per isolate creation).
@@ -1492,7 +1492,7 @@ pub(crate) async fn build_runtime(
     let evaluated = load_and_evaluate(&mut runtime, source).await;
     done.store(true, Ordering::SeqCst);
     match evaluated {
-        Ok(default_export) => Ok((runtime, default_export)),
+        Ok((default_export, features)) => Ok((runtime, default_export, features)),
         Err(fail) => {
             if timed_out.load(Ordering::SeqCst) {
                 runtime.v8_isolate().cancel_terminate_execution();
@@ -1517,11 +1517,14 @@ pub(crate) async fn build_runtime(
     }
 }
 
-/// Load + evaluate the ESM bundle and return its default export.
+/// Load + evaluate the ESM bundle and return its default export plus its
+/// declared feature flags (an optional top-level `export const features =
+/// ["…"]` — the handshake by which an adapter advertises native capabilities
+/// such as `"list-records"`; absent or malformed → empty).
 async fn load_and_evaluate(
     runtime: &mut JsRuntime,
     source: &str,
-) -> Result<v8::Global<v8::Value>, String> {
+) -> Result<(v8::Global<v8::Value>, Vec<String>), String> {
     let spec = resolve_url("rs2:service").map_err(|e| format!("specifier: {e}"))?;
     let mod_id = runtime
         .load_main_es_module_from_code(&spec, source.to_string())
@@ -1543,7 +1546,12 @@ async fn load_and_evaluate(
     let default_export = ns
         .get(scope, default_key.into())
         .ok_or("no default export")?;
-    Ok(v8::Global::new(scope, default_export))
+    let features_key = v8::String::new(scope, "features").ok_or("oom")?;
+    let features = ns
+        .get(scope, features_key.into())
+        .and_then(|v| serde_v8::from_v8::<Vec<String>>(scope, v).ok())
+        .unwrap_or_default();
+    Ok((v8::Global::new(scope, default_export), features))
 }
 
 /// Call `__rs2_dispatch(default, msg, config)` once and return the response

@@ -35,6 +35,16 @@ Done:
   PUT/POST/DELETE semantics, the 409 + `?confirm=` container guard, ETags on
   children. Mounts declare `pattern` + `facets` on the discovery surface;
   the generated OpenAPI `$ref`s one shared store path-item shape.
+- **Projected dataset listings** (`$select`/`$sort` on `data`): a dataset
+  listing projects dot-path fields into each entry (`fields` object) and sorts
+  by them; `$sort` without `$select` is a 400. Semantics pinned in
+  `listing.rs` (binary UTF-8 string order; missing < null < false < true <
+  numbers < strings cross-type order; key tiebreak) and enforced across
+  backends by the conformance suite; `DataStore::list_records` has a default
+  key-walk fallback (full walk under a sort, page-only unsorted) with native
+  pushdown for `builtin:mem`. Field-level read rules redact projections like
+  record GETs. Discovery: `list-projection` facet + `listProjection:
+  native|fallback` in the services doc.
 - **Static-site mode on `file`** (no separate service — config):
   `defaultResource` serves a default document for directory GETs,
   `spaFallback` serves the root app shell for extension-less misses

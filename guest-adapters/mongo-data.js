@@ -113,6 +113,38 @@ function command(doc) {
 
 const SCHEMA_COLL = "__rs2_schemas__";
 
+// Native listing pushdown: the host sends `$select`/`$sort` to this bundle
+// instead of key-walking, because we advertise the feature here. See the
+// projected-listing route below and guest-adapters/README.md for the
+// documented sort-semantics deviation on MongoDB.
+export const features = ["list-records"];
+
+// Rebuild the listing contract's projected shape from a fetched doc: walk
+// each dotted path; absent paths are omitted entirely. (Mongo's inclusion
+// projection would keep empty intermediate objects — `{meta: {}}` when `meta`
+// exists but `meta.date` doesn't — which the contract does not.) The server-
+// side projection still trims the wire payload; this pass fixes the shape.
+function pick(doc, paths) {
+  const out = {};
+  for (const p of paths) {
+    const segs = p.split(".");
+    let cur = doc, ok = true;
+    for (const s of segs) {
+      if (cur === null || typeof cur !== "object" || Array.isArray(cur) || !(s in cur)) { ok = false; break; }
+      cur = cur[s];
+    }
+    if (!ok) continue;
+    let o = out;
+    for (let i = 0; i < segs.length - 1 && o; i++) {
+      const seg = segs[i];
+      if (!(seg in o)) o[seg] = {};
+      o = (o[seg] !== null && typeof o[seg] === "object" && !Array.isArray(o[seg])) ? o[seg] : null;
+    }
+    if (o) o[segs[segs.length - 1]] = cur;
+  }
+  return out;
+}
+
 export default async (msg, ctx) => {
   connect(ctx.config);
   const path = String(msg.url).split("?")[0];
@@ -130,6 +162,29 @@ export default async (msg, ctx) => {
 
   const dataset = segs[0];
   if (segs.length === 1 && path.endsWith("/")) {
+    if (msg.method === "GET" && qs.get("$select") !== null) {
+      // Projected listing (native `list-records` pushdown): one `find` with
+      // the projection/sort/skip/limit pushed to the server, plus a `count`
+      // for the unpaged total. The record key (`_id`) is appended ascending
+      // as the final sort key — the contract's key tiebreak. Sort-semantics
+      // deviation vs. the host fallback (documented in the README): MongoDB
+      // collates missing and null together and brackets mixed types its own
+      // way; the contract only pins homogeneous scalar sort fields.
+      const fields = qs.get("$select").split(",").map((s) => s.trim()).filter(Boolean);
+      const projection = { _id: 1 };
+      for (const f of fields) projection[f] = 1;
+      const sort = {};
+      for (const k of (qs.get("$sort") || "").split(",").map((s) => s.trim()).filter(Boolean)) {
+        if (k.startsWith("-")) sort[k.slice(1)] = -1; else sort[k] = 1;
+      }
+      if (!("_id" in sort)) sort._id = 1;
+      const total = command({ count: dataset }).n || 0;
+      const found = command({ find: dataset, filter: {}, projection, sort, skip, limit: take });
+      const entries = (found.cursor.firstBatch || []).map((d) => ({
+        name: String(d._id), dir: false, contentType: "application/json", fields: pick(d, fields),
+      }));
+      return { status: 200, body: { path: "/" + dataset + "/", entries, total } };
+    }
     if (msg.method === "GET") {
       const total = command({ count: dataset }).n || 0;
       const found = command({ find: dataset, filter: {}, skip, limit: take });

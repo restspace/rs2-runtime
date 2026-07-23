@@ -247,22 +247,7 @@ pub trait DataStore: Send + Sync {
         dataset: &str,
         spec: &crate::listing::ListSpec,
     ) -> Result<(Vec<(String, serde_json::Value)>, u64), RsError> {
-        if spec.sort.is_empty() {
-            let (keys, total) = self.list_keys(tenant, dataset, spec.take, spec.skip).await?;
-            let mut page = Vec::with_capacity(keys.len());
-            for key in keys {
-                let record = self.get(tenant, dataset, &key).await?;
-                page.push((key, crate::listing::project(&record, &spec.fields)));
-            }
-            return Ok((page, total));
-        }
-        let (keys, _) = self.list_keys(tenant, dataset, usize::MAX, 0).await?;
-        let mut records = Vec::with_capacity(keys.len());
-        for key in keys {
-            let record = self.get(tenant, dataset, &key).await?;
-            records.push((key, record));
-        }
-        Ok(crate::listing::sort_page_project(records, spec))
+        list_records_fallback(self, tenant, dataset, spec).await
     }
 
     /// Whether [`DataStore::list_records`] is pushed down to the backing
@@ -271,6 +256,34 @@ pub trait DataStore: Send + Sync {
     fn listing_pushdown(&self) -> bool {
         false
     }
+}
+
+/// The default [`DataStore::list_records`] pipeline over `list_keys` + `get`,
+/// factored out so an adapter with *conditional* pushdown (e.g. a guest
+/// adapter whose bundle didn't advertise `"list-records"`) can invoke the
+/// key-walk explicitly from its own override.
+pub async fn list_records_fallback<S: DataStore + ?Sized>(
+    store: &S,
+    tenant: &str,
+    dataset: &str,
+    spec: &crate::listing::ListSpec,
+) -> Result<(Vec<(String, serde_json::Value)>, u64), RsError> {
+    if spec.sort.is_empty() {
+        let (keys, total) = store.list_keys(tenant, dataset, spec.take, spec.skip).await?;
+        let mut page = Vec::with_capacity(keys.len());
+        for key in keys {
+            let record = store.get(tenant, dataset, &key).await?;
+            page.push((key, crate::listing::project(&record, &spec.fields)));
+        }
+        return Ok((page, total));
+    }
+    let (keys, _) = store.list_keys(tenant, dataset, usize::MAX, 0).await?;
+    let mut records = Vec::with_capacity(keys.len());
+    for key in keys {
+        let record = store.get(tenant, dataset, &key).await?;
+        records.push((key, record));
+    }
+    Ok(crate::listing::sort_page_project(records, spec))
 }
 
 /// Outbound HTTP, granted with allowed-host patterns; default deny.
