@@ -8,7 +8,10 @@ doc tracks the improvement list from the July 2026 CMS survey of both repos.
 views — the runtime projected-listing contract (`$select`/`$sort` with pinned
 binary-UTF-8 collation, native pushdown for mem + mongo, `list-projection` and
 `meta-sort` facets), the UI List panel with schema-derived columns, and the
-sidebar sibling drill-in. That was item 2 of the original ten.
+sidebar sibling drill-in. That was item 2 of the original ten. Item 1 (editor
+role scoping in the UI) shipped 2026-07-24: the catalogue's permission-filtered
+`control` block now gates every engineer surface — gear, Send, Raw, Code — so
+a content-only role sees no admin chrome (rs2-ui `1c2f6b4`).
 
 ## The central enabler: a CMS manifest + Editor mode
 
@@ -37,13 +40,6 @@ role-driven by default with a toggle for operators, so one deployment serves
 both audiences.
 
 ## Open items
-
-### 1. Editor role scoping in the UI (quick win, UI only)
-
-Permission-filtered catalogues already shrink the tree for a role granted
-write only on content mounts. Add UI behaviour on top: when the principal
-lacks config access, hide the gear / Send / Raw / Code surfaces entirely
-rather than showing them disabled.
 
 ### 3. Markdown / rich-text editing (quick win, UI only)
 
