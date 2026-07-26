@@ -337,6 +337,36 @@ non-HTTP wire protocols — without recompiling `rs2-core`.
 - **Deferred** (Phase 3): a `GuestActor` model for long-lived push connections
   (Discord gateway), SCRAM auth for Mongo, multi-file ESM resolution.
 
+## Service-private storage, body splice, and the image service
+
+Three additions that together make CMS media transforms (cms-roadmap item 8's
+transform half) a pure `code:` deployment — the runtime carries no image code:
+
+- **`store` grant** (`services/code.rs`): `{"type": "store", "root": "…"}` on
+  a code mount hands the guest a full store surface (a private `FileService`
+  over `PrefixedFileStore`) rooted at the reserved `.rs2-store/<root>` tree.
+  No dispatch, no principal, no access check — the operator-configured grant
+  is the authority — solving "an anonymous caller's request needs to write the
+  service's cache" without a publicly writable mount. Router path safety is
+  applied at the grant boundary (traversal → `path_unsafe`); errors return as
+  status responses like a `prefix` grant. Proof: `tests/store_grant.rs`.
+- **`x-rs2-body-ref` response header** (both engines): a handler returns
+  `<capability>:<path>` instead of a body; the host resolves the read through
+  the mount's own grant after the guest returns and attaches the (streamed)
+  `Body` — zero bytes cross the sandbox for cache hits/passthrough. Caller
+  principal is carried, so `prefix`-grant reads keep their authz. Dangling
+  refs are `502 contract_violation`. The host also stamps `x-rs2-base-path`
+  on guest requests so a service can derive its mount-relative path.
+- **`guest-services/image`** — the image transform component (wasm32-wasip2,
+  ~1.1 MB): `w`/`h`/`dpr`/`fit`/`g`/`rect`/`f`/`q` with canonicalization,
+  width-ladder snapping, derived strong ETag = hash(path, source ETag,
+  canonical params), 304s, `$info`, `DELETE /.cache?confirm=` purge, pixel
+  guard before decode. Steady state does no pixel work (304 or body-ref
+  splice from the cache tree). Pure logic tests natively in the crate;
+  e2e in `tests/image_service.rs` (env-gated like conformance). See
+  `guest-services/image/README.md`. Lossy WebP/AVIF and `Accept`
+  negotiation are deliberate v1 gaps (no mature pure-Rust lossy encoder).
+
 ## G1 + G3 benchmarks (`tests/g_benchmarks.rs`)
 
 ```powershell

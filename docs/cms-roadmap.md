@@ -86,6 +86,11 @@ resize/thumbnail transforms anywhere. A resize-on-query-param image service
 (cached, decorating a file mount) unlocks thumbnails for the asset library
 (item 4) and responsive images for templates.
 
+**Transforms shipped 2026-07-26** as a sandboxed Wasm component rather than a
+built-in (`guest-services/image` + the `store` grant and `x-rs2-body-ref`
+splice in `services/code.rs`) — the runtime stays image-free; tenants mount
+`code:image@<v>` decorating their media mount. Multipart upload remains open.
+
 ### 9. Change events / webhooks (runtime)
 
 No outbound events exist on content writes. Needed eventually for cache

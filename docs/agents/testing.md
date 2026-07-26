@@ -23,6 +23,15 @@ $env:RS2_CONFORMANCE_COMPONENT = "$PWD\conformance\echo-guest\target\wasm32-wasi
 cargo test --features wasm -p rs2-core --test conformance
 ```
 
+The image service e2e (`tests/image_service.rs`) is gated the same way — its
+pure param/geometry/transform logic also tests natively inside the guest crate:
+
+```powershell
+cd guest-services/image; cargo test; cargo build --target wasm32-wasip2 --release; cd ../..
+$env:RS2_IMAGE_COMPONENT = "$PWD\guest-services\image\target\wasm32-wasip2\release\rs2_image.wasm"
+cargo test --features wasm -p rs2-core --test image_service
+```
+
 ## Integration harness
 
 Tests build a `Runtime` over real adapters and drive it with `rt.handle(msg)`:

@@ -1,0 +1,24 @@
+# Image transform service: a Wasm component implementing the RS2 service
+# world — query-string resize/crop over a `source` prefix grant, with a
+# derivative cache in a `store` grant. Built standalone (not a workspace
+# member — it targets wasm32-wasip2):
+#   cargo build --target wasm32-wasip2 --release
+# Pure-module unit tests (params/geometry/transform) run natively:
+#   cargo test
+[package]
+name = "rs2-image"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+strip = true
+lto = true
