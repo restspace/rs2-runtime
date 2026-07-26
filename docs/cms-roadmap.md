@@ -40,8 +40,9 @@ The derivation rules:
   `/.well-known/rs2/services`, minus spec stores (self-identifying via
   `specSubtree`) and control surfaces. Roles do the pruning; `x-expose` is the
   generic per-mount opt-out for anything left over.
-- **Labels** from the mount's `description` metadata, falling back to a
-  humanized path segment; **icons** from pattern/facets/content-type; **rail
+- **Labels** humanize the mount path segment (or dataset name) — real
+  `description` values are documentation prose, so they serve as the row
+  tooltip, not the label; **icons** from pattern/facets/content-type; **rail
   order** from mount declaration order in the tenant config.
 - **Columns and default sort**: already schema-derived (`lib/columns.ts`). An
   explicit `x-columns` schema-root override stays unbuilt until demanded.
@@ -58,6 +59,13 @@ Runtime side: approximately nothing — optionally extend `x-expose` filtering
 `?surface=editor` prunes the rail, and document the schema annotation
 vocabulary in the manual + rs2-skill as a generic client contract rather than
 a UI-private convention.
+
+**Shipped 2026-07-26**: the runtime half in `8e96487` (`?surface=` on the
+services catalogue, control block follows its mount; manual 4.8 documents the
+annotation vocabulary; rs2-skill references updated) and the UI in rs2-ui
+`7f8da23` (`lib/collections.ts` derivation, `lib/view-mode.ts` role-driven
+mode + operator toggle, `sidebar/CollectionsRail.tsx`), verified in-browser
+against a live node.
 
 ## Open items
 
