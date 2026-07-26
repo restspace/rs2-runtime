@@ -45,6 +45,7 @@ before, so a first read works front-to-back; later it doubles as a reference.
 - [4.5 Schemas, validation errors, and JSON merge PATCH](part-4-storing-files-and-data/4.5-schemas-validation-patch.md)
 - [4.6 Listings, pagination, and the `?confirm=` delete guard](part-4-storing-files-and-data/4.6-listings-pagination-delete.md)
 - [4.7 Choosing a storage backend and isolating mounts](part-4-storing-files-and-data/4.7-choosing-a-storage-backend.md)
+- [4.8 Schema annotations: the authoring contract for editing clients](part-4-storing-files-and-data/4.8-schema-annotations-for-clients.md)
 
 ### Part 5 — Authentication & Access Control
 

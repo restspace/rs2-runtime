@@ -135,9 +135,10 @@ fn readable_mounts<'t>(tenant: &'t Tenant, msg: &Message) -> Vec<&'t Mount> {
         .collect()
 }
 
-/// `?surface=mcp` filtering against the mount's `x-expose` (PRD §12):
-/// a mount with `x-expose` lists the surfaces it appears on; mounts
-/// without `x-expose` appear everywhere.
+/// `?surface=mcp` filtering against the mount's `x-expose` (PRD §12),
+/// applied to the agent surface and the services catalogue alike: a mount
+/// with `x-expose` lists the surfaces it appears on; mounts without
+/// `x-expose` appear everywhere.
 fn exposed_on(mount: &Mount, surface: Option<&str>) -> bool {
     let Some(surface) = surface else { return true };
     match mount.config.get("x-expose") {
@@ -373,7 +374,15 @@ pub fn allowed_methods(mount: &Mount) -> Vec<&'static str> {
 }
 
 fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
-    let readable = readable_mounts(tenant, msg);
+    // `?surface=` prunes the catalogue exactly like the agent surface, so a
+    // client can ask for e.g. the "editor" view of the tenant. The `control`
+    // block derives from the same filtered list, so a `services` mount
+    // scoped off the surface takes its control entries with it.
+    let surface = msg.url.query_param("surface");
+    let readable: Vec<&Mount> = readable_mounts(tenant, msg)
+        .into_iter()
+        .filter(|m| exposed_on(m, surface.as_deref()))
+        .collect();
     let services: Vec<Value> = readable
         .iter()
         .copied()

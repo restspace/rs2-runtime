@@ -175,8 +175,11 @@ Done:
   `IQueryAdapter` equivalent, now bind-capable) + reference adapter
   scanning any `DataStore`.
 - **Agent surface** (PRD §12), generated per tenant and filtered by the
-  caller's read permission and `?surface=` against `x-expose`:
+  caller's read permission and `?surface=` against `x-expose` (`services`
+  and `agent-surface`; `openapi` filters by permission only):
   - `/.well-known/rs2/services` — mount catalogue with x-agent/x-policy
+    and the `control` block (which follows its backing mount off a
+    filtered surface)
   - `/.well-known/rs2/agent-surface` — entities, actions (effect class +
     Idempotency-Key guidance advertised), stored queries with their schemas
   - `/.well-known/rs2/openapi` — OpenAPI 3.1; the schemas referenced are

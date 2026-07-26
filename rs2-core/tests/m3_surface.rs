@@ -475,6 +475,92 @@ async fn discovery_surface_filters_and_advertises() {
     assert_eq!(post.status.unwrap().as_u16(), 405);
 }
 
+/// `?surface=` prunes the services catalogue exactly like the agent surface:
+/// a mount with `x-expose` appears only on its listed surfaces; a mount
+/// without `x-expose` appears on every surface. No param = no filtering.
+#[tokio::test]
+async fn services_catalogue_filters_by_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = rt_with(dir.path(), surface_config());
+
+    let paths_for = |doc: &serde_json::Value| -> Vec<String> {
+        doc["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["path"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // No ?surface param: /q lists despite its x-expose (unfiltered).
+    let mut all = rt
+        .handle(req(Method::GET, "/.well-known/rs2/services"))
+        .await;
+    let doc = body_json(&mut all).await;
+    let paths = paths_for(&doc);
+    assert!(paths.contains(&"/q".to_string()), "{paths:?}");
+
+    // /q is exposed on "mcp" only: gone from the editor surface, while
+    // x-expose-less mounts appear on every surface.
+    let mut editor = rt
+        .handle(req(
+            Method::GET,
+            "/.well-known/rs2/services?surface=editor",
+        ))
+        .await;
+    let doc = body_json(&mut editor).await;
+    let paths = paths_for(&doc);
+    assert!(!paths.contains(&"/q".to_string()), "{paths:?}");
+    assert!(
+        paths.contains(&"/data".to_string()) && paths.contains(&"/summary".to_string()),
+        "x-expose-less mounts appear on every surface: {paths:?}"
+    );
+    // The services mount carries no x-expose, so control survives the filter.
+    assert_eq!(doc["control"]["path"], "/services");
+
+    let mut mcp = rt
+        .handle(req(Method::GET, "/.well-known/rs2/services?surface=mcp"))
+        .await;
+    let paths = paths_for(&body_json(&mut mcp).await);
+    assert!(paths.contains(&"/q".to_string()), "{paths:?}");
+}
+
+/// When the mounts backing the `control` block are scoped off the requested
+/// surface via `x-expose`, the control entries pointing at them go too.
+#[tokio::test]
+async fn services_control_block_respects_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = surface_config();
+    config["mounts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|m| m["service"] == "services")
+        .unwrap()["config"]["x-expose"] = json!(["admin"]);
+    let rt = rt_with(dir.path(), config);
+
+    let mut editor = rt
+        .handle(req(
+            Method::GET,
+            "/.well-known/rs2/services?surface=editor",
+        ))
+        .await;
+    let doc = body_json(&mut editor).await;
+    assert!(
+        doc["control"].is_null(),
+        "control follows its filtered-out mount: {doc}"
+    );
+
+    let mut admin = rt
+        .handle(req(
+            Method::GET,
+            "/.well-known/rs2/services?surface=admin",
+        ))
+        .await;
+    let doc = body_json(&mut admin).await;
+    assert_eq!(doc["control"]["path"], "/services");
+}
+
 // ---------------------------------------------------------------------------
 // schema + media-type self-containment (discovery == enforcement)
 // ---------------------------------------------------------------------------
