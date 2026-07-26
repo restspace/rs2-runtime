@@ -4,69 +4,62 @@ The goal: configure the runtime and rs2-ui so they present a view of a site
 that is close to as usable as a CMS front end for non-technical users. This
 doc tracks the improvement list from the July 2026 CMS survey of both repos.
 
-**Already done (for context, not part of the open list):** collection list
-views — the runtime projected-listing contract (`$select`/`$sort` with pinned
-binary-UTF-8 collation, native pushdown for mem + mongo, `list-projection` and
-`meta-sort` facets), the UI List panel with schema-derived columns, and the
-sidebar sibling drill-in. That was item 2 of the original ten. Item 1 (editor
-role scoping in the UI) shipped 2026-07-24: the catalogue's permission-filtered
-`control` block now gates every engineer surface — gear, Send, Raw, Code — so
-a content-only role sees no admin chrome (rs2-ui `1c2f6b4`).
+**Already done (for context, not part of the open list):**
 
-## The central enabler: a CMS manifest + Editor mode
+- **Item 2 — collection list views**: the runtime projected-listing contract
+  (`$select`/`$sort` with pinned binary-UTF-8 collation, native pushdown for
+  mem + mongo, `list-projection` and `meta-sort` facets), the UI List panel
+  with schema-derived columns, and the sidebar sibling drill-in.
+- **Item 1 — editor role scoping** (2026-07-24): the catalogue's
+  permission-filtered `control` block now gates every engineer surface — gear,
+  Send, Raw, Code — so a content-only role sees no admin chrome (rs2-ui
+  `1c2f6b4`).
+- **Items 3–6 — authoring quick wins** (2026-07-25, rs2-ui `8434fef`):
+  markdown editing (`format: "markdown"` / `x-editor`), the image picker
+  (`x-media-mount`), live page preview beside the form (`x-preview` schema-root
+  mapping, GET template or POST-self for unsaved edits), and plain-language
+  errors (`friendlyError` mapping 412/422/409 into editor language). All hints
+  ride the resource's **JSON Schema** — feature-detected, never keyed off a
+  service name.
 
-Everything below hangs off one idea: a per-tenant **editorial manifest** —
-config describing the *editor's* view of the site, distinct from the
-engineer's view. Natural home: mount metadata in the catalogue (alongside the
-existing `x-agent`/`x-expose` blocks), perhaps plus a tenant-level `cms`
-section, served through the already permission-filtered
-`/.well-known/rs2/services`. It declares:
+## The central enabler: Editor mode, derived — not a manifest
 
-- **Collections**: label ("Blog posts"), icon, backing mount/dataset, list
-  columns, default sort. (The UI's `lib/columns.ts` column-plan heuristics are
-  deliberately the seam a manifest overrides.)
-- **Field editor hints**: this string field is markdown/rich text, this one is
-  an image reference into the media mount, this one is a slug derived from the
-  title.
-- **Preview mapping**: how a record maps to its rendered page URL (the
-  pipeline/template that serves it).
-- **A designated media mount** to treat as the asset library.
+The original plan here was a per-tenant "editorial manifest" — a config
+document describing the editor's view of the site. That plan is **dropped**:
+RS2 is more generic than a CMS, and a `cms` config block would describe the
+site to one particular UI only. Instead, Editor mode is a **derived
+projection** of surfaces the runtime already serves, with the few irreducible
+declarations living in the data's own JSON Schema (the pattern items 3–6
+established). Everything a polymorphic client — rs2-ui, an AI agent on the
+agent surface — needs, it gets from generic contracts.
 
-The UI reads the manifest and renders a content-first **Editor mode**: a flat
-rail of labelled collections ("Pages", "Posts", "Media") instead of the mount
-tree, with the full explorer remaining as Admin mode. When no manifest is
-present, the UI falls back to today's explorer. Mode selection should be
-role-driven by default with a toggle for operators, so one deployment serves
-both audiences.
+The derivation rules:
+
+- **Collections** = store-pattern mounts (and datasets one level below data
+  mounts) visible in the caller's permission-filtered
+  `/.well-known/rs2/services`, minus spec stores (self-identifying via
+  `specSubtree`) and control surfaces. Roles do the pruning; `x-expose` is the
+  generic per-mount opt-out for anything left over.
+- **Labels** from the mount's `description` metadata, falling back to a
+  humanized path segment; **icons** from pattern/facets/content-type; **rail
+  order** from mount declaration order in the tenant config.
+- **Columns and default sort**: already schema-derived (`lib/columns.ts`). An
+  explicit `x-columns` schema-root override stays unbuilt until demanded.
+- **Field editors, preview mapping**: the shipped schema annotations
+  (`x-editor`, `x-media-mount`, `x-preview`).
+- **Media mount**: `x-media-mount` where declared; otherwise feature-detect —
+  the file mount decorated by `code:image`, else the only writable file mount.
+- **Mode selection**: no `control` block visible → Editor mode (flat labelled
+  collections rail); operators who see `control` get a toggle back to the full
+  explorer (Admin mode). Zero config.
+
+Runtime side: approximately nothing — optionally extend `x-expose` filtering
+(today applied to the agent surface) to the services catalogue so
+`?surface=editor` prunes the rail, and document the schema annotation
+vocabulary in the manual + rs2-skill as a generic client contract rather than
+a UI-private convention.
 
 ## Open items
-
-### 3. Markdown / rich-text editing (quick win, UI only)
-
-The Form tab renders plaintext for every string field. Honor
-`"format": "markdown"` (or an `x-editor` annotation) in schemas with a proper
-editor (TipTap/Milkdown, or CodeMirror with preview), and add markdown
-rendering to the Preview tab. The single biggest authoring-experience gap in
-the UI.
-
-### 4. Image picker field widget (quick win, UI only)
-
-A schema-form widget for image-URL fields that opens a browse/upload dialog
-against the media mount, with thumbnails. Keyless POST upload already works;
-it just needs a friendly surface. (Thumbnails want item 8 for quality, but a
-first version can show full images scaled down.)
-
-### 5. Live page preview (quick win, UI only)
-
-The template-authoring panel already does server-rendered iframe previews —
-reuse that machinery on the *content* side: with the manifest's preview
-mapping, show the rendered page beside the form as the editor types.
-
-### 6. Plain-language errors (quick win, UI only)
-
-Map 412/422/409 into editor language ("Someone else saved this page — reload
-or overwrite?", field-level validation messages) instead of surfacing status
-codes and ETag vocabulary.
 
 ### 7. Draft/publish and revisions (runtime — the biggest gap)
 
@@ -112,8 +105,8 @@ service fed by the event hook from item 9.
 
 ## Suggested sequence
 
-Manifest schema + Editor mode navigation first — it reframes the whole
-experience for roughly a week or two of UI work. Then markdown + image picker
-+ preview (3–5), which makes authoring genuinely pleasant. Draft/publish (7)
-is the first big runtime investment; media transforms (8) second. Items 9–10
+Editor mode navigation next — with the manifest dropped there is no schema to
+design, version, or migrate, so it is pure UI derivation work plus the small
+`x-expose` catalogue-filtering change. Then draft/publish (7), the first big
+runtime investment; multipart upload (the open half of 8) second. Items 9–10
 are infrastructure that can follow demand.
