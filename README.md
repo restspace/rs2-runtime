@@ -104,8 +104,11 @@ cargo run -p rs2-server -- serverConfig.json
 ```
 
 `serverConfig.json` sets the listener, tenancy mode, and data root; tenant
-configs live in `tenants/<name>.json` (this repo ships a working example of
-both). Then:
+configs live in `tenants/<name>.json`. Copy the shipped example to the path the
+default `serverConfig.json` expects — `cp tenants/main.example.json
+tenants/main.json` — and edit from there. Your `tenants/main.json` is gitignored:
+once you enable auth it holds a real `auth.jwtSecret`, which does not belong in
+version control. Then:
 
 ```bash
 curl -X PUT localhost:3100/files/notes/hello.txt -d 'hi'

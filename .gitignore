@@ -19,6 +19,9 @@ examples/*/data-store/
 # login password it was minted from. Never commit.
 rsconfig.json
 rsconfig.*.json
+# The local dev node's live tenant config: once auth is on it holds a real
+# `auth.jwtSecret`. Start from tenants/main.example.json instead.
+/tenants/main.json
 # Dev-node log files.
 /rs2-dev.out.log
 /rs2-dev.err.log
