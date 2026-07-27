@@ -113,6 +113,21 @@ pub fn resolve_host(flag: Option<&str>, config: &RsConfig) -> Result<String, Str
     Ok(host.trim_end_matches('/').to_string())
 }
 
+/// The scheme + authority of a URL: `http://h:3100/services` → `http://h:3100`.
+/// A stored token records the *host* it was issued for, so a command holding a
+/// deeper URL (the `services` mount) has to strip back to the origin before
+/// asking [`token_if_valid`].
+pub fn origin(url: &str) -> String {
+    let after_scheme = match url.find("://") {
+        Some(i) => i + 3,
+        None => return url.trim_end_matches('/').to_string(),
+    };
+    match url[after_scheme..].find('/') {
+        Some(j) => url[..after_scheme + j].to_string(),
+        None => url.trim_end_matches('/').to_string(),
+    }
+}
+
 /// Resolve a usable bearer token for `host`: requires a stored `auth` issued
 /// for the same host and not past its `exp`.
 /// A usable bearer token for `host`, if one is stored, matches the host, and
@@ -135,4 +150,62 @@ pub fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_strips_the_path() {
+        assert_eq!(
+            origin("http://127.0.0.1:3100/services"),
+            "http://127.0.0.1:3100"
+        );
+        assert_eq!(origin("https://a.example/x/y/z"), "https://a.example");
+        // Already an origin, with or without a trailing slash.
+        assert_eq!(origin("http://127.0.0.1:3100"), "http://127.0.0.1:3100");
+        assert_eq!(origin("http://127.0.0.1:3100/"), "http://127.0.0.1:3100");
+    }
+
+    /// The deploy path resolves a token by origin, so a `services` URL must
+    /// match a token issued for its host — and must not match another node.
+    #[test]
+    fn token_matches_by_origin() {
+        let config = RsConfig {
+            host: Some("http://127.0.0.1:3100".to_string()),
+            login: None,
+            auth: Some(Auth {
+                token: "t".to_string(),
+                exp: now_secs() + 600,
+                host: "http://127.0.0.1:3100".to_string(),
+            }),
+        };
+        let services = "http://127.0.0.1:3100/services";
+        assert_eq!(
+            token_if_valid(&config, &origin(services)),
+            Some("t".to_string())
+        );
+        // A different node gets nothing, even on the same machine.
+        assert_eq!(
+            token_if_valid(&config, &origin("http://127.0.0.1:3200/services")),
+            None
+        );
+        // The un-stripped URL would never match — the bug this guards.
+        assert_eq!(token_if_valid(&config, services), None);
+    }
+
+    #[test]
+    fn expired_tokens_are_not_used() {
+        let config = RsConfig {
+            host: None,
+            login: None,
+            auth: Some(Auth {
+                token: "t".to_string(),
+                exp: now_secs() - 1,
+                host: "http://h".to_string(),
+            }),
+        };
+        assert_eq!(token_if_valid(&config, "http://h"), None);
+    }
 }

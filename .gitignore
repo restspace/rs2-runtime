@@ -15,6 +15,10 @@ examples/*/data-store/
 /.run/
 # Internal strategy/positioning notes — not for the public repo.
 /docs/positioning.md
+# CLI state written by `rs2 login` — holds a bearer token, and often the
+# login password it was minted from. Never commit.
+rsconfig.json
+rsconfig.*.json
 # Dev-node log files.
 /rs2-dev.out.log
 /rs2-dev.err.log

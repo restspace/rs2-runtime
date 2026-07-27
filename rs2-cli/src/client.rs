@@ -80,6 +80,33 @@ impl Client {
         finish(req.send_bytes(bytes))
     }
 
+    /// POST raw bytes with a content type — the code store's keyless deploy,
+    /// where the server derives the (content-addressed) version name.
+    ///
+    /// Uploads are big enough (a Wasm component is ~1 MB) that a server which
+    /// rejects the request answers and closes while the body is still going
+    /// out; the client then sees a connection reset rather than the status. So
+    /// a mid-transfer I/O failure carries the auth hint the lost status would
+    /// have given. A failure to connect at all is reported as-is.
+    pub fn post_bytes(
+        &self,
+        path: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<Response, String> {
+        let req = self
+            .auth(ureq::post(&self.url(path)))
+            .set("content-type", content_type);
+        match req.send_bytes(bytes) {
+            Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::Io => Err(format!(
+                "request failed: {t} — the server may have closed the upload before it finished, \
+                 which is how a rejected (e.g. unauthenticated) deploy usually surfaces; \
+                 try `rs2 login`"
+            )),
+            other => finish(other),
+        }
+    }
+
     pub fn post_json(&self, path: &str, value: &serde_json::Value) -> Result<Response, String> {
         let body = serde_json::to_vec(value).map_err(|e| format!("cannot serialize body: {e}"))?;
         let req = self

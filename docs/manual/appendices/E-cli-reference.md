@@ -12,7 +12,7 @@ commands. Run it as the installed `rs2` binary or
 | `rs2 new <name> [--js]` | Scaffold a custom-service project. Default Rust/Wasm against the published WIT (compiles as-is with `cargo build --target wasm32-wasip2 --release`); `--js` is a single-file ESM scaffold with `manifest.json` |
 | `rs2 dev [serverConfig.json]` | Run a local node (same code as `rs2-server`) |
 | `rs2 test [projectDir] [--component <path>]` | Validate `manifest.json` and the built component (wasm header; engine compile-check when built `--features wasm`) |
-| `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Keyless `POST` to `<server>/code/<n>/`; the content-addressed store derives the version. `.js`/`.mjs` → JS bundle; `\0asm` → component. `--bundle` runs `npx esbuild … --bundle --format=esm --platform=browser` first |
+| `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Keyless `POST` to `<server>/code/<n>/`; the content-addressed store derives the version. `.js`/`.mjs` → JS bundle; `\0asm` → component. Server and token default from `rsconfig.json` like the other admin verbs. `--bundle` runs `npx esbuild … --bundle --format=esm --platform=browser` first |
 | `rs2 template build <entry.jsx|tsx> [--out <file>]` | Bundle a Preact component into the `{source, contentType}` envelope stored by a `template` mount (6.6) |
 | `rs2 migrate <services.json> [-o tenant.json]` | Convert a v1 Restspace config to an RS2 tenant config (Part 11) |
 | `rs2 login [--host <url>] [--email <e>] [--password <p>]` | Log in through `/auth/login` and save the token, expiry, and issuing host to `rsconfig.json` |
@@ -51,8 +51,8 @@ bootstrap.
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--name <n>` | — | The bundle name in the code store |
-| `--server <url>` | `http://127.0.0.1:3100/services` | The `services` API base |
-| `--token <t>` | — | Bearer token for a protected `services` mount |
+| `--server <url>` | rsconfig `host` + `/services`, else `http://127.0.0.1:3100/services` | The `services` API base |
+| `--token <t>` | the token saved by `rs2 login` (when unexpired and issued for that host) | Bearer token for a protected `services` mount |
 | `--bundle` | off | esbuild the entry first (Node.js on PATH required) |
 
 ## Typical workflows

@@ -58,10 +58,12 @@ enum Command {
         /// Deployed bundle name (mounts reference `code:<name>@<version>`).
         #[arg(long)]
         name: String,
-        /// Server base URL (the tenant's `services` mount).
-        #[arg(long, default_value = "http://127.0.0.1:3100/services")]
-        server: String,
-        /// Bearer token for an authenticated `services` mount.
+        /// Server base URL (the tenant's `services` mount); defaults to
+        /// `host` from rsconfig.json + `/services`.
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for an authenticated `services` mount; defaults to the
+        /// token saved by `rs2 login`.
         #[arg(long)]
         token: Option<String>,
         /// Bundle the entry point first (npx esbuild: npm deps resolved at
@@ -285,7 +287,7 @@ fn dispatch(command: Command) -> Result<(), String> {
         } else {
             Ok(component)
         })
-        .and_then(|artifact| deploy(&artifact, &name, &server, token.as_deref())),
+        .and_then(|artifact| deploy(&artifact, &name, server.as_deref(), token.as_deref())),
         Command::Template { action } => match action {
             TemplateCommand::Build { entry, out } => template_build(&entry, out.as_deref()),
         },
@@ -606,7 +608,16 @@ fn esbuild_jsx(entry: &str) -> Result<String, String> {
     Ok(out_str)
 }
 
-fn deploy(component: &str, name: &str, server: &str, token: Option<&str>) -> Result<(), String> {
+/// Where `deploy` looks when neither `--server` nor an rsconfig `host` says
+/// otherwise: the node `rs2 dev` starts.
+const DEFAULT_HOST: &str = "http://127.0.0.1:3100";
+
+fn deploy(
+    component: &str,
+    name: &str,
+    server: Option<&str>,
+    token: Option<&str>,
+) -> Result<(), String> {
     let bytes = std::fs::read(component).map_err(|e| format!("cannot read {component}: {e}"))?;
     // JS bundles deploy as source; anything else must be a wasm component.
     let content_type = if component.ends_with(".js") || component.ends_with(".mjs") {
@@ -618,35 +629,47 @@ fn deploy(component: &str, name: &str, server: &str, token: Option<&str>) -> Res
             "{component} is neither a .js bundle nor a WebAssembly binary"
         ));
     };
+
+    // Server and token resolve like every other networked command: an explicit
+    // flag wins, else `rsconfig.json` (its `host`, and the token `rs2 login`
+    // saved for that host). Deploying to an authenticated `services` mount must
+    // not require re-pasting the token by hand.
+    let loaded = config::load()?;
+    let services = match server {
+        Some(s) => s.trim_end_matches('/').to_string(),
+        None => format!(
+            "{}/services",
+            config::resolve_host(None, &loaded.config).unwrap_or_else(|_| DEFAULT_HOST.to_string())
+        ),
+    };
+    let token = token
+        .map(str::to_string)
+        .or_else(|| config::token_if_valid(&loaded.config, &config::origin(&services)));
+    let had_token = token.is_some();
+
     // Deploy = keyless POST to the bundle's container (the code store is
     // content-addressed: the server derives the version name).
-    let url = format!("{}/code/{name}/", server.trim_end_matches('/'));
-    let mut req = ureq::post(&url).set("content-type", content_type);
-    if let Some(token) = token {
-        req = req.set("authorization", &format!("Bearer {token}"));
+    let client = client::Client::new(services, token);
+    let resp = client
+        .post_bytes(&format!("/code/{name}/"), content_type, &bytes)
+        .map_err(|e| format!("deploy failed: {e}"))?;
+    if resp.status != 200 && resp.status != 201 {
+        return Err(format!(
+            "deploy failed: {}{}",
+            resp.error_detail(),
+            commands::login_hint(resp.status, had_token)
+        ));
     }
-    match req.send_bytes(&bytes) {
-        Ok(resp) => {
-            let text = resp
-                .into_string()
-                .map_err(|e| format!("unreadable deploy response: {e}"))?;
-            let body: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| format!("deploy response was not JSON: {e}"))?;
-            println!(
-                "deployed {} → {}\nmount it with: {{ \"path\": \"/my-service\", \"service\": {} }}",
-                name,
-                body.get("ref").and_then(|v| v.as_str()).unwrap_or("?"),
-                body.get("ref").map(|v| v.to_string()).unwrap_or_default(),
-            );
-            if body.get("validated") == Some(&serde_json::Value::Bool(false)) {
-                println!("note: the server skipped engine validation (built without wasm)");
-            }
-            Ok(())
-        }
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            Err(format!("deploy failed: {code} {body}"))
-        }
-        Err(e) => Err(format!("deploy failed: {e}")),
+    let body: serde_json::Value = serde_json::from_str(&resp.body)
+        .map_err(|e| format!("deploy response was not JSON: {e}"))?;
+    println!(
+        "deployed {} → {}\nmount it with: {{ \"path\": \"/my-service\", \"service\": {} }}",
+        name,
+        body.get("ref").and_then(|v| v.as_str()).unwrap_or("?"),
+        body.get("ref").map(|v| v.to_string()).unwrap_or_default(),
+    );
+    if body.get("validated") == Some(&serde_json::Value::Bool(false)) {
+        println!("note: the server skipped engine validation (built without wasm)");
     }
+    Ok(())
 }
