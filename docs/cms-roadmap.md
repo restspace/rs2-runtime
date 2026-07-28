@@ -125,7 +125,27 @@ was the one thing that did not work first time.
 (vocabulary table + the state model + the mount recipe) and in the rs2-skill
 `references/services.md`. Nothing else is owed by the runtime.
 
-Remaining: rs2-ui — publish/unpublish actions and the three-state badge.
+**UI half shipped 2026-07-28** (rs2-ui `e74c4c1`): a Status column in the List
+panel and Publish/Unpublish controls above the record form, feature-detected
+on `x-publish`. **Item 7 is done.**
+
+One constraint worth recording, because it shaped the implementation and is
+the obvious thing to "fix" later: the two surfaces derive state differently
+because the runtime gives them different material. The record editor compares
+**ETags** — exact, since a data ETag is a content hash. The list cannot:
+`dir+json` listing entries carry **no ETag**, so it projects the schema's
+declared fields from both mounts with `$select` and compares the projected
+objects. That is exact for every declared field but would miss a change
+confined to an *undeclared* one (closed schemas rule this out), and it costs a
+content-bearing listing fetch, so badges are suppressed above a cap rather
+than guessed.
+
+The exact fix is a small runtime change — **project the record ETag into
+listing entries** (as a `$select` pseudo-field, or unconditionally on data
+listings) — after which the list compares ETags like the editor does and the
+field projection goes away. Not worth doing until the approximation actually
+bites: the cost is a full record read per entry, which is free on the host
+fallback path but not on a native pushdown.
 
 Assumptions taken (revisit if wrong): assets live in a **single** media mount
 rather than getting their own draft/live split; **single-record** publish
@@ -239,11 +259,16 @@ service fed by the event hook from item 9.
 
 ## Suggested sequence
 
-**Preview/publish (7) is the whole of what is left on the CMS list.** Dropping
-revisions took the last big runtime investment off it: 7 is now two mounts, one
-pipeline, one documented schema annotation, and the rs2-ui actions — and item
-9's first stage falls out of it for free, since the publish pipeline is the
-event trigger. Do them together rather than tracking 9 separately.
+**The CMS list is done.** Item 7 — preview/publish — shipped 2026-07-28 across
+both repos, and it was the last item on it. The goal at the top of this page
+is met: a content editor gets a labelled collections rail, schema-derived list
+views, markdown/image/preview authoring, plain-language errors, and now
+draft/publish with derived state — with no CMS-specific config anywhere, only
+generic contracts a second client could implement.
+
+The one piece still worth doing on this theme is **item 9's event tee** on the
+publish pipeline — a few lines of tenant config, not code, and it needs a
+consumer (a cache purge, a rebuild, an indexer) before it means anything.
 
 Everything else on this page is either shipped or is not a CMS blocker:
 
