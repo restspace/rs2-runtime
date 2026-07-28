@@ -272,6 +272,7 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
             let mut facets = vec!["range", "confirm-delete", "move", "meta-sort"];
             if mount.config.get("defaultResource").is_some()
                 || mount.config.get("spaFallback").is_some()
+                || mount.config.get("spaFallbackAll").is_some()
             {
                 facets.push("static-site");
             }

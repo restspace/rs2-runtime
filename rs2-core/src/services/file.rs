@@ -131,6 +131,9 @@ struct SiteOptions {
     /// 200 (client-side routing); asset misses (paths with extensions)
     /// still 404.
     spa_fallback: bool,
+    /// Every miss — extension or not — serves the mount-root default
+    /// resource with 200. Implies `spa_fallback`.
+    spa_fallback_all: bool,
     /// Suppress dir+json listings (a public site shouldn't be browsable).
     listings: bool,
     /// Resolve extension-less URLs to a stored file (e.g. `/docs/readme` →
@@ -147,6 +150,7 @@ impl Default for SiteOptions {
         SiteOptions {
             default_resource: None,
             spa_fallback: false,
+            spa_fallback_all: false,
             listings: true,
             friendly_urls: false,
             extension_priority: Vec::new(),
@@ -158,12 +162,13 @@ impl SiteOptions {
     fn from_config(config: &serde_json::Value) -> SiteOptions {
         let cfg = serde_json::from_value::<crate::config_schema::FileConfig>(config.clone())
             .unwrap_or_default();
-        let default_resource = cfg
-            .default_resource
-            .or_else(|| cfg.spa_fallback.then(|| "index.html".to_string()));
+        let default_resource = cfg.default_resource.or_else(|| {
+            (cfg.spa_fallback || cfg.spa_fallback_all).then(|| "index.html".to_string())
+        });
         SiteOptions {
             default_resource,
             spa_fallback: cfg.spa_fallback,
+            spa_fallback_all: cfg.spa_fallback_all,
             listings: cfg.listings,
             friendly_urls: cfg.friendly_urls,
             extension_priority: cfg.extension_priority,
@@ -405,7 +410,7 @@ impl Service for FileService {
                             }
                             Err(e) if e.code != crate::error::codes::NOT_FOUND => return Err(e),
                             // No default doc here: SPA routes fall to the root.
-                            Err(_) if site.spa_fallback && path != "/" => {
+                            Err(_) if (site.spa_fallback || site.spa_fallback_all) && path != "/" => {
                                 let mut resp = self
                                     .serve_file(
                                         msg.response(StatusCode::OK, None),
@@ -478,11 +483,14 @@ impl Service for FileService {
                 if matches!(files.head(&path).await, Ok(m) if m.is_dir) {
                     return Ok(Self::slash_redirect(&msg));
                 }
-                if e.code == crate::error::codes::NOT_FOUND && is_extensionless(&path) {
+                if e.code == crate::error::codes::NOT_FOUND {
+                    let extensionless = is_extensionless(&path);
                     // Friendly URL: resolve `/docs/readme` to a stored
                     // `docs/readme.<ext>` (Accept-negotiated). A real file
-                    // beats the SPA shell, so try this first.
-                    if site.friendly_urls {
+                    // beats the SPA shell, so try this first. Only meaningful
+                    // for extension-less requests — an extensioned miss
+                    // can't be a friendly-URL stem.
+                    if extensionless && site.friendly_urls {
                         if let Some(real) = self
                             .resolve_friendly(
                                 &path,
@@ -508,10 +516,13 @@ impl Service for FileService {
                             return Ok(resp);
                         }
                     }
-                    // SPA fallback: an extension-less miss is a client-side
-                    // route — serve the root default with 200. Asset misses
-                    // (paths with extensions) stay honest 404s.
-                    if site.spa_fallback {
+                    // SPA fallback: `spaFallback` rescues an extension-less
+                    // miss only (a client-side route); asset misses (paths
+                    // with extensions) stay honest 404s. `spaFallbackAll`
+                    // rescues *every* miss, extension included — for a mount
+                    // that hosts nothing but one SPA build, where the app's
+                    // own router may reflect extensioned paths into the URL.
+                    if (extensionless && site.spa_fallback) || site.spa_fallback_all {
                         let default = site.default_resource.as_deref().unwrap_or("index.html");
                         return self
                             .serve_file(

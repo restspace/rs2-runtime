@@ -500,6 +500,62 @@ async fn file_static_site_mode() {
     );
 }
 
+/// `spaFallbackAll`: unlike plain `spaFallback` (extension-less misses only),
+/// every miss — including one that carries an extension, the way a bundled
+/// SPA's own client-side router can reflect an arbitrary path (with dots)
+/// into the browser URL — falls back to the app shell.
+#[tokio::test]
+async fn file_static_site_spa_fallback_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapters = Adapters::new(
+        Arc::new(LocalFsFileStore::new(dir.path())),
+        Arc::new(MemDataStore::new()),
+    );
+    let loader = Arc::new(StaticLoader(json!({ "mounts": [
+        { "path": "/admin", "service": "file", "config": {
+            "access": "open",
+            "spaFallbackAll": true, "listings": false } }
+    ]})));
+    let rt = Runtime::new(
+        Tenancy::Single {
+            tenant: "t1".into(),
+        },
+        adapters,
+        loader,
+        LimitTable::default(),
+    );
+
+    let put = req(Method::PUT, "/admin/index.html")
+        .with_body(Body::from_string("<html>app</html>", MediaType::new("text/html")));
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
+
+    // Extension-less miss: same behavior as plain spaFallback.
+    let route = rt.handle(req(Method::GET, "/admin/users/42")).await;
+    assert_eq!(route.status, Some(StatusCode::OK));
+
+    // A miss *with* an extension — e.g. rs2-ui's URL-as-path deep link
+    // `/admin/files/docs/readme.md` — also falls back, unlike plain
+    // spaFallback (which would 404 this).
+    let mut deep_link = rt.handle(req(Method::GET, "/admin/files/docs/readme.md")).await;
+    assert_eq!(deep_link.status, Some(StatusCode::OK));
+    let bytes = deep_link
+        .body
+        .as_mut()
+        .unwrap()
+        .materialize(65536)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"<html>app</html>");
+
+    // A real, existing asset still serves normally rather than being masked
+    // by the catch-all.
+    let put = req(Method::PUT, "/admin/assets/app.js")
+        .with_body(Body::from_string("boot()", MediaType::new("application/javascript")));
+    assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
+    let js = rt.handle(req(Method::GET, "/admin/assets/app.js")).await;
+    assert_eq!(js.status, Some(StatusCode::OK));
+}
+
 #[tokio::test]
 async fn tenant_storage_is_host_scoped() {
     let dir = tempfile::tempdir().unwrap();

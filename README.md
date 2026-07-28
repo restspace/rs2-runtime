@@ -151,13 +151,17 @@ Build `rs2-ui` and push it straight into a `file` mount running in
 no separate dev server, the runtime serves its own admin UI.
 
 1. Add a mount (write access gated to an admin role, so anyone can read the
-   UI but only an operator can redeploy it):
+   UI but only an operator can redeploy it). Use `spaFallbackAll`, not plain
+   `spaFallback`: rs2-ui deep-links the selected item's path verbatim into the
+   browser URL (`/admin/files/docs/readme.md` — see rs2-ui's own README,
+   "URL-as-path routing"), extension included, and this mount serves nothing
+   but that one SPA build — so every miss, not just extension-less ones,
+   should fall back to the shell (4.3):
 
    ```json
    { "path": "/admin", "service": "file",
      "config": {
-       "defaultResource": "index.html",
-       "spaFallback": true,
+       "spaFallbackAll": true,
        "listings": false,
        "access": { "read": "all", "write": "A" }
      } }
@@ -179,20 +183,10 @@ no separate dev server, the runtime serves its own admin UI.
    file's content type, and PUTs it under `<path>`, preserving the tree — the
    bulk-upload counterpart to single-file `rs2 send --file`.
 
-3. Visit `http://localhost:3100/admin/`.
-
-**Known gap:** rs2-ui deep-links the selected item's path verbatim into the
-browser URL (e.g. `/admin/files/docs/readme.md` — see rs2-ui's own README,
-"URL-as-path routing"), and relies on the static host rewriting *any*
-unmatched sub-path to `index.html`. RS2's `spaFallback` only rescues
-**extension-less** misses (`/admin/users/42` → shell), by design — a miss
-*with* an extension stays a `404` so a genuinely-missing asset doesn't
-masquerade as the app (4.3). That means a hard refresh or shared link on a
-deep rs2-ui path with an extension will `404` instead of reloading the shell.
-Navigating within the UI is unaffected (client-side routing); only direct
-navigation/refresh on such a link breaks. There's no config workaround today —
-treat direct deep-links as best-effort until the file service grows an
-"always fall back" mode for mounts fully dedicated to one SPA.
+3. Visit `http://localhost:3100/admin/`. Deep links and hard refreshes into
+   rs2-ui's own routes (`/admin/files/docs/readme.md`) now resolve correctly —
+   `spaFallbackAll` falls back to the shell even though the path carries an
+   extension.
 
 ## Repo layout
 

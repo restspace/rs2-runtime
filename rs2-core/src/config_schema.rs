@@ -175,6 +175,16 @@ pub struct FileConfig {
     pub default_resource: Option<String>,
     /// Extension-less misses serve the root default resource (SPA routing).
     pub spa_fallback: bool,
+    /// Like `spaFallback`, but **every** miss falls back to the root default
+    /// resource, including paths with an extension (`/users/42/report.pdf`).
+    /// Implies `spaFallback`. For a mount that hosts nothing but one SPA
+    /// build (e.g. a bundled admin UI) whose client-side router reflects
+    /// arbitrary paths — including ones with dots — into the browser URL, so
+    /// a genuinely missing asset can't be told apart from a client route by
+    /// path shape alone. Don't set this on a mount that also serves real,
+    /// independently-fetchable assets: a typo'd asset URL silently 200s with
+    /// the app shell instead of 404ing. Default `false`.
+    pub spa_fallback_all: bool,
     /// Whether directory GETs return `dir+json` listings (default `true`).
     pub listings: bool,
     /// Serve files at extension-less "friendly" URLs (e.g. `/docs/readme`
@@ -196,6 +206,7 @@ impl Default for FileConfig {
         FileConfig {
             default_resource: None,
             spa_fallback: false,
+            spa_fallback_all: false,
             listings: true,
             friendly_urls: false,
             extension_priority: Vec::new(),
