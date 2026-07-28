@@ -117,17 +117,51 @@ rather than getting their own draft/live split; **single-record** publish
 first, bulk publish over a listing (via `split`) deferred; publishing a record
 that links to unpublished records is **not** warned about in v1.
 
-### 8. Media: multipart upload + image transforms (runtime)
-
-Multipart form parsing is explicitly out of scope in v1 and there are no
-resize/thumbnail transforms anywhere. A resize-on-query-param image service
-(cached, decorating a file mount) unlocks thumbnails for the asset library
-(item 4) and responsive images for templates.
+### 8. Media: image transforms (done) + multipart upload (not a CMS blocker)
 
 **Transforms shipped 2026-07-26** as a sandboxed Wasm component rather than a
 built-in (`guest-services/image` + the `store` grant and `x-rs2-body-ref`
 splice in `services/code.rs`) — the runtime stays image-free; tenants mount
-`code:image@<v>` decorating their media mount. Multipart upload remains open.
+`code:image@<v>` decorating their media mount. That was the half that mattered
+here: it unlocks thumbnails for the asset library (item 4) and responsive
+images for templates.
+
+**Multipart upload is still open, but it does not block the asset library** —
+the original survey assumed it did. rs2-ui already uploads: `putResource` PUTs
+a body with a content type, and the keyless POST → 201 + Location path is
+annotated "Used for file upload" (`rs2-client.ts:454`). A `fetch` client never
+needs multipart. So this is an **integration/compat** item, not a CMS one, and
+nothing on the CMS list waits for it.
+
+What it does enable: plain HTML forms with file inputs (no-JS pages posting
+straight at a mount); **inbound webhooks that post multipart** — Mailgun
+inbound email routes, Twilio media, hosted form services, all currently
+unreceivable, which is the sharpest gap; batch upload as one request; and
+proxying multipart onward to an external API.
+
+Design notes for whenever it is picked up. The slot is already reserved: the
+`Splitter` enum has one variant, `JsonSplit` (`spec.rs:44`), and the DSL
+rejects `"multipart"` with "not yet supported" (`dsl.rs:48`) — so the intended
+home is a **pipeline splitter** (multipart body → one message per part, the
+remaining steps run per part). Two parts are not mechanical:
+
+- **Part names are not addressable.** `interpolation_context`
+  (`executor.rs:1096`) builds from query params, JSON-*object* body fields, and
+  captured vars only. `jsonSplit` gets away with that because its elements are
+  JSON objects whose fields become interpolable; a binary part contributes
+  nothing, so `PUT /media/${filename}` will not resolve. Seed part metadata
+  (filename, field name, content type) into the element's vars. Not optional —
+  without it the splitter is useless.
+- **Split means parallel fan-out, but a multipart stream cannot be seeked.**
+  Either materialize the whole upload (bounded by `materialize_cap`, 100MB) and
+  reuse the existing fan-out, or build a new sequential-streaming shape. Do the
+  first and document the cap; the second is what large-media uploads would
+  eventually want.
+
+Then the safety work: part-count cap (`max_fanout` exists), per-part and total
+size limits, and filename sanitization defanged at the store key boundary —
+`filename="../../etc/x"` must never be trusted from the wire. The JS sandbox
+(8.3) lists binary multipart as unsupported too; leave that as is.
 
 ### 9. Change events / webhooks — tee off publish, not off writes
 
@@ -190,13 +224,20 @@ service fed by the event hook from item 9.
 
 ## Suggested sequence
 
-Preview/publish (7) next. Dropping revisions took the last big runtime
-investment off the list: it is now two mounts, one pipeline, one documented
-schema annotation, and the rs2-ui actions — and item 9's first stage falls out
-of it for free, since the publish pipeline is the event trigger. Do them
-together rather than tracking 9 separately.
+**Preview/publish (7) is the whole of what is left on the CMS list.** Dropping
+revisions took the last big runtime investment off it: 7 is now two mounts, one
+pipeline, one documented schema annotation, and the rs2-ui actions — and item
+9's first stage falls out of it for free, since the publish pipeline is the
+event trigger. Do them together rather than tracking 9 separately.
 
-That leaves **multipart upload** (the open half of 8) as the only substantial
-runtime work outstanding, followed by stage 2 content projection. The
-`Runtime::dispatch` write-event hook and full-text search (10) stay parked
-until something actually demands durable, unbypassable events.
+Everything else on this page is either shipped or is not a CMS blocker:
+
+- **Multipart upload** (8) is integration/compat work, not CMS — the asset
+  library already uploads without it. Sequence it against inbound-webhook
+  demand, not against this list.
+- **Stage 2 content projection** matters only for file-backed collections;
+  data-backed ones already have real columns.
+- The **`Runtime::dispatch` write-event hook** and **full-text search** (10)
+  stay parked until something actually demands durable, unbypassable events.
+
+So: ship 7 (+9), and the CMS-usability goal at the top of this page is met.
