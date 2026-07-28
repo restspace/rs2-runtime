@@ -20,9 +20,15 @@ serve adjacent audiences.
 
 ## The operator skill
 
-The `rs2-skill` repo is the **user-facing skill** — a concise operational reference
+[`rs2-skill`](https://github.com/restspace/rs2-skill) is the **user-facing skill** — a concise operational reference
 for driving a running RS2 server. It covers the same surface as this manual in
-terse, lookup-oriented form:
+terse, lookup-oriented form. Install it for Claude Code or Codex:
+
+```powershell
+git clone https://github.com/restspace/rs2-skill.git
+cd rs2-skill
+.\deploy.ps1
+```
 
 | Reference | Topic |
 | --- | --- |

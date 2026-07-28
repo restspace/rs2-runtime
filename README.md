@@ -188,6 +188,25 @@ no separate dev server, the runtime serves its own admin UI.
    `spaFallbackAll` falls back to the shell even though the path carries an
    extension.
 
+## Claude / Codex skill
+
+[`rs2-skill`](https://github.com/restspace/rs2-skill) is the user-facing
+agent skill — terse, lookup-oriented reference docs for driving a *running*
+RS2 server (discovery, auth, pipelines, custom services, the `rs2` CLI, v1
+migration). It's how an agent operates a tenant without re-deriving the HTTP
+surface each session; the [User Manual](docs/manual/README.md) above is for
+learning the concepts first.
+
+```powershell
+git clone https://github.com/restspace/rs2-skill.git
+cd rs2-skill
+.\deploy.ps1
+```
+
+Copies the skill into `~\.claude\skills\rs2` and `~\.codex\skills\rs2`. See
+the [rs2-skill README](https://github.com/restspace/rs2-skill#readme) for
+details.
+
 ## Repo layout
 
 ```
