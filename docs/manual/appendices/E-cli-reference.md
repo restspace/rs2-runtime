@@ -17,6 +17,7 @@ commands. Run it as the installed `rs2` binary or
 | `rs2 migrate <services.json> [-o tenant.json]` | Convert a v1 Restspace config to an RS2 tenant config (Part 11) |
 | `rs2 login [--host <url>] [--email <e>] [--password <p>]` | Log in through `/auth/login` and save the token, expiry, and issuing host to `rsconfig.json` |
 | `rs2 send <path> --file <local> [--content-type <ct>]` | PUT one local file to the configured host; content type is inferred when omitted; uses a saved valid token when present |
+| `rs2 send <path> --dir <local-dir>` | Recursively PUT every file under `<local-dir>` to `<path>`, preserving the tree (e.g. a Vite `dist/` into a static-site mount — see 4.3); content type is inferred per file; stops at the first failed upload |
 | `rs2 service add <mount.json> [--path <p>]` | ETag-safe read/append/write of one new mount; refuses an occupied path |
 | `rs2 service set-access <path> --access <json> [--set k=v]…` | ETag-safe update of an existing mount's access and optional config keys |
 | `rs2 auth init --admin-email <e> [options]` | One-shot auth bootstrap on a fresh open node: enable auth, create/login first admin, lock user store and services mount |
@@ -85,7 +86,9 @@ rs2 send /notes/welcome.txt --file .\welcome.txt
 
 For a multi-file/versioned config change, use `rs2 pull`, edit the local `rs2/`
 mirror, inspect `rs2 push --dry-run`, then push. The mirror contains config,
-specs, and code pins — not data, site assets, or bundle bytes.
+specs, and code pins — not data, site assets, or bundle bytes. For site
+assets in bulk (a built SPA, a docs site), use `rs2 send <path> --dir <dir>`
+instead (§4.3).
 
 **Migrate from v1:**
 

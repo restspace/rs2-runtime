@@ -94,6 +94,87 @@ pub fn send(server_path: &str, file: &str, content_type: Option<&str>) -> Result
     Ok(())
 }
 
+/// `rs2 send --dir` — recursively PUT every file under a local directory to
+/// `server_path`, preserving the tree (e.g. a Vite `dist/` for a static-site
+/// mount). Stops at the first failed upload, leaving earlier files in place.
+pub fn send_dir(server_path: &str, dir: &str) -> Result<(), String> {
+    let root = std::path::Path::new(dir);
+    if !root.is_dir() {
+        return Err(format!("{dir} is not a directory"));
+    }
+
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files)?;
+    files.sort();
+    if files.is_empty() {
+        return Err(format!("{dir} has no files to upload"));
+    }
+
+    let loaded = config::load()?;
+    let host = config::resolve_host(None, &loaded.config)?;
+    let token = config::token_if_valid(&loaded.config, &host);
+    let had_token = token.is_some();
+    let client = Client::new(host, token);
+    let base = server_path.trim_end_matches('/');
+
+    let mut total_bytes = 0usize;
+    for rel in &files {
+        let local = root.join(rel);
+        let bytes = std::fs::read(&local).map_err(|e| format!("cannot read {}: {e}", local.display()))?;
+        let content_type = mime_guess::from_path(&local)
+            .first_raw()
+            .unwrap_or("application/octet-stream");
+        let dest = format!("{base}/{rel}");
+        let resp = client.put(&dest, content_type, &bytes, None)?;
+        match resp.status {
+            200 | 201 => {
+                total_bytes += bytes.len();
+                println!("  {dest} ({} bytes, {content_type})", bytes.len());
+            }
+            _ => {
+                return Err(format!(
+                    "upload of {dest} failed: {}{}",
+                    resp.error_detail(),
+                    login_hint(resp.status, had_token)
+                ))
+            }
+        }
+    }
+    println!(
+        "uploaded {} file(s) ({total_bytes} bytes total) to {base}",
+        files.len()
+    );
+    Ok(())
+}
+
+/// Recursively collect every regular file under `dir`, relative to `root`,
+/// with forward-slash separators regardless of platform.
+fn collect_files(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, out)?;
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
 /// `rs2 service add` — read a mount spec from a JSON file and append it to the
 /// tenant config via the self-config API, failing if a mount already occupies
 /// the target path.

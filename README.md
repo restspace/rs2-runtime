@@ -100,15 +100,16 @@ cargo build --release -p rs2-server --features wasm,js
 ## Quick start
 
 ```bash
-cargo run -p rs2-server -- serverConfig.json
+cp tenants/main.example.json tenants/main.json
+cargo run -p rs2-server --features wasm,js -- serverConfig.json
 ```
 
 `serverConfig.json` sets the listener, tenancy mode, and data root; tenant
-configs live in `tenants/<name>.json`. Copy the shipped example to the path the
-default `serverConfig.json` expects — `cp tenants/main.example.json
-tenants/main.json` — and edit from there. Your `tenants/main.json` is gitignored:
-once you enable auth it holds a real `auth.jwtSecret`, which does not belong in
-version control. Then:
+configs live in `tenants/<name>.json`, starting from the copy above. Your
+`tenants/main.json` is gitignored: once you enable auth it holds a real
+`auth.jwtSecret`, which does not belong in version control. Build with
+`--features wasm,js` from the start — without them, mounts backed by custom
+Wasm/JS code 501 with `engine_unavailable` instead of running. Then:
 
 ```bash
 curl -X PUT localhost:3100/files/notes/hello.txt -d 'hi'
@@ -123,6 +124,75 @@ production operation, written for anyone comfortable with HTTP and JSON (no
 Rust required). The `rs2` CLI (`rs2 new / dev / test / deploy / migrate`)
 covers the developer loop, including migration from a Restspace v1
 `services.json`.
+
+## UI
+
+[`rs2-ui`](https://github.com/restspace/rs2-ui) is the admin/explorer UI —
+a separate Vite+React checkout that talks to a running RS2 server. With the
+server up from Quick start:
+
+```bash
+cd ../rs2-ui
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Leave `VITE_RS2_API` empty in `.env` for local dev: Vite's dev-server proxy
+forwards `/__rs2` to `127.0.0.1:3100` same-origin, so there's no CORS
+configuration to do. For a self-contained node with no separate dev server,
+see [Bundling the UI into a static-site mount](#bundling-the-ui-into-a-static-site-mount)
+below.
+
+## Bundling the UI into a static-site mount
+
+Build `rs2-ui` and push it straight into a `file` mount running in
+[static-site mode](docs/manual/part-4-storing-files-and-data/4.3-static-site-and-spa.md) —
+no separate dev server, the runtime serves its own admin UI.
+
+1. Add a mount (write access gated to an admin role, so anyone can read the
+   UI but only an operator can redeploy it):
+
+   ```json
+   { "path": "/admin", "service": "file",
+     "config": {
+       "defaultResource": "index.html",
+       "spaFallback": true,
+       "listings": false,
+       "access": { "read": "all", "write": "A" }
+     } }
+   ```
+
+   `rs2 service add admin.mount.json --path /admin` adds this over HTTP and
+   hot-reloads it instead of hand-editing `tenants/main.json`.
+
+2. Build under that sub-path and upload the output in one shot:
+
+   ```bash
+   cd ../rs2-ui
+   VITE_BASE_PATH=/admin npm run build
+   rs2 login --email you@example.com   # skip if the mount's write access is "all"
+   rs2 send /admin --dir dist
+   ```
+
+   `rs2 send <path> --dir <local-dir>` walks the directory, infers each
+   file's content type, and PUTs it under `<path>`, preserving the tree — the
+   bulk-upload counterpart to single-file `rs2 send --file`.
+
+3. Visit `http://localhost:3100/admin/`.
+
+**Known gap:** rs2-ui deep-links the selected item's path verbatim into the
+browser URL (e.g. `/admin/files/docs/readme.md` — see rs2-ui's own README,
+"URL-as-path routing"), and relies on the static host rewriting *any*
+unmatched sub-path to `index.html`. RS2's `spaFallback` only rescues
+**extension-less** misses (`/admin/users/42` → shell), by design — a miss
+*with* an extension stays a `404` so a genuinely-missing asset doesn't
+masquerade as the app (4.3). That means a hard refresh or shared link on a
+deep rs2-ui path with an extension will `404` instead of reloading the shell.
+Navigating within the UI is unaffected (client-side routing); only direct
+navigation/refresh on such a link breaks. There's no config workaround today —
+treat direct deep-links as best-effort until the file service grows an
+"always fall back" mode for mounts fully dedicated to one SPA.
 
 ## Repo layout
 

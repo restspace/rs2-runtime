@@ -96,14 +96,22 @@ enum Command {
         #[arg(long)]
         password: Option<String>,
     },
-    /// Send a local file to a path on the server (PUT).
+    /// Send a local file, or a whole directory tree, to a path on the server
+    /// (PUT). Exactly one of `--file` / `--dir` is required.
     Send {
-        /// Destination path on the server, e.g. `/files/report.pdf`.
+        /// Destination path on the server, e.g. `/files/report.pdf` or
+        /// `/admin` (the mount root a `--dir` upload is written under).
         path: String,
         /// Local file to upload.
         #[arg(long)]
-        file: String,
-        /// Content-Type (else inferred from the file extension).
+        file: Option<String>,
+        /// Local directory to upload recursively; each file lands at `path`
+        /// joined with its path relative to `dir`. Use for a static-site
+        /// bundle, e.g. `rs2 send /admin --dir rs2-ui/dist`.
+        #[arg(long)]
+        dir: Option<String>,
+        /// Content-Type for a `--file` upload (else inferred from the
+        /// extension); ignored for `--dir`, where each file is inferred.
         #[arg(long)]
         content_type: Option<String>,
     },
@@ -300,8 +308,14 @@ fn dispatch(command: Command) -> Result<(), String> {
         Command::Send {
             path,
             file,
+            dir,
             content_type,
-        } => commands::send(&path, &file, content_type.as_deref()),
+        } => match (file, dir) {
+            (Some(file), None) => commands::send(&path, &file, content_type.as_deref()),
+            (None, Some(dir)) => commands::send_dir(&path, &dir),
+            (Some(_), Some(_)) => Err("pass only one of --file / --dir, not both".to_string()),
+            (None, None) => Err("pass one of --file <path> or --dir <path>".to_string()),
+        },
         Command::Service { action } => match action {
             ServiceCommand::Add { file, path } => commands::service_add(&file, path.as_deref()),
             ServiceCommand::SetAccess { path, access, set } => {
