@@ -86,10 +86,14 @@ The shape:
   the public site and templates. Give it `"x-expose": []` so it does not appear
   as a second collection (`discovery.rs:142` — a mount *without* `x-expose`
   shows on every surface, so the twin needs the explicit opt-out).
-- `/publish` — a pipeline mount with `elevate: "publisher"` running
+- `/publish` — a **`wrapper`** mount (one fixed flow, so config not a stored
+  spec — 7.10) with `elevate: "publisher"`, running
   `GET /content${url.rest}` → `PUT /content-live${url.rest}`. Editors publish
   without ever holding write access on live (the gateway pattern, 7.3).
-  Unpublish is the same flow with DELETE.
+  Unpublish is the same flow with DELETE. **Open `delete` alongside `invoke`**
+  on it: access is gated by verb (`action_for`, `wrapper/mod.rs:407`), so
+  `DELETE` needs the `delete` key, which otherwise defaults to `write` — with
+  only `invoke` opened every unpublish is a 401.
 
 **Publish state comes free from the ETag.** `record_etag` (`data.rs:103`) is a
 content hash of the record, not a counter, so draft ETag == live ETag means
@@ -108,9 +112,20 @@ feature-detected. Keeping it on the schema (not in tenant config) keeps it a
 generic contract: an agent on the agent surface can publish too, not just
 rs2-ui.
 
-Work: runtime — document `x-publish` in manual 4.8 and the rs2-skill
-references; that is the whole runtime half. rs2-ui — publish/unpublish actions
-and the three-state badge.
+**Verified end-to-end 2026-07-28** on a throwaway node against the mounts
+above: schema enforced on the draft (422); anonymous direct write to the live
+twin refused (401) while `POST /publish/...` succeeded through `elevate`;
+ETags identical after publish, divergent after a draft edit, identical again
+after re-publish; `DELETE /publish/...` removed the live record (204) and left
+the draft intact; and `?surface=editor` pruned the twin from the catalogue
+while the unfiltered catalogue still listed it. The `delete`-access trap above
+was the one thing that did not work first time.
+
+**Runtime half shipped 2026-07-28**: `x-publish` documented in manual 4.8
+(vocabulary table + the state model + the mount recipe) and in the rs2-skill
+`references/services.md`. Nothing else is owed by the runtime.
+
+Remaining: rs2-ui — publish/unpublish actions and the three-state badge.
 
 Assumptions taken (revisit if wrong): assets live in a **single** media mount
 rather than getting their own draft/live split; **single-record** publish
