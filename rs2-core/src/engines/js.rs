@@ -154,6 +154,14 @@ const COMPAT_PRELUDE: &str = include_str!("js_prelude.js");
 /// fails if the committed blob is stale relative to the prelude source.
 static PRELUDE_SNAPSHOT: &[u8] = include_bytes!("js_prelude.snapshot.bin");
 
+/// Whether per-isolate startup boots from [`PRELUDE_SNAPSHOT`]. **Off on every
+/// platform** — deserializing a custom snapshot while another isolate is alive
+/// in the process aborts V8; see [`build_runtime`] for the measurements. Kept
+/// as a named switch (rather than deleting the snapshot machinery) so the
+/// deno_core upgrade can flip it back and re-run
+/// `tests/js_isolate_overlap.rs`.
+const USE_PRELUDE_SNAPSHOT: bool = false;
+
 /// Build the prelude startup snapshot. Called only by the `gen-js-snapshot`
 /// example — **never** from the serving process, which inits V8 in normal mode
 /// (deno_core asserts a single V8 init mode per process). Returns the raw blob
@@ -1440,18 +1448,33 @@ pub(crate) async fn build_runtime(
     // already baked into the isolate's heap; otherwise they run from source
     // (identical result, ~10ms slower per isolate creation).
     //
-    // Windows-only for now: on Linux, creating isolates from a custom snapshot
-    // intermittently aborts inside V8's `SharedHeapDeserializer` /
-    // `ReadReadOnlyHeapRef` (hardened-libc++ vector[] OOB) whenever other
-    // threads are active in the process — ~20% of parallel npm_compat runs.
-    // Reproduced with blobs generated on both Windows and Linux, with isolate
-    // creation fully serialized behind a mutex, and with a never-dropped
-    // anchor isolate pinning the shared read-only heap — so it is not a
-    // first-init race the host can guard against. Suspected upstream
+    // The snapshot is **disabled on every platform** (`USE_PRELUDE_SNAPSHOT`).
+    // Booting an isolate from a custom snapshot *while another isolate is alive
+    // in the process* aborts inside V8's `SharedHeapDeserializer` /
+    // `ReadReadOnlyHeapRef` (hardened-libc++ `vector[]` OOB → `0xC0000409` /
+    // SIGILL). It is a fastfail, not a catchable error: the whole process dies
+    // with no unwind and no response.
+    //
+    // Linux was disabled first; Windows was assumed safe and is not — measured
+    // 72/252 aborted runs (16–43%) with the snapshot on and isolates
+    // overlapping, against 0/192 with either the snapshot off or isolate
+    // lifetimes strictly serialized (`--test-threads=1`).
+    //
+    // Overlap is the trigger, not concurrent *creation* and not load: it
+    // reproduces with creation serialized behind a mutex, and a never-dropped
+    // anchor isolate makes it worse rather than better (that anchor guarantees
+    // the overlap). Both JS paths overlap in normal operation — `invoke` builds
+    // an isolate per invocation, so two concurrent requests suffice, and a
+    // resident adapter (`engines::resident`) keeps one alive for the life of
+    // the process, so *every* invocation overlaps it.
+    //
+    // Cost of running the prelude from source instead: ~10ms per isolate
+    // creation, which is what Linux has always paid. Suspected upstream
     // deno_core/rusty_v8 bug (family of denoland/deno#15590, which deno_core
-    // mutexes on Windows only); revisit at the planned deno_core upgrade
-    // (G13 Phase 2).
-    let snapshot = (cfg!(windows) && !PRELUDE_SNAPSHOT.is_empty()).then_some(PRELUDE_SNAPSHOT);
+    // mutexes on Windows only); re-test at the deno_core upgrade (G13 Phase 2)
+    // by flipping `USE_PRELUDE_SNAPSHOT` and running
+    // `tests/js_isolate_overlap.rs`.
+    let snapshot = (USE_PRELUDE_SNAPSHOT && !PRELUDE_SNAPSHOT.is_empty()).then_some(PRELUDE_SNAPSHOT);
     let create = v8::CreateParams::default().heap_limits(0, limits.memory_bytes as usize);
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![rs2_host::init()],

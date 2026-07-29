@@ -235,13 +235,17 @@ behind the same `Engine` trait).
   `application/javascript` stores the bundle (compile smoke test when the
   engine is in the build); `code:` mounts dispatch by bundle type, so wasm
   and JS services share grants, limits, and the host contract.
-- **Startup snapshot**: per-invocation isolates boot from a committed V8
-  snapshot with the bootstrap + compat prelude baked in — currently
-  **Windows-only**; on Linux custom-snapshot isolate creation intermittently
-  aborts inside V8's shared-heap deserializer (upstream deno_core/rusty_v8
-  bug, family of denoland/deno#15590 — full investigation in commit
-  `dbd6857`), so Linux runs the identical-semantics source-eval fallback
-  (~10 ms per isolate creation). Revisit at the deno_core upgrade.
+- **Startup snapshot**: a committed V8 snapshot with the bootstrap + compat
+  prelude baked in exists and is kept current, but is **disabled on every
+  platform** (`USE_PRELUDE_SNAPSHOT`). Booting an isolate from it while another
+  isolate is alive in the process aborts inside V8's shared-heap deserializer
+  and fastfails the whole process (upstream deno_core/rusty_v8 bug, family of
+  denoland/deno#15590). Linux was disabled first; Windows was assumed safe and
+  is not — measured 16–43% of runs with isolates overlapping, which both the
+  per-invocation and resident-adapter paths do in normal operation. All
+  platforms run the identical-semantics source-eval fallback (~10 ms per
+  isolate creation). `tests/js_isolate_overlap.rs` guards the re-enable at the
+  deno_core upgrade.
 
 ## npm-compat layer (G5)
 

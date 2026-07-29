@@ -47,17 +47,36 @@ telemetry that may be discarded.
 - Sandbox `console.*` and the WIT `log()` both route to `HostApi::log`; the JS
   prelude (`engines/js_prelude.js`) maps `console.log/info→info`, `warn→warn`,
   `error→error`, `debug→debug`.
-- **Editing the bootstrap or `js_prelude.js` means regenerating the prelude
-  snapshot.** `build_runtime` boots each per-request isolate from a committed V8
-  startup snapshot (`engines/js_prelude.snapshot.bin`) so it skips recompiling
-  ~500 lines of prelude (~4× faster per invocation). The blob is a pure
-  optimization — an empty blob falls back to running the prelude from source —
-  but a stale blob bakes the *old* prelude and silently ignores your edit.
-  `tests/prelude_snapshot.rs` fails on drift; fix with
+- **The prelude startup snapshot is OFF on every platform, and must stay off
+  until deno_core is upgraded.** Booting an isolate from a custom V8 startup
+  snapshot *while another isolate is alive in the process* aborts inside V8's
+  `SharedHeapDeserializer` (hardened-libc++ `vector[]` OOB). It is a **fastfail
+  — the whole process dies** with no unwind and no response (`0xC0000409` on
+  Windows, SIGILL on Linux). Measured 72/252 aborted runs (16–43%) with the
+  snapshot on and isolates overlapping; 0/192 with it off, or with isolate
+  lifetimes serialized.
+  - **Overlap is the trigger** — not concurrent *creation*, not load. It
+    reproduces with creation behind a mutex, and a never-dropped anchor isolate
+    makes it *worse* (that anchor guarantees the overlap).
+  - **Both JS paths overlap in normal operation**: `invoke` builds an isolate
+    per invocation (two concurrent requests suffice), and `engines::resident`
+    keeps one alive for the life of the process, so on a node with a loadable
+    adapter mounted *every* invocation overlaps it.
+  - This was believed Windows-safe and was not — do not re-enable per-platform.
+    Flip `USE_PRELUDE_SNAPSHOT` in `engines/js.rs` only together with a
+    deno_core upgrade, and prove it with `tests/js_isolate_overlap.rs` under
+    repeated parallel runs (a clean pass is the signal — the failure mode is a
+    process abort, not a failed assertion).
+- **Editing the bootstrap or `js_prelude.js` still means regenerating the
+  prelude snapshot.** The blob (`engines/js_prelude.snapshot.bin`) is kept
+  current for the eventual re-enable, and `tests/prelude_snapshot.rs` fails on
+  drift; fix with
   `cargo run -p rs2-core --example gen-js-snapshot --features js`, then commit
   the regenerated `.bin` + `.hash`. The snapshot can't be built in the serving
   process (V8 inits in snapshot *or* normal mode per process, not both), which is
-  why generation is a separate example, not automatic.
+  why generation is a separate example, not automatic. When it is re-enabled it
+  skips recompiling ~500 lines of prelude (~4× faster per invocation); running
+  from source costs ~10 ms per isolate creation.
 
 ## Smaller traps
 
