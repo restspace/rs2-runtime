@@ -186,6 +186,12 @@ pub struct FileConfig {
     /// the app shell instead of 404ing. Default `false`.
     pub spa_fallback_all: bool,
     /// Whether directory GETs return `dir+json` listings (default `true`).
+    /// `false` conceals the mount's inventory from the public — it is not an
+    /// authorization boundary (files stay readable by name under
+    /// `access.read`), so tenant **operators** (`operatorRoles`) still get the
+    /// listing on a deliberate `Accept: application/vnd.rs2.dir+json`: they can
+    /// toggle this flag anyway, and the CLI/agent view of a mount shouldn't be
+    /// hidden from its owner. Operator-only listings are `no-store`.
     pub listings: bool,
     /// Serve files at extension-less "friendly" URLs (e.g. `/docs/readme`
     /// resolves `docs/readme.md`). Exact matches still win; on a stem

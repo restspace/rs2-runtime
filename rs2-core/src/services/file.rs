@@ -135,6 +135,8 @@ struct SiteOptions {
     /// resource with 200. Implies `spa_fallback`.
     spa_fallback_all: bool,
     /// Suppress dir+json listings (a public site shouldn't be browsable).
+    /// Concealment, not authorization: tenant operators still see the listing,
+    /// since they can toggle this flag anyway.
     listings: bool,
     /// Resolve extension-less URLs to a stored file (e.g. `/docs/readme` →
     /// `docs/readme.md`), choosing among collisions by `Accept` negotiation.
@@ -387,8 +389,9 @@ impl Service for FileService {
                 // `*/*`) and humans keep getting the default doc. The `listings`
                 // gate below still applies: an explicit request can surface a
                 // listing the default resource hides, but it cannot override
-                // `listings: false`. The representation served at a directory
-                // URL now depends on `Accept`, so every branch sets `Vary`.
+                // `listings: false` for anyone but an operator. The
+                // representation served at a directory URL now depends on
+                // `Accept`, so every branch sets `Vary`.
                 let force_listing = wants_dir_listing(accept.as_deref());
 
                 // Static-site mode: directories serve the default resource.
@@ -427,9 +430,26 @@ impl Service for FileService {
                         }
                     }
                 }
-                if !site.listings {
+                // `listings: false` conceals the inventory from the public; it
+                // is not an authorization boundary (every file stays readable
+                // by name under `access.read`). An **operator** can flip the
+                // flag in tenant config at will, so withholding the listing
+                // from them protects nothing and costs them the CLI/agent view
+                // of their own mount. The gate runs *after* the
+                // `default_resource` branch, so an operator browsing the site
+                // still gets the default doc — only a deliberate
+                // `Accept: dir+json` surfaces the listing.
+                if !site.listings
+                    && !crate::wrapper::is_operator(
+                        msg.principal.as_ref(),
+                        ctx.operator_roles.as_deref().unwrap_or(""),
+                    )
+                {
                     return Err(RsError::not_found(format!("'{path}' does not exist")));
                 }
+                // Past the gate with `listings: false` ⇒ this listing exists
+                // only because the caller is an operator.
+                let operator_only = !site.listings;
                 let (take, skip) = pagination(&msg);
                 // Metadata sort (the `meta-sort` facet): order by what the
                 // listing already knows (@name/@size/@lastModified/
@@ -459,6 +479,18 @@ impl Service for FileService {
                 )));
                 resp.set_header("x-total-count", &total.to_string());
                 resp.set_header("vary", "accept");
+                if operator_only {
+                    // This representation is principal-dependent: the same URL
+                    // and `Accept` 404s for everyone else. A `listings: false`
+                    // static site is exactly the mount most likely to run
+                    // `caching: {public: true}` (it's anonymously readable), so
+                    // without this a shared cache would store the operator's
+                    // listing and serve the public the inventory the flag
+                    // hides. Set explicitly — the host cache policy leaves a
+                    // response's own `Cache-Control` alone.
+                    resp.set_header("cache-control", "no-store");
+                    crate::wrapper::append_header_value(&mut resp, "vary", "authorization, cookie");
+                }
                 Ok(resp)
             }
             Method::GET => {
