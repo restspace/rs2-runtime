@@ -22,6 +22,10 @@ impl UreqHttpOut {
         UreqHttpOut {
             agent: ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(30))
+                // The workspace-wide trust roots rather than `ureq`'s built-in
+                // Mozilla bundle, so a service granted `httpOut` to an internal
+                // host can reach one fronted by the operator's own CA.
+                .tls_config(crate::tls::client_config())
                 .build(),
         }
     }
@@ -73,12 +77,13 @@ impl HttpOut for UreqHttpOut {
                 // Status errors still carry a response to surface.
                 Err(ureq::Error::Status(_, resp)) => resp,
                 Err(e) => {
-                    let mut err = RsError::new(
-                        502,
-                        crate::error::codes::INTERNAL,
-                        "Upstream Error",
-                        e.to_string(),
-                    );
+                    let mut detail = e.to_string();
+                    if crate::tls::is_certificate_error(&detail) {
+                        detail.push_str(" — ");
+                        detail.push_str(&crate::tls::unknown_issuer_help());
+                    }
+                    let mut err =
+                        RsError::new(502, crate::error::codes::INTERNAL, "Upstream Error", detail);
                     err.retryable = true;
                     return Err(err);
                 }

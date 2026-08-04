@@ -22,6 +22,11 @@ pub struct RsConfig {
     /// The session minted by `login`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
+    /// PEM file of extra certificate authorities to trust when talking to
+    /// `host` — so a repo pointed at a server behind a private CA carries that
+    /// with its server identity, as it already carries the host and the token.
+    #[serde(default, rename = "caFile", skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -99,6 +104,21 @@ pub fn save(path: &Path, config: &RsConfig) -> Result<(), String> {
     let text = serde_json::to_string_pretty(config)
         .map_err(|e| format!("cannot serialize config: {e}"))?;
     std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// The `caFile` from the discovered `rsconfig.json`, resolved against the
+/// directory holding it so a repo can carry a relative path. Read at startup,
+/// before any subcommand runs, so a missing or malformed config is simply no
+/// answer here rather than an error on commands that never open a connection.
+pub fn ca_file() -> Option<String> {
+    let loaded = load().ok()?;
+    let ca_file = loaded.config.ca_file?;
+    let path = Path::new(&ca_file);
+    if path.is_absolute() {
+        return Some(ca_file);
+    }
+    let base = loaded.path.parent()?;
+    Some(base.join(path).to_string_lossy().into_owned())
 }
 
 /// Resolve the server host: an explicit flag wins, else the stored `host`.
@@ -180,6 +200,7 @@ mod tests {
                 exp: now_secs() + 600,
                 host: "http://127.0.0.1:3100".to_string(),
             }),
+            ca_file: None,
         };
         let services = "http://127.0.0.1:3100/services";
         assert_eq!(
@@ -205,6 +226,7 @@ mod tests {
                 exp: now_secs() - 1,
                 host: "http://h".to_string(),
             }),
+            ca_file: None,
         };
         assert_eq!(token_if_valid(&config, "http://h"), None);
     }

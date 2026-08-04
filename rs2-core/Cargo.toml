@@ -11,9 +11,13 @@ default = []
 # Wasmtime component engine for Rust/Wasm custom services
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # V8 isolate engine for TS/JS custom services (deno_core: modules, ops, extensions)
-js = ["dep:deno_core", "dep:deno_error", "dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
+js = ["dep:deno_core", "dep:deno_error", "dep:tokio-rustls", "tls"]
 # Outbound HTTP adapter (ureq) for httpOut capability grants
-http = ["dep:ureq"]
+http = ["dep:ureq", "tls"]
+# Shared outbound TLS trust roots (`crate::tls`): the OS trust store, the
+# bundled Mozilla roots, and operator-supplied PEM bundles. Enabled by every
+# feature that opens a TLS connection; `rs2-cli` enables it directly.
+tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-native-certs", "dep:rustls-pemfile"]
 
 [dependencies]
 argon2 = "0.5"
@@ -26,6 +30,8 @@ deno_core = { version = "0.404", optional = true }
 deno_error = { version = "0.7", optional = true }
 futures.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
 hmac = "0.12"

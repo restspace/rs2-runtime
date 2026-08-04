@@ -11,7 +11,8 @@ name = "rs2"
 path = "src/main.rs"
 
 [dependencies]
-rs2-core = { path = "../rs2-core" }
+# `tls` for the shared outbound trust roots the HTTP client is built on.
+rs2-core = { path = "../rs2-core", features = ["tls"] }
 rs2-server = { path = "../rs2-server" }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -21,6 +22,14 @@ ureq = "2"
 shlex = "1"
 mime_guess = "2"
 rand = "0.8"
+
+[dev-dependencies]
+# A real TLS server for the trust-roots test: the CLI is driven as a
+# subprocess, so these only serve the far end of the connection.
+base64 = "0.22"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tempfile = "3"
 
 [features]
 # Enables the deployment-time component compile check in `rs2 test`.

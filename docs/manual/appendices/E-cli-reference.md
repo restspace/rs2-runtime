@@ -5,6 +5,12 @@ is not a general API client — use plain HTTP for everything outside these
 commands. Run it as the installed `rs2` binary or
 `cargo run -p rs2-cli -- <args>`.
 
+The CLI is **built from source** — a release ships server binaries only:
+
+```bash
+cargo build --release -p rs2-cli    # binary at target/release/rs2
+```
+
 ## Verbs
 
 | Command | Does |
@@ -27,6 +33,55 @@ commands. Run it as the installed `rs2` binary or
 | `rs2 push [--dir <d>] [--dry-run] [--allow-secret-rotation]` | Push local instruction-plane edits back through the validated APIs (config `If-Match`, spec `If-Match`/412); aborts on a remote change rather than clobbering. `--dry-run` shows the diff; refuses a real secret value in a `"<secret>"` slot without `--allow-secret-rotation` |
 | `rs2 run <script>` | Run one `rs2` command per line, skipping blanks/comments and aborting on the first failure; `dev` is rejected because it never returns |
 
+## Global flags
+
+| Flag | Notes |
+| --- | --- |
+| `--ca-file <pem>` | Extra certificate authorities to trust, **added** to the roots RS2 already has. Accepted on any verb — see [TLS and certificate authorities](#tls-and-certificate-authorities) |
+
+## TLS and certificate authorities
+
+The CLI trusts the **union** of your operating system's trust store and a
+bundled copy of the Mozilla root list. The OS store is what carries a private
+CA — a corporate proxy, a CI TLS-inspection appliance, an internal PKI — so
+installing the CA there is usually all that's needed. The bundled roots are
+kept alongside it because some environments have no OS trust store at all (a
+scratch container with no `ca-certificates` package) and because Windows fills
+its store lazily; dropping either source would break hosts that work today.
+
+When installing the CA system-wide isn't an option, name a PEM bundle:
+
+```bash
+rs2 --ca-file /etc/ssl/corp-root.pem send /files/report.pdf --file report.pdf
+```
+
+| Setting | Where | Effect |
+| --- | --- | --- |
+| `--ca-file <pem>` | flag, any verb | Adds the PEM bundle's authorities to the roots |
+| `RS2_CA_FILE` | environment | The same, for a shell session or a CI job |
+| `"caFile"` | `rsconfig.json` | The same, carried with the repo's server identity; a relative path resolves against the config file |
+| `SSL_CERT_FILE` / `SSL_CERT_DIR` | environment | Honoured with their conventional OpenSSL meaning: they **replace** the OS trust store rather than adding to it |
+| `RS2_CA_ROOTS` | environment | `native` for the OS store alone (so a root you distrusted there stays distrusted), `webpki` for the bundled roots alone. The default uses both |
+
+A certificate that still can't be verified reports which roots were loaded and
+how to add one:
+
+```
+error: request failed: … invalid peer certificate: UnknownIssuer
+  the server's certificate was not issued by a trusted authority.
+  Trust roots in use: 52 from the OS trust store, 157 bundled Mozilla roots.
+  To trust a private CA, either install it in the OS trust store, or point RS2
+  at the PEM file: --ca-file <path> (or RS2_CA_FILE=<path>), …
+```
+
+### Proxies
+
+An explicit forward proxy is read from `ALL_PROXY`, `HTTPS_PROXY`, or
+`HTTP_PROXY` (either case), with `NO_PROXY` honoured as a comma-separated list
+of hosts and domain suffixes, or `*` for all. Loopback hosts are never proxied,
+so a global proxy setting doesn't cut off `rs2 dev` on localhost. Transparent
+interception needs no configuration — only the CA above.
+
 ## `rsconfig.json`
 
 The admin commands walk upward from the current directory to the nearest
@@ -37,7 +92,8 @@ The admin commands walk upward from the current directory to the nearest
   "host": "https://api.example.com",
   "login": { "email": "admin@example.com" },
   "auth": { "token": "<jwt>", "exp": 1799999999,
-            "host": "https://api.example.com" }
+            "host": "https://api.example.com" },
+  "caFile": "corp-root.pem"
 }
 ```
 

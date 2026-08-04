@@ -329,23 +329,15 @@ impl SockStream {
     }
 }
 
-/// The TLS client connector (webpki roots, ring provider). Tests may override
-/// it via [`set_tls_connector_for_test`] to trust a self-signed cert.
+/// The TLS client connector, over the trust roots shared with the rest of the
+/// workspace ([`crate::tls`]) — the OS store, so a sandboxed service reaching
+/// an internal host behind a private CA sees the same authorities the host
+/// does. Tests may override it via [`set_tls_connector_for_test`] to trust a
+/// self-signed cert.
 fn tls_connector() -> tokio_rustls::TlsConnector {
     static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
     CONNECTOR
-        .get_or_init(|| {
-            let mut roots = rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("ring supports the default protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-            tokio_rustls::TlsConnector::from(Arc::new(config))
-        })
+        .get_or_init(|| tokio_rustls::TlsConnector::from(crate::tls::client_config()))
         .clone()
 }
 
@@ -1474,7 +1466,8 @@ pub(crate) async fn build_runtime(
     // mutexes on Windows only); re-test at the deno_core upgrade (G13 Phase 2)
     // by flipping `USE_PRELUDE_SNAPSHOT` and running
     // `tests/js_isolate_overlap.rs`.
-    let snapshot = (USE_PRELUDE_SNAPSHOT && !PRELUDE_SNAPSHOT.is_empty()).then_some(PRELUDE_SNAPSHOT);
+    let snapshot =
+        (USE_PRELUDE_SNAPSHOT && !PRELUDE_SNAPSHOT.is_empty()).then_some(PRELUDE_SNAPSHOT);
     let create = v8::CreateParams::default().heap_limits(0, limits.memory_bytes as usize);
     let mut runtime = JsRuntime::new(RuntimeOptions {
         extensions: vec![rs2_host::init()],

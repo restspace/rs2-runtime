@@ -21,6 +21,13 @@ use clap::{Parser, Subcommand};
     about = "RS2 sandboxed composable-service runtime CLI"
 )]
 struct Cli {
+    /// PEM file of extra certificate authorities, added to the roots RS2
+    /// already trusts — for a server behind a corporate proxy, a
+    /// TLS-inspection appliance, or any private CA. Also settable as
+    /// `RS2_CA_FILE`, or `caFile` in rsconfig.json.
+    #[arg(long, global = true, value_name = "PEM")]
+    ca_file: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -267,6 +274,11 @@ enum TemplateCommand {
 
 fn main() {
     let cli = Cli::parse();
+    // Before any client is built: the trust roots are assembled once, on the
+    // first outbound request, and shared from there on.
+    if let Some(path) = cli.ca_file.clone().or_else(config::ca_file) {
+        rs2_core::tls::set_ca_file(path);
+    }
     if let Err(e) = dispatch(cli.command) {
         eprintln!("error: {e}");
         std::process::exit(1);

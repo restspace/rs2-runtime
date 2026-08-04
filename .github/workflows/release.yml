@@ -1,8 +1,12 @@
 name: release
 
-# Builds both server variants on the oldest supported glibc (Ubuntu 22.04) and
-# attaches them — plus the Apache vhost template and SHA256SUMS — to the
-# release the tag points at.
+# Builds both server variants and the `rs2` CLI on the oldest supported glibc
+# (Ubuntu 22.04) and attaches them — plus the Apache vhost template and
+# SHA256SUMS — to the release the tag points at.
+#
+# The CLI is here because v0.1.0 shipped server artefacts only, and downstream
+# readers assumed a CLI download existed; building from source stays the
+# supported path on every other platform.
 
 on:
   push:
@@ -43,10 +47,21 @@ jobs:
       - name: Build
         run: cargo build --release -p rs2-server --features "${{ matrix.features }}"
 
+      # The CLI rides along with the light variant only: it is one binary for
+      # every server variant, and building it under `js` would pull V8 into a
+      # developer tool for the sake of one pre-flight check. `wasm` is worth
+      # having — it is what gives `rs2 test` its component compile check.
+      - name: Build the CLI
+        if: matrix.variant == 'rs2-server'
+        run: cargo build --release -p rs2-cli --features wasm
+
       - name: Stage artifact
         run: |
           mkdir -p dist
           cp target/release/rs2-server "dist/${{ matrix.variant }}-x86_64-linux"
+          if [ "${{ matrix.variant }}" = "rs2-server" ]; then
+            cp target/release/rs2 dist/rs2-x86_64-linux
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -68,7 +83,7 @@ jobs:
         run: |
           cp deploy/apache-vhost.conf.tmpl dist/
           cp deploy/install.sh dist/
-          ( cd dist && sha256sum rs2-server-* > SHA256SUMS )
+          ( cd dist && sha256sum rs2-server-* rs2-x86_64-linux > SHA256SUMS )
           ls -l dist
 
       - name: Attach to release

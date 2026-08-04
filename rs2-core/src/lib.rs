@@ -42,6 +42,8 @@ pub mod runtime;
 pub mod scheduler;
 pub mod services;
 pub mod tenant;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod wrapper;
 
 pub use error::RsError;

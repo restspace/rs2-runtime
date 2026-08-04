@@ -97,6 +97,13 @@ Or build from source on any platform (pinned toolchain via
 cargo build --release -p rs2-server --features wasm,js
 ```
 
+**The `rs2` CLI is built from source** — a release ships the server binaries
+above and nothing else, so there is no CLI download:
+
+```bash
+cargo build --release -p rs2-cli     # binary at target/release/rs2
+```
+
 ## Quick start
 
 ```bash
