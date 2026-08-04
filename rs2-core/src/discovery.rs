@@ -283,7 +283,13 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
             // `list-projection`: dataset listings accept `$select`/`$sort`
             // (always available — host fallback when the adapter has no
             // native pushdown; see `listProjection` in the services doc).
-            vec!["schema", "patch", "echo", "confirm-delete", "list-projection"],
+            vec![
+                "schema",
+                "patch",
+                "echo",
+                "confirm-delete",
+                "list-projection",
+            ],
         ),
         // Spec stores' authoring subtrees delegate to an owned FileService,
         // so their listings inherit `meta-sort`.

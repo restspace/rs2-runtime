@@ -89,7 +89,10 @@ async fn deploy_and_mount(rt: &Runtime, bundle: &str, mount_config: serde_json::
     ));
     let mut resp = rt.handle(deploy).await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
-    let code_ref = body_json(&mut resp).await["ref"].as_str().unwrap().to_string();
+    let code_ref = body_json(&mut resp).await["ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let mut config = base_config();
     config["mounts"].as_array_mut().unwrap().push(json!({
@@ -229,7 +232,12 @@ async fn body_ref_attaches_a_granted_read_host_side() {
     // A dangling reference is the service's bug: a 502 contract violation,
     // not a silent empty 200.
     let mut miss = rt.handle(req(Method::GET, "/svc/missing")).await;
-    assert_eq!(miss.status.map(|s| s.as_u16()), Some(502), "{:?}", miss.body);
+    assert_eq!(
+        miss.status.map(|s| s.as_u16()),
+        Some(502),
+        "{:?}",
+        miss.body
+    );
     let out = body_json(&mut miss).await;
     assert_eq!(out["code"], "contract_violation");
 }

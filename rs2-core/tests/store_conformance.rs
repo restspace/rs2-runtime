@@ -323,10 +323,22 @@ async fn assert_listing_contract(rt: &Runtime, mount: &str) {
             assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {path}");
         }
     };
-    put("ka", json!({ "title": "apple",  "n": 5,  "meta": { "date": "2026-01-02" } })).await;
-    put("kb", json!({ "title": "Zebra",  "n": 2,  "meta": { "date": "2026-01-03" } })).await;
+    put(
+        "ka",
+        json!({ "title": "apple",  "n": 5,  "meta": { "date": "2026-01-02" } }),
+    )
+    .await;
+    put(
+        "kb",
+        json!({ "title": "Zebra",  "n": 2,  "meta": { "date": "2026-01-03" } }),
+    )
+    .await;
     put("kc", json!({ "title": "banana", "n": 2 })).await;
-    put("kd", json!({ "title": "cherry", "n": 10, "meta": { "date": "2026-01-01" } })).await;
+    put(
+        "kd",
+        json!({ "title": "cherry", "n": 10, "meta": { "date": "2026-01-01" } }),
+    )
+    .await;
 
     let names = |listing: &serde_json::Value| -> Vec<String> {
         listing["entries"]
@@ -423,7 +435,10 @@ async fn assert_listing_contract(rt: &Runtime, mount: &str) {
         ))
         .await;
     let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
-    assert_eq!(total, 4, "[{mount}] paged projected total is the full count");
+    assert_eq!(
+        total, 4,
+        "[{mount}] paged projected total is the full count"
+    );
     let listing = body_json(&mut resp).await;
     assert_eq!(
         names(&listing),
@@ -567,7 +582,9 @@ async fn assert_meta_sort_contract(rt: &Runtime, mount: &str, make_body: impl Fn
     }
 
     // The plain listing is untouched by the feature existing.
-    let mut resp = rt.handle(req(Method::GET, &format!("{mount}/msort/"))).await;
+    let mut resp = rt
+        .handle(req(Method::GET, &format!("{mount}/msort/")))
+        .await;
     assert_eq!(resp.status, Some(StatusCode::OK));
     let listing = body_json(&mut resp).await;
     assert_eq!(listing["entries"].as_array().unwrap().len(), 4);

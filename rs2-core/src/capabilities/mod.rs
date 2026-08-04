@@ -269,7 +269,9 @@ pub async fn list_records_fallback<S: DataStore + ?Sized>(
     spec: &crate::listing::ListSpec,
 ) -> Result<(Vec<(String, serde_json::Value)>, u64), RsError> {
     if spec.sort.is_empty() {
-        let (keys, total) = store.list_keys(tenant, dataset, spec.take, spec.skip).await?;
+        let (keys, total) = store
+            .list_keys(tenant, dataset, spec.take, spec.skip)
+            .await?;
         let mut page = Vec::with_capacity(keys.len());
         for key in keys {
             let record = store.get(tenant, dataset, &key).await?;

@@ -120,7 +120,8 @@ pub fn send_dir(server_path: &str, dir: &str) -> Result<(), String> {
     let mut total_bytes = 0usize;
     for rel in &files {
         let local = root.join(rel);
-        let bytes = std::fs::read(&local).map_err(|e| format!("cannot read {}: {e}", local.display()))?;
+        let bytes =
+            std::fs::read(&local).map_err(|e| format!("cannot read {}: {e}", local.display()))?;
         let content_type = mime_guess::from_path(&local)
             .first_raw()
             .unwrap_or("application/octet-stream");

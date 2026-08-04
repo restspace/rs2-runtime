@@ -74,7 +74,12 @@ pub struct ListSpec {
 
 impl ListSpec {
     /// Parse the wire form: `$select=title,meta.date`, `$sort=-date,title`.
-    pub fn parse(select: &str, sort: Option<&str>, take: usize, skip: usize) -> Result<ListSpec, RsError> {
+    pub fn parse(
+        select: &str,
+        sort: Option<&str>,
+        take: usize,
+        skip: usize,
+    ) -> Result<ListSpec, RsError> {
         let fields = select
             .split(',')
             .map(|f| FieldPath::parse(f.trim()))
@@ -96,7 +101,12 @@ impl ListSpec {
                 })
                 .collect::<Result<Vec<_>, RsError>>()?,
         };
-        Ok(ListSpec { fields, sort, take, skip })
+        Ok(ListSpec {
+            fields,
+            sort,
+            take,
+            skip,
+        })
     }
 }
 
@@ -140,7 +150,10 @@ fn compare_numbers(x: &serde_json::Number, y: &serde_json::Number) -> Ordering {
     if let (Some(a), Some(b)) = (x.as_u64(), y.as_u64()) {
         return a.cmp(&b);
     }
-    let (a, b) = (x.as_f64().unwrap_or(f64::NAN), y.as_f64().unwrap_or(f64::NAN));
+    let (a, b) = (
+        x.as_f64().unwrap_or(f64::NAN),
+        y.as_f64().unwrap_or(f64::NAN),
+    );
     a.partial_cmp(&b).unwrap_or(Ordering::Equal)
 }
 
@@ -300,9 +313,7 @@ pub fn sort_page_project(
     spec: &ListSpec,
 ) -> (Vec<(String, Value)>, u64) {
     let total = records.len() as u64;
-    records.sort_by(|(ka, a), (kb, b)| {
-        compare_records(a, b, &spec.sort).then_with(|| ka.cmp(kb))
-    });
+    records.sort_by(|(ka, a), (kb, b)| compare_records(a, b, &spec.sort).then_with(|| ka.cmp(kb)));
     let page = records
         .into_iter()
         .skip(spec.skip)
@@ -336,7 +347,10 @@ mod tests {
         assert_eq!(compare(&json!("Zebra"), &json!("apple")), Ordering::Less);
         assert_eq!(compare(&json!("é"), &json!("z")), Ordering::Greater);
         // NFC vs NFD é differ bytewise — unequal by design.
-        assert_ne!(compare(&json!("\u{e9}"), &json!("e\u{301}")), Ordering::Equal);
+        assert_ne!(
+            compare(&json!("\u{e9}"), &json!("e\u{301}")),
+            Ordering::Equal
+        );
     }
 
     #[test]
@@ -406,16 +420,29 @@ mod tests {
     #[test]
     fn meta_sort_orders_entries_with_name_tiebreak() {
         use crate::capabilities::DirEntry;
-        let entry = |name: &str, size: u64, dir: bool, ct: Option<&str>, lm: Option<&str>| DirEntry {
-            name: name.to_string(),
-            size,
-            last_modified: lm.map(str::to_string),
-            dir,
-            content_type: ct.map(str::to_string),
-        };
+        let entry =
+            |name: &str, size: u64, dir: bool, ct: Option<&str>, lm: Option<&str>| DirEntry {
+                name: name.to_string(),
+                size,
+                last_modified: lm.map(str::to_string),
+                dir,
+                content_type: ct.map(str::to_string),
+            };
         let mut entries = vec![
-            entry("b.txt", 10, false, Some("text/plain"), Some("2026-07-02T00:00:00Z")),
-            entry("a.json", 300, false, Some("application/json"), Some("2026-07-01T00:00:00Z")),
+            entry(
+                "b.txt",
+                10,
+                false,
+                Some("text/plain"),
+                Some("2026-07-02T00:00:00Z"),
+            ),
+            entry(
+                "a.json",
+                300,
+                false,
+                Some("application/json"),
+                Some("2026-07-01T00:00:00Z"),
+            ),
             entry("sub/", 0, true, None, Some("2026-07-03T00:00:00Z")),
             entry("c.txt", 10, false, Some("text/plain"), None),
         ];
@@ -430,11 +457,16 @@ mod tests {
         assert_eq!(names(&entries), ["c.txt", "a.json", "b.txt", "sub/"]);
 
         // A directory's missing contentType sorts first; name breaks ties.
-        MetaSort::parse("@contentType,@name").unwrap().sort(&mut entries);
+        MetaSort::parse("@contentType,@name")
+            .unwrap()
+            .sort(&mut entries);
         assert_eq!(names(&entries), ["sub/", "a.json", "b.txt", "c.txt"]);
 
         assert!(MetaSort::parse("@nope").is_err());
-        assert!(MetaSort::parse("name").is_err(), "unprefixed keys are errors");
+        assert!(
+            MetaSort::parse("name").is_err(),
+            "unprefixed keys are errors"
+        );
         assert!(MetaSort::parse("").is_err());
     }
 

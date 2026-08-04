@@ -660,7 +660,11 @@ impl DataStore for GuestDataStore {
         if !self.inner.has_feature("list-records") {
             return list_records_fallback(self, tenant, dataset, spec).await;
         }
-        let select: Vec<String> = spec.fields.iter().map(|f| query_encode(&f.dotted())).collect();
+        let select: Vec<String> = spec
+            .fields
+            .iter()
+            .map(|f| query_encode(&f.dotted()))
+            .collect();
         let mut path = format!("/{dataset}/?$select={}", select.join(","));
         if !spec.sort.is_empty() {
             let sort: Vec<String> = spec
@@ -1081,9 +1085,10 @@ mod tests {
             export default async (msg, ctx) => { N += 1; return { status: 200, body: { n: N } }; };
         "#
         .to_string();
-        let (h, features) = spawn_resident(src, host, InvocationLimits::default(), "t".into(), vec![])
-            .await
-            .unwrap();
+        let (h, features) =
+            spawn_resident(src, host, InvocationLimits::default(), "t".into(), vec![])
+                .await
+                .unwrap();
         assert!(features.is_empty(), "no features export → empty");
         let a = h
             .call(json!({ "method": "GET", "url": "/" }), json!({}))

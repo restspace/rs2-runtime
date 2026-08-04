@@ -626,8 +626,7 @@ fn mongo_dispatch(
                         let paths: Vec<(rs2_core::listing::FieldPath, i64)> = keys
                             .iter()
                             .map(|k| {
-                                let dir =
-                                    sort_doc.get(k).and_then(|d| d.as_i64()).unwrap_or(1);
+                                let dir = sort_doc.get(k).and_then(|d| d.as_i64()).unwrap_or(1);
                                 (rs2_core::listing::FieldPath::parse(k).unwrap(), dir)
                             })
                             .collect();
@@ -651,21 +650,23 @@ fn mongo_dispatch(
                         .into_iter()
                         .skip(skip)
                         .take(limit)
-                        .map(|d| match cmd.get("projection").and_then(|p| p.as_object()) {
-                            None => d,
-                            Some(proj) => {
-                                let fields: Vec<rs2_core::listing::FieldPath> = proj
-                                    .keys()
-                                    .filter(|k| k.as_str() != "_id")
-                                    .map(|k| rs2_core::listing::FieldPath::parse(k).unwrap())
-                                    .collect();
-                                let mut out = rs2_core::listing::project(&d, &fields);
-                                if let Some(id) = d.get("_id") {
-                                    out["_id"] = id.clone();
+                        .map(
+                            |d| match cmd.get("projection").and_then(|p| p.as_object()) {
+                                None => d,
+                                Some(proj) => {
+                                    let fields: Vec<rs2_core::listing::FieldPath> = proj
+                                        .keys()
+                                        .filter(|k| k.as_str() != "_id")
+                                        .map(|k| rs2_core::listing::FieldPath::parse(k).unwrap())
+                                        .collect();
+                                    let mut out = rs2_core::listing::project(&d, &fields);
+                                    if let Some(id) = d.get("_id") {
+                                        out["_id"] = id.clone();
+                                    }
+                                    out
                                 }
-                                out
-                            }
-                        })
+                            },
+                        )
                         .collect();
                     batch = projected;
                 }
@@ -1848,10 +1849,22 @@ async fn assert_listing_contract(rt: &Runtime, mount: &str) {
             assert_eq!(resp.status, Some(StatusCode::CREATED), "seed {path}");
         }
     };
-    put("ka", json!({ "title": "apple",  "n": 5,  "meta": { "date": "2026-01-02" } })).await;
-    put("kb", json!({ "title": "Zebra",  "n": 2,  "meta": { "date": "2026-01-03" } })).await;
+    put(
+        "ka",
+        json!({ "title": "apple",  "n": 5,  "meta": { "date": "2026-01-02" } }),
+    )
+    .await;
+    put(
+        "kb",
+        json!({ "title": "Zebra",  "n": 2,  "meta": { "date": "2026-01-03" } }),
+    )
+    .await;
     put("kc", json!({ "title": "banana", "n": 2 })).await;
-    put("kd", json!({ "title": "cherry", "n": 10, "meta": { "date": "2026-01-01" } })).await;
+    put(
+        "kd",
+        json!({ "title": "cherry", "n": 10, "meta": { "date": "2026-01-01" } }),
+    )
+    .await;
 
     let names = |listing: &serde_json::Value| -> Vec<String> {
         listing["entries"]
@@ -1943,7 +1956,10 @@ async fn assert_listing_contract(rt: &Runtime, mount: &str) {
         ))
         .await;
     let total: u64 = resp.header("x-total-count").unwrap().parse().unwrap();
-    assert_eq!(total, 4, "[{mount}] paged projected total is the full count");
+    assert_eq!(
+        total, 4,
+        "[{mount}] paged projected total is the full count"
+    );
     let listing = body_json(&mut resp).await;
     assert_eq!(
         names(&listing),

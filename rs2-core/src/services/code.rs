@@ -159,7 +159,10 @@ impl CodeService {
             .ok_or_else(|| RsError::internal("code service has no requester capability"))?;
         for (capability, grant) in config_grants {
             if grant.get("type").and_then(|t| t.as_str()) == Some("store") {
-                grants.insert(capability.clone(), store_grant_target(capability, grant, ctx)?);
+                grants.insert(
+                    capability.clone(),
+                    store_grant_target(capability, grant, ctx)?,
+                );
                 continue;
             }
             if grant.get("type").and_then(|t| t.as_str()) == Some("httpOut") {
@@ -424,8 +427,7 @@ impl Service for CodeService {
                             &ctx.limits,
                         )
                         .await?;
-                    return resolve_body_ref(resp, &grants, &tenant, principal, trace, depth)
-                        .await;
+                    return resolve_body_ref(resp, &grants, &tenant, principal, trace, depth).await;
                 }
                 #[cfg(not(feature = "wasm"))]
                 {
@@ -470,8 +472,7 @@ impl Service for CodeService {
                             &ctx.limits,
                         )
                         .await?;
-                    return resolve_body_ref(resp, &grants, &tenant, principal, trace, depth)
-                        .await;
+                    return resolve_body_ref(resp, &grants, &tenant, principal, trace, depth).await;
                 }
                 #[cfg(not(feature = "js"))]
                 {

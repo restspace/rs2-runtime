@@ -525,8 +525,10 @@ async fn file_static_site_spa_fallback_all() {
         LimitTable::default(),
     );
 
-    let put = req(Method::PUT, "/admin/index.html")
-        .with_body(Body::from_string("<html>app</html>", MediaType::new("text/html")));
+    let put = req(Method::PUT, "/admin/index.html").with_body(Body::from_string(
+        "<html>app</html>",
+        MediaType::new("text/html"),
+    ));
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
 
     // Extension-less miss: same behavior as plain spaFallback.
@@ -536,7 +538,9 @@ async fn file_static_site_spa_fallback_all() {
     // A miss *with* an extension — e.g. rs2-ui's URL-as-path deep link
     // `/admin/files/docs/readme.md` — also falls back, unlike plain
     // spaFallback (which would 404 this).
-    let mut deep_link = rt.handle(req(Method::GET, "/admin/files/docs/readme.md")).await;
+    let mut deep_link = rt
+        .handle(req(Method::GET, "/admin/files/docs/readme.md"))
+        .await;
     assert_eq!(deep_link.status, Some(StatusCode::OK));
     let bytes = deep_link
         .body
@@ -549,8 +553,10 @@ async fn file_static_site_spa_fallback_all() {
 
     // A real, existing asset still serves normally rather than being masked
     // by the catch-all.
-    let put = req(Method::PUT, "/admin/assets/app.js")
-        .with_body(Body::from_string("boot()", MediaType::new("application/javascript")));
+    let put = req(Method::PUT, "/admin/assets/app.js").with_body(Body::from_string(
+        "boot()",
+        MediaType::new("application/javascript"),
+    ));
     assert_eq!(rt.handle(put).await.status, Some(StatusCode::CREATED));
     let js = rt.handle(req(Method::GET, "/admin/assets/app.js")).await;
     assert_eq!(js.status, Some(StatusCode::OK));

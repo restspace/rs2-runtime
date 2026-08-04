@@ -211,7 +211,10 @@ async fn operator_sees_listing_through_listings_false() {
     assert_eq!(resp.header("cache-control"), Some("no-store"));
     let vary = resp.header("vary").unwrap().to_string();
     assert!(vary.contains("accept"), "{vary}");
-    assert!(vary.contains("authorization") && vary.contains("cookie"), "{vary}");
+    assert!(
+        vary.contains("authorization") && vary.contains("cookie"),
+        "{vary}"
+    );
 
     let listing: serde_json::Value = serde_json::from_slice(&body_of(&mut resp).await).unwrap();
     let names: Vec<&str> = listing["entries"]

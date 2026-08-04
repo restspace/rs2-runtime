@@ -503,10 +503,7 @@ async fn services_catalogue_filters_by_surface() {
     // /q is exposed on "mcp" only: gone from the editor surface, while
     // x-expose-less mounts appear on every surface.
     let mut editor = rt
-        .handle(req(
-            Method::GET,
-            "/.well-known/rs2/services?surface=editor",
-        ))
+        .handle(req(Method::GET, "/.well-known/rs2/services?surface=editor"))
         .await;
     let doc = body_json(&mut editor).await;
     let paths = paths_for(&doc);
@@ -540,10 +537,7 @@ async fn services_control_block_respects_surface() {
     let rt = rt_with(dir.path(), config);
 
     let mut editor = rt
-        .handle(req(
-            Method::GET,
-            "/.well-known/rs2/services?surface=editor",
-        ))
+        .handle(req(Method::GET, "/.well-known/rs2/services?surface=editor"))
         .await;
     let doc = body_json(&mut editor).await;
     assert!(
@@ -552,10 +546,7 @@ async fn services_control_block_respects_surface() {
     );
 
     let mut admin = rt
-        .handle(req(
-            Method::GET,
-            "/.well-known/rs2/services?surface=admin",
-        ))
+        .handle(req(Method::GET, "/.well-known/rs2/services?surface=admin"))
         .await;
     let doc = body_json(&mut admin).await;
     assert_eq!(doc["control"]["path"], "/services");

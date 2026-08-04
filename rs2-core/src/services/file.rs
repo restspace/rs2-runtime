@@ -413,7 +413,9 @@ impl Service for FileService {
                             }
                             Err(e) if e.code != crate::error::codes::NOT_FOUND => return Err(e),
                             // No default doc here: SPA routes fall to the root.
-                            Err(_) if (site.spa_fallback || site.spa_fallback_all) && path != "/" => {
+                            Err(_)
+                                if (site.spa_fallback || site.spa_fallback_all) && path != "/" =>
+                            {
                                 let mut resp = self
                                     .serve_file(
                                         msg.response(StatusCode::OK, None),
@@ -462,8 +464,7 @@ impl Service for FileService {
                         let sort = crate::listing::MetaSort::parse(&sort)?;
                         let (mut entries, total) = files.list(&path, usize::MAX, 0).await?;
                         sort.sort(&mut entries);
-                        let entries: Vec<_> =
-                            entries.into_iter().skip(skip).take(take).collect();
+                        let entries: Vec<_> = entries.into_iter().skip(skip).take(take).collect();
                         (entries, total)
                     }
                     None => files.list(&path, take, skip).await?,

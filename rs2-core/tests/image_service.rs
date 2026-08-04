@@ -100,8 +100,10 @@ fn png_dims(bytes: &[u8]) -> (u32, u32) {
 
 /// Deploy the built component and mount it at `/img` decorating `/files`.
 async fn setup(rt: &Runtime, component: Vec<u8>) {
-    let deploy = req(Method::POST, "/services/code/image/")
-        .with_body(Body::from_bytes(component, MediaType::new("application/wasm")));
+    let deploy = req(Method::POST, "/services/code/image/").with_body(Body::from_bytes(
+        component,
+        MediaType::new("application/wasm"),
+    ));
     let mut resp = rt.handle(deploy).await;
     assert_eq!(resp.status, Some(StatusCode::CREATED), "{:?}", resp.body);
     let body = resp
@@ -153,7 +155,11 @@ async fn resize_cache_and_conditional_flow() {
     let mut first = rt.handle(req(Method::GET, "/img/pic.png?w=10")).await;
     assert_eq!(first.status, Some(StatusCode::OK), "{:?}", first.body);
     assert_eq!(first.header("x-img-cache"), Some("miss"));
-    assert_eq!(first.header("x-rs2-body-ref"), None, "splice header stripped");
+    assert_eq!(
+        first.header("x-rs2-body-ref"),
+        None,
+        "splice header stripped"
+    );
     let etag = first.header("etag").expect("derived etag").to_string();
     let bytes = body_bytes(&mut first).await;
     assert_eq!(png_dims(&bytes), (16, 8));
@@ -246,8 +252,19 @@ async fn passthrough_transforms_and_errors() {
     assert_eq!(seeded.header("x-img-cache"), Some("miss"));
     let unconfirmed = rt.handle(req(Method::DELETE, "/img/.cache")).await;
     assert_eq!(unconfirmed.status, Some(StatusCode::CONFLICT));
-    let purge = rt.handle(req(Method::DELETE, "/img/.cache?confirm=1")).await;
-    assert_eq!(purge.status, Some(StatusCode::NO_CONTENT), "{:?}", purge.body);
+    let purge = rt
+        .handle(req(Method::DELETE, "/img/.cache?confirm=1"))
+        .await;
+    assert_eq!(
+        purge.status,
+        Some(StatusCode::NO_CONTENT),
+        "{:?}",
+        purge.body
+    );
     let again = rt.handle(req(Method::GET, "/img/pic.png?w=8")).await;
-    assert_eq!(again.header("x-img-cache"), Some("miss"), "cache was emptied");
+    assert_eq!(
+        again.header("x-img-cache"),
+        Some("miss"),
+        "cache was emptied"
+    );
 }
