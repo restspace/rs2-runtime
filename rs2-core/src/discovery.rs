@@ -315,8 +315,9 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
     };
     let mut facets: Vec<String> = facets.into_iter().map(str::to_string).collect();
     // Every store-shaped mount honours `If-Match`/`If-None-Match` on writes
-    // (412 on mismatch) and returns an `ETag` on PUT — the host does an atomic
-    // or best-effort check depending on the adapter. A future atomic adapter
+    // and single-resource deletes (412 on mismatch) and returns an `ETag` on
+    // PUT — the host does an atomic or best-effort check depending on the
+    // adapter. A future atomic adapter
     // can add a `conditional-write-atomic` marker; today the guarantee is
     // best-effort and the client behaviour (send If-Match, handle 412) is the
     // same either way.

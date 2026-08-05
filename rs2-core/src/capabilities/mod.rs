@@ -150,6 +150,42 @@ pub trait FileStore: Send + Sync {
     }
 
     async fn delete(&self, tenant: &str, path: &str) -> Result<(), RsError>;
+
+    /// Conditional delete honouring a [`WritePrecondition`] — the DELETE side
+    /// of the store's optimistic-concurrency contract, with the same
+    /// **best-effort** check-then-act default as [`FileStore::write_cond`].
+    /// A missing resource is not a precondition failure: it falls through to
+    /// [`FileStore::delete`] so the caller sees the store's normal `404`
+    /// (RFC 9110 §13.1 — preconditions are evaluated only after the normal
+    /// request checks).
+    async fn delete_cond(
+        &self,
+        tenant: &str,
+        path: &str,
+        precondition: WritePrecondition,
+    ) -> Result<(), RsError> {
+        match &precondition {
+            WritePrecondition::None => {}
+            WritePrecondition::IfMatch(want) => {
+                if let Some(cur) = self.current_etag(tenant, path).await? {
+                    if !if_match_hits(want, &cur) {
+                        return Err(RsError::precondition_failed(
+                            "If-Match does not match the current ETag — re-read and retry",
+                        ));
+                    }
+                }
+            }
+            WritePrecondition::IfNoneMatchStar => {
+                if self.current_etag(tenant, path).await?.is_some() {
+                    return Err(RsError::precondition_failed(
+                        "If-None-Match: * given but the resource exists",
+                    ));
+                }
+            }
+        }
+        self.delete(tenant, path).await
+    }
+
     /// Move/rename a file. Returns `true` if the destination was created
     /// (vs. overwritten). Fails if the source is missing or a directory.
     async fn rename(&self, tenant: &str, from: &str, to: &str) -> Result<bool, RsError>;
@@ -462,6 +498,17 @@ impl FileStore for PrefixedFileStore {
         self.inner.delete(tenant, &self.join(path)).await
     }
 
+    async fn delete_cond(
+        &self,
+        tenant: &str,
+        path: &str,
+        precondition: WritePrecondition,
+    ) -> Result<(), RsError> {
+        self.inner
+            .delete_cond(tenant, &self.join(path), precondition)
+            .await
+    }
+
     async fn rename(&self, tenant: &str, from: &str, to: &str) -> Result<bool, RsError> {
         self.inner
             .rename(tenant, &self.join(from), &self.join(to))
@@ -601,6 +648,16 @@ impl ScopedFileStore {
 
     pub async fn delete(&self, path: &str) -> Result<(), RsError> {
         self.inner.delete(&self.tenant, path).await
+    }
+
+    pub async fn delete_cond(
+        &self,
+        path: &str,
+        precondition: WritePrecondition,
+    ) -> Result<(), RsError> {
+        self.inner
+            .delete_cond(&self.tenant, path, precondition)
+            .await
     }
 
     pub async fn rename(&self, from: &str, to: &str) -> Result<bool, RsError> {

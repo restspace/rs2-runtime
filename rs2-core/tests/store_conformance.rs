@@ -229,8 +229,31 @@ async fn assert_store_contract(
         "[{mount}] container is a dir entry at the root: {root}"
     );
 
-    // DELETE child: 204, then gone.
-    let resp = rt.handle(req(Method::DELETE, &child("alpha"))).await;
+    // Conditional delete: the DELETE side of the `conditional-write`
+    // contract — a stale If-Match refuses (412) and leaves the child alone.
+    let mut stale = req(Method::DELETE, &child("alpha"));
+    stale.set_header("if-match", "\"definitely-not-the-current-etag\"");
+    let resp = rt.handle(stale).await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::PRECONDITION_FAILED),
+        "[{mount}] stale If-Match DELETE is 412"
+    );
+    let resp = rt.handle(req(Method::GET, &child("alpha"))).await;
+    assert_eq!(
+        resp.status,
+        Some(StatusCode::OK),
+        "[{mount}] refused delete left the child in place"
+    );
+    let etag = resp
+        .header("etag")
+        .unwrap_or_else(|| panic!("[{mount}] child GET carries ETag"))
+        .to_string();
+
+    // DELETE child (matching If-Match): 204, then gone.
+    let mut matched = req(Method::DELETE, &child("alpha"));
+    matched.set_header("if-match", &etag);
+    let resp = rt.handle(matched).await;
     assert_eq!(
         resp.status,
         Some(StatusCode::NO_CONTENT),

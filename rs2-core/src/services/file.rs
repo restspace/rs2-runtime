@@ -7,7 +7,7 @@ use http::{Method, StatusCode};
 use serde_json::json;
 
 use super::{pagination, Service, ServiceContext};
-use crate::capabilities::ByteRange;
+use crate::capabilities::{ByteRange, WritePrecondition};
 use crate::error::RsError;
 use crate::message::{Body, MediaType, Message, Provenance};
 
@@ -703,7 +703,15 @@ impl Service for FileService {
                 Ok(resp)
             }
             Method::DELETE => {
+                let precondition = super::write_precondition(&msg);
                 if msg.url.is_directory() {
+                    // Directories have no ETag, so a conditional header can't
+                    // be evaluated — refuse rather than silently ignore it.
+                    if !matches!(precondition, WritePrecondition::None) {
+                        return Err(RsError::bad_request(
+                            "conditional headers are not supported on directory deletes",
+                        ));
+                    }
                     // Store contract guard: non-empty containers delete only
                     // with `?confirm=<container name>` (matching `data`).
                     let dir_name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
@@ -717,7 +725,10 @@ impl Service for FileService {
                 } else {
                     // Mirror GET precedence: exact match first, then (friendly
                     // URLs on) the pinned `E1` a no-`Accept` GET would resolve.
-                    match files.delete(&path).await {
+                    // A missing exact path falls out of `delete_cond` as the
+                    // 404 that triggers the fallback, so the precondition is
+                    // checked against whichever file is actually deleted.
+                    match files.delete_cond(&path, precondition.clone()).await {
                         Ok(()) => {}
                         Err(e)
                             if e.code == crate::error::codes::NOT_FOUND
@@ -728,7 +739,7 @@ impl Service for FileService {
                                 .resolve_friendly(&path, None, files, &site.extension_priority)
                                 .await?
                             {
-                                Some(real) => files.delete(&real).await?,
+                                Some(real) => files.delete_cond(&real, precondition).await?,
                                 None => return Err(e),
                             }
                         }

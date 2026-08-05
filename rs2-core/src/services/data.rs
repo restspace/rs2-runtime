@@ -409,6 +409,14 @@ impl Service for DataService {
                         Ok(resp)
                     }
                     Method::DELETE => {
+                        // Datasets have no ETag, so a conditional header
+                        // can't be evaluated — refuse rather than silently
+                        // ignore it (matching `file` directory deletes).
+                        if !matches!(super::write_precondition(&msg), WritePrecondition::None) {
+                            return Err(RsError::bad_request(
+                                "conditional headers are not supported on dataset deletes",
+                            ));
+                        }
                         // Explicit confirm token replaces emptiness
                         // heuristics. 409 matches the store contract's
                         // non-empty-container guard across all stores.
@@ -625,6 +633,35 @@ impl Service for DataService {
                         )))
                     }
                     Method::DELETE => {
+                        // The DELETE side of the optimistic-concurrency
+                        // contract (same best-effort check as PUT above). A
+                        // missing record is not a precondition failure — it
+                        // falls through so the adapter's 404 wins (RFC 9110
+                        // §13.1: preconditions are evaluated only after the
+                        // normal request checks).
+                        match super::write_precondition(&msg) {
+                            WritePrecondition::None => {}
+                            WritePrecondition::IfMatch(want) => {
+                                let cur = get_or_null(data, &dataset, &key).await?;
+                                if !cur.is_null()
+                                    && !crate::capabilities::if_match_hits(
+                                        &want,
+                                        &record_etag(&cur),
+                                    )
+                                {
+                                    return Err(RsError::precondition_failed(
+                                        "If-Match does not match the current ETag — re-read and retry",
+                                    ));
+                                }
+                            }
+                            WritePrecondition::IfNoneMatchStar => {
+                                if !get_or_null(data, &dataset, &key).await?.is_null() {
+                                    return Err(RsError::precondition_failed(
+                                        "If-None-Match: * given but the record exists",
+                                    ));
+                                }
+                            }
+                        }
                         data.delete(&dataset, &key).await?;
                         Ok(msg.no_content())
                     }

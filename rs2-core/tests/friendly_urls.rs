@@ -274,6 +274,33 @@ async fn delete_removes_pinned_then_falls_through() {
 }
 
 #[tokio::test]
+async fn conditional_delete_checks_the_resolved_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = test_runtime(dir.path());
+    put_ok(&rt, "/friendly/docs/readme.md", "# hello", "text/markdown").await;
+
+    let resp = rt.handle(req(Method::GET, "/friendly/docs/readme")).await;
+    let etag = resp.header("etag").unwrap().to_string();
+
+    // A stale If-Match on the slug is checked against the resolved file:
+    // 412, and the file survives.
+    let mut stale = req(Method::DELETE, "/friendly/docs/readme");
+    stale.set_header("if-match", "\"not-the-current-etag\"");
+    let refused = rt.handle(stale).await;
+    assert_eq!(refused.status, Some(StatusCode::PRECONDITION_FAILED));
+    let still = rt.handle(req(Method::GET, "/friendly/docs/readme")).await;
+    assert_eq!(still.status, Some(StatusCode::OK));
+
+    // The matching ETag deletes through the same resolution.
+    let mut matched = req(Method::DELETE, "/friendly/docs/readme");
+    matched.set_header("if-match", &etag);
+    let deleted = rt.handle(matched).await;
+    assert_eq!(deleted.status, Some(StatusCode::NO_CONTENT));
+    let gone = rt.handle(req(Method::GET, "/friendly/docs/readme")).await;
+    assert_eq!(gone.status, Some(StatusCode::NOT_FOUND));
+}
+
+#[tokio::test]
 async fn head_resolves_friendly() {
     let dir = tempfile::tempdir().unwrap();
     let rt = test_runtime(dir.path());
