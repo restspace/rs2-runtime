@@ -112,6 +112,8 @@ jobs:
         working-directory: rs2-worker
       - run: npm run build:shim
         working-directory: rs2-worker
+      # The generated shim module is checked in; a stale one fails here.
+      - run: git diff --exit-code -- rs2-worker/src/engines/guest-shim.bundled.ts
       - run: npm run typecheck
         working-directory: rs2-worker
       - run: npm test

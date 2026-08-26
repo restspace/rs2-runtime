@@ -356,6 +356,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
   status INTEGER, headers TEXT,             -- JSON [[name,value],…]
   body BLOB, media_type TEXT,
   completed_at INTEGER,                     -- ms epoch; replay window 24h
+  started_at INTEGER,                       -- ms epoch; in-flight lifetime 5 min
   PRIMARY KEY (scope, key));
 CREATE INDEX IF NOT EXISTS idem_done ON idempotency(completed_at);
 
@@ -384,7 +385,13 @@ row; absent → insert in-flight, `Fresh`; present with both hashes non-null and
 different → `PayloadMismatch`; in-flight → `InFlight`; done → `Replay`.
 `complete` updates the row (body ≤ 1 MiB; otherwise `abandon` deletes it);
 `abandon` deletes. Row cap 100 000 with oldest-done eviction (an eighth of the
-cap per sweep), in-flight never evicted — `MemIdempotencyStore` semantics.
+cap per sweep), in-flight never evicted — `MemIdempotencyStore` semantics —
+except that an in-flight row whose `started_at` is older than the in-flight
+lifetime (5 min, far beyond the 30 s request wall clock) is **abandoned**
+(deleted, the begin is `Fresh`): a DO reset mid-request would otherwise leave
+the slot answering 409 forever, where Rust's in-memory store forgets on
+restart. `migrateIdempotencySchema` adds the column to pre-existing tables;
+rows without a start time count as abandoned.
 
 **Logs**: `emit` inserts synchronously (SQLite writes in a DO are fast and
 never block on I/O); after every 256 inserts delete rows below
@@ -534,23 +541,40 @@ what the platform lacks:
   today: `capability_denied` when there is no grant named `fetch`, the
   allowlist otherwise.
 
-Shim module (`engines/guest-shim.js`, bundled as text into the Worker):
+Shim modules (`engines/guest-shim.js` + `engines/guest-globals.js`, bundled
+as text into the Worker). The globals module is imported **first**, so it is
+evaluated before the bundle's module scope — as in the Rust prelude, a bundle
+that uses `Buffer` or captures `fetch` at top level sees the installed
+globals and the *wrapped* fetch:
 
 ```js
+// globals.js — evaluated before the bundle
+import { AsyncLocalStorage } from "node:async_hooks";   // loader flag nodejs_als
+export const invocationContext = new AsyncLocalStorage();
+installGlobals();                              // Buffer, global, process, RS2Socket, wrapped fetch, console
+
+// shim.js — the main module
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { invocationContext, rethrow } from "./globals.js";
 import * as user from "./bundle.js";           // the deployed bundle, unchanged
-installGlobals();                              // Buffer, global, process, RS2Socket
 export const features = Array.isArray(user.features) ? user.features : [];
 export default class Rs2Guest extends WorkerEntrypoint {
-  async invoke(msg, config) {                  // called by the host via RPC
-    const ctx = makeCtx(this.env.RS2, config); // host-mediated capabilities
+  async invoke(msg, config, invocationId) {    // called by the host via RPC
     const h = typeof user.default === "function" ? user.default : user.default?.handle;
     if (typeof h !== "function") throw new Error("default export must be a function or { handle }");
-    const out = await h(msg, ctx);
+    const out = await invocationContext.run({ rs2: this.env.RS2, invocationId },
+      () => h(msg, makeCtx(this.env.RS2, config, invocationId)));
     return normalizeEnvelope(out);             // js.rs normalize_envelope semantics
   }
 }
 ```
+
+The surfaces with no per-call handle — the fetch wrapper (which stamps
+`x-rs2-invocation`), console routing, `RS2Socket.connect` — find their
+invocation through `invocationContext`, so concurrent invocations sharing an
+isolate keep their own attribution (grants, principal, outbound budget) and
+work that outlives its invocation carries a finished id the host no longer
+knows (denied).
 
 `makeCtx` mirrors `__rs2_dispatch`'s `ctx` exactly in shape; every member that
 was a blocking op in V8 is now a Promise: `request`, `state.get/put`,
@@ -582,10 +606,14 @@ guest, unforgeable). Methods:
 | `socketConnect(host, port, tls)` | **not RPC** — sockets stay in the guest via `cloudflare:sockets`; the gateway's `connect()` hook enforces the `{"type":"socket","hosts":[…]}` allowlist (`socket_allowed` patterns: `host:port`, host-only, `*`, `*.suffix[:port]`) and denies with `capability 'socket <host>:<port>' is not granted to this service` |
 
 Host → guest: `const worker = env.LOADER.get(id, loadCode)` where `id =
-"<tenant>:<name>@<version>"` (content-addressed; a redeploy is a new id) and
-`loadCode` returns `{compatibilityDate: "2026-08-26", mainModule: "shim.js",
-modules: {"shim.js": SHIM, "bundle.js": {js: bundleText}}, env: {RS2: stub},
-globalOutbound: gateway, limits: {cpuMs, subRequests}, tails: []}`. Then
+"<tenant>:<mount base>:<name>@<version>"` (content-addressed — a redeploy is
+a new id — and mount-addressed, so two mounts of one bundle with different
+grants never share an isolate's module state) and `loadCode` returns
+`{compatibilityDate: "2026-08-22", compatibilityFlags: ["nodejs_als"],
+mainModule: "shim.js", modules: {"shim.js": SHIM, "globals.js": GLOBALS,
+"bundle.js": {js: bundleText}}, env: {RS2: stub}, globalOutbound: gateway,
+limits: {cpuMs, subRequests}, tails: []}` (`engines/dynamic-worker.ts
+guestCodeBase`). Then
 `worker.getEntrypoint("Rs2Guest").invoke(msg, config)` with a `Promise.race`
 against the wall clock (30 s) as a backstop; a CPU-limit exception from the
 loader maps to `limit_exceeded("wall_clock_ms")` (the closest contractual
@@ -771,7 +799,7 @@ rs2-worker/
                           query-template template auth proxy sms wrapper-service
                           services-config catalogue code log-reader
     pipeline/             spec dsl condition transform response segments executor
-    engines/              dynamic-worker.ts host-api.ts guest-shim.js
+    engines/              dynamic-worker.ts host-api.ts guest-shim.js guest-globals.js
     workflows/            transfer.ts (P5)
     fixtures/             catalogue.json (generated by the Rust CLI, checked in)
   test/                   vitest-pool-workers unit tests (per module, mirrors rs2-core unit tests)
@@ -781,7 +809,7 @@ conformance/http/
 
 Scripts (`rs2-worker/package.json`): `dev` (`wrangler dev`), `deploy`,
 `test` (unit), `typecheck`, `build:shim` (esbuild `src/engines/guest-shim.js`
-to a string module). `conformance/http`: `test`, `host:rust`, `host:cf`.
++ `guest-globals.js` to a string module). `conformance/http`: `test`, `host:rust`, `host:cf`.
 Versioning: the Worker's `RS2_VERSION` constant and `rs2-core`'s
 `CARGO_PKG_VERSION` are set from the same git tag by the release workflow;
 `user-agent: rs2/<version>` and `info.version` in OpenAPI therefore match.
@@ -966,4 +994,20 @@ Decisions 24–31 were made during the P3/P4 build (WF2):
 31. **The guest shim ships as a generated module**
     (`engines/guest-shim.bundled.ts`, `npm run build:shim`) checked into the
     tree; a unit test asserts the bundle is fresh against
-    `engines/guest-shim.js` so the two cannot drift.
+    `engines/guest-shim.js` + `guest-globals.js` so they cannot drift, and
+    CI runs `build:shim` then `git diff --exit-code` so a stale checked-in
+    bundle fails the build.
+32. **Invocation attribution is an `AsyncLocalStorage`, not a module
+    global** (`guest-globals.js`, loader flag `nodejs_als` — just
+    `node:async_hooks`, not the full `nodejs_compat` surface). Concurrent
+    invocations of one isolate interleave; a module-level "current
+    invocation" would stamp one invocation's egress with another's id and
+    run it under the wrong grants. The flag is the only Node surface the
+    guest sees.
+33. **Guest worker ids include the mount base**
+    (`<tenant>:<mount base>:<name>@<version>`): grants are per mount, module
+    state is per isolate, so isolates are per mount too.
+34. **The globals module evaluates before the bundle** (`shim.js` imports
+    `./globals.js` before `./bundle.js`): a bundle's module scope sees
+    `Buffer`/`process`/`global`/`RS2Socket` and captures the wrapped
+    `fetch`, matching the Rust prelude's install-then-evaluate order.

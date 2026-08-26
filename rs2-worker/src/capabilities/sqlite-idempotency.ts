@@ -1,7 +1,12 @@
 // DO SQLite `IdempotencyStore` (cloudflare.md §C.3). `begin` is one
 // `transactionSync`; expired `done` rows are swept every 4096 begins; the
 // row cap is 100 000 with oldest-done eviction (an eighth per sweep),
-// in-flight never evicted — `MemIdempotencyStore` semantics.
+// in-flight never evicted — `MemIdempotencyStore` semantics — except that
+// an in-flight row older than `inFlightMs` is *abandoned*: a DO reset
+// mid-request (an unhandled rejection resets the whole object) would
+// otherwise leave the row in-flight forever and answer 409 for that
+// scope+key until the end of time. Rust's in-memory store forgets on
+// restart; this is the durable equivalent.
 
 import type { Begin, IdempotencyStore, StoredResponse } from "../runtime/idempotency";
 import { DEFAULT_REPLAY_WINDOW_MS } from "../runtime/idempotency";
@@ -14,12 +19,31 @@ CREATE TABLE IF NOT EXISTS idempotency (
   status INTEGER, headers TEXT,
   body BLOB, media_type TEXT,
   completed_at INTEGER,
+  started_at INTEGER,
   PRIMARY KEY (scope, key));
 CREATE INDEX IF NOT EXISTS idem_done ON idempotency(completed_at);
 `;
 
+/// Bring a pre-`started_at` table up to date (idempotent; safe to run on
+/// every construction). Rows that predate the column have no start time
+/// and are treated as abandoned on their next `begin`.
+export function migrateIdempotencySchema(sql: SqlStorage): void {
+  const cols = sql
+    .exec<{ name: string }>("SELECT name FROM pragma_table_info('idempotency')")
+    .toArray()
+    .map((r) => r.name);
+  if (!cols.includes("started_at")) {
+    sql.exec("ALTER TABLE idempotency ADD COLUMN started_at INTEGER");
+  }
+}
+
 const SWEEP_EVERY = 4096;
 const MAX_ENTRIES = 100_000;
+
+/// Default in-flight lifetime: a generous multiple of the longest request
+/// the host will run (`wallClockServiceMs` 30 s, dispatch-raced), so a live
+/// request is never mistaken for an abandoned one.
+export const DEFAULT_IN_FLIGHT_MS = 5 * 60_000;
 
 interface Row extends Record<string, SqlStorageValue> {
   payload_hash: string | null;
@@ -29,6 +53,7 @@ interface Row extends Record<string, SqlStorageValue> {
   body: ArrayBuffer | null;
   media_type: string | null;
   completed_at: number | null;
+  started_at: number | null;
 }
 
 export class SqliteIdempotencyStore implements IdempotencyStore {
@@ -38,11 +63,17 @@ export class SqliteIdempotencyStore implements IdempotencyStore {
     private readonly storage: DurableObjectStorage,
     private readonly windowMs = DEFAULT_REPLAY_WINDOW_MS,
     private readonly maxEntries = MAX_ENTRIES,
+    private readonly inFlightMs = DEFAULT_IN_FLIGHT_MS,
   ) {}
 
   private sweep(now: number, forceEvict: boolean): void {
     const sql = this.storage.sql;
     sql.exec("DELETE FROM idempotency WHERE state = 1 AND completed_at < ?", now - this.windowMs);
+    // Abandoned in-flight rows (a reset mid-request); never a live one.
+    sql.exec(
+      "DELETE FROM idempotency WHERE state = 0 AND (started_at IS NULL OR started_at < ?)",
+      now - this.inFlightMs,
+    );
     if (!forceEvict) return;
     const n = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM idempotency").one().n;
     if (n >= this.maxEntries) {
@@ -63,26 +94,29 @@ export class SqliteIdempotencyStore implements IdempotencyStore {
         const count = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM idempotency").one().n;
         if (count >= this.maxEntries) this.sweep(now, true);
       }
-      // Opportunistic expiry of the addressed slot.
+      // Opportunistic expiry of the addressed slot: a done row past the
+      // replay window, or an in-flight row past its lifetime (abandoned).
       sql.exec(
-        "DELETE FROM idempotency WHERE scope = ? AND key = ? AND state = 1 AND completed_at < ?",
+        "DELETE FROM idempotency WHERE scope = ? AND key = ? AND ((state = 1 AND completed_at < ?) OR (state = 0 AND (started_at IS NULL OR started_at < ?)))",
         scope,
         key,
         now - this.windowMs,
+        now - this.inFlightMs,
       );
       const rows = sql
         .exec<Row>(
-          "SELECT payload_hash, state, status, headers, body, media_type, completed_at FROM idempotency WHERE scope = ? AND key = ?",
+          "SELECT payload_hash, state, status, headers, body, media_type, completed_at, started_at FROM idempotency WHERE scope = ? AND key = ?",
           scope,
           key,
         )
         .toArray();
       if (rows.length === 0) {
         sql.exec(
-          "INSERT INTO idempotency (scope, key, payload_hash, state) VALUES (?, ?, ?, 0)",
+          "INSERT INTO idempotency (scope, key, payload_hash, state, started_at) VALUES (?, ?, ?, 0, ?)",
           scope,
           key,
           payloadHash ?? null,
+          now,
         );
         return { kind: "fresh" } as Begin;
       }

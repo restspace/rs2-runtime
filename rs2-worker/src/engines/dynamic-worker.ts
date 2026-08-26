@@ -1,7 +1,7 @@
 // The Dynamic Worker engine (cloudflare.md §E): runs deployed JS bundles as
 // sandboxed Dynamic Workers under the engine-neutral contract — the port of
 // `rs2-core/src/engines/js.rs` over `env.LOADER`. One worker per
-// content-addressed id (`<tenant>:<name>@<version>`); one invocation =
+// mount + bundle (`<tenant>:<mount base>:<name>@<version>`); one invocation =
 // one `Rs2Guest.invoke(msg, config, invocationId)` RPC. Guest capability
 // calls come back into the DO through the `HostApi`/`Egress` entrypoints
 // (`egress.ts`) keyed by the invocation id; the DO-side handlers live here
@@ -15,10 +15,36 @@ import { Message } from "../runtime/message";
 import type { Principal } from "../runtime/message";
 import { GrantedHost } from "./host-api";
 import type { CapabilityTarget, GuestStateKv, LogContext } from "./host-api";
-import { GUEST_SHIM } from "./guest-shim.bundled";
+import { GUEST_GLOBALS, GUEST_SHIM } from "./guest-shim.bundled";
 
 /// The guests' platform snapshot; bump deliberately, never per deploy.
 const GUEST_COMPAT_DATE = "2026-08-22";
+
+/// `nodejs_als` enables only `node:async_hooks` (the shim's per-invocation
+/// attribution, `guest-globals.js`) — not the full `nodejs_compat` surface,
+/// which would change which globals the platform hands the bundle.
+const GUEST_COMPAT_FLAGS = ["nodejs_als"];
+
+/// The loader `modules` for one deployed bundle: the shim (main), its
+/// globals module, and the bundle as `bundle.js`.
+export function guestModules(source: string): Record<string, string | WorkerLoaderModule> {
+  return { "shim.js": GUEST_SHIM, "globals.js": GUEST_GLOBALS, "bundle.js": { js: source } };
+}
+
+/// The loader code descriptor every guest worker shares, minus the
+/// per-worker bindings/limits.
+export function guestCodeBase(source: string): Pick<
+  WorkerLoaderWorkerCode,
+  "compatibilityDate" | "compatibilityFlags" | "mainModule" | "modules" | "tails"
+> {
+  return {
+    compatibilityDate: GUEST_COMPAT_DATE,
+    compatibilityFlags: GUEST_COMPAT_FLAGS,
+    mainModule: "shim.js",
+    modules: guestModules(source),
+    tails: [],
+  };
+}
 
 /// The platform's fixed per-isolate heap (reported, not configurable).
 export const GUEST_MEMORY_BYTES = 128 * 1024 * 1024;
@@ -422,7 +448,9 @@ export interface EngineHost {
 /// Everything one invocation needs beyond the message: the identity, the
 /// grants, and the loader limits.
 export interface InvokeArgs {
-  /// Content-addressed worker id: `<tenant>:<name>@<version>`.
+  /// Worker id: `<tenant>:<mount base>:<name>@<version>` — content-addressed
+  /// AND mount-addressed, so two mounts of one bundle with different grants
+  /// never share an isolate (module-scope state, captured closures).
   codeId: string;
   source: string;
   msg: Message;
@@ -459,13 +487,10 @@ export class DynamicWorkerEngine {
   async compileCheck(source: string, hash: string): Promise<void> {
     try {
       const worker = this.hostEnv.loader.get(`check:${hash}`, () => ({
-        compatibilityDate: GUEST_COMPAT_DATE,
-        mainModule: "shim.js",
-        modules: { "shim.js": GUEST_SHIM, "bundle.js": { js: source } },
+        ...guestCodeBase(source),
         env: {},
         globalOutbound: null,
         limits: { cpuMs: 10_000 },
-        tails: [],
       }));
       const ep = worker.getEntrypoint("Rs2Guest") as unknown as { check(): Promise<boolean> };
       await ep.check();
@@ -581,13 +606,10 @@ export class DynamicWorkerEngine {
     const tenant = msg.tenant;
 
     const worker = this.hostEnv.loader.get(args.codeId, () => ({
-      compatibilityDate: GUEST_COMPAT_DATE,
-      mainModule: "shim.js",
-      modules: { "shim.js": GUEST_SHIM, "bundle.js": { js: args.source } },
+      ...guestCodeBase(args.source),
       env: { RS2: this.hostEnv.hostApiStub(tenant) },
       globalOutbound: this.hostEnv.egressStub(tenant),
       limits: { cpuMs: args.cpuMs, subRequests: args.outboundBudget },
-      tails: [],
     }));
     const ep = worker.getEntrypoint("Rs2Guest") as unknown as {
       invoke(msg: Json, config: Json, invocationId: string): Promise<Json>;
@@ -659,13 +681,10 @@ export class DynamicWorkerEngine {
     wallClockMs: number,
   ): Promise<{ status: number; body: Json }> {
     const worker = this.hostEnv.loader.get(codeId, () => ({
-      compatibilityDate: GUEST_COMPAT_DATE,
-      mainModule: "shim.js",
-      modules: { "shim.js": GUEST_SHIM, "bundle.js": { js: source } },
+      ...guestCodeBase(source),
       env: {},
       globalOutbound: null,
       limits: { cpuMs },
-      tails: [],
     }));
     const ep = worker.getEntrypoint("Rs2Guest") as unknown as {
       invoke(msg: Json, config: Json, invocationId: string): Promise<Json>;

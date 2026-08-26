@@ -51,6 +51,14 @@ const CANNED = {
 export default {
   async fetch(request) {
     const host = new URL(request.url).hostname;
+    // Attribution probe: echoes the invocation id the shim's fetch wrapper
+    // stamped (the real gateway strips it before the grant path).
+    if (host === "echo.test") {
+      return new Response(JSON.stringify({ invocation: request.headers.get("x-rs2-invocation") }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     const body = CANNED[host];
     const headers = {
       "content-type": "application/json",

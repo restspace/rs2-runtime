@@ -12,11 +12,18 @@ import { describe, expect, it } from "vitest";
 import {
   DynamicWorkerEngine,
   cpuMsFromConfig,
+  guestCodeBase,
   socketPatternMatches,
 } from "../src/engines/dynamic-worker";
 import type { EngineHost } from "../src/engines/dynamic-worker";
-import { GUEST_SHIM, GUEST_SHIM_SOURCE_HASH } from "../src/engines/guest-shim.bundled";
+import {
+  GUEST_GLOBALS,
+  GUEST_GLOBALS_SOURCE_HASH,
+  GUEST_SHIM,
+  GUEST_SHIM_SOURCE_HASH,
+} from "../src/engines/guest-shim.bundled";
 import shimSource from "../src/engines/guest-shim.js?raw";
+import globalsSource from "../src/engines/guest-globals.js?raw";
 import { sha256Hex } from "../src/runtime/crypto";
 import { RsError } from "../src/runtime/error";
 
@@ -59,20 +66,18 @@ function invokeGuest(
   msg: Record<string, unknown>,
   config: Record<string, unknown> = {},
   outbound: Fetcher | null = null,
+  invocationId = `test-${id}`,
 ): Promise<GuestEnvelope> {
   const worker = loader!.get(id, () => ({
-    compatibilityDate: "2026-08-22",
-    mainModule: "shim.js",
-    modules: { "shim.js": GUEST_SHIM, "bundle.js": { js: source } },
+    ...guestCodeBase(source),
     env: {},
     globalOutbound: outbound,
     limits: { cpuMs: 15_000, subRequests: 16 },
-    tails: [],
   }));
   const ep = worker.getEntrypoint("Rs2Guest") as unknown as {
     invoke(msg: unknown, config: unknown, invocationId: string): Promise<GuestEnvelope>;
   };
-  return ep.invoke(msg, config, `test-${id}`);
+  return ep.invoke(msg, config, invocationId);
 }
 
 const RUN_MSG = {
@@ -94,6 +99,59 @@ describe("guest shim", () => {
     const lf = shimSource.replace(/\r\n/g, "\n");
     expect(GUEST_SHIM.replace(/\r\n/g, "\n")).toBe(lf);
     expect(GUEST_SHIM_SOURCE_HASH).toBe((await sha256Hex(new TextEncoder().encode(lf))).slice(0, 16));
+    const glf = globalsSource.replace(/\r\n/g, "\n");
+    expect(GUEST_GLOBALS.replace(/\r\n/g, "\n")).toBe(glf);
+    expect(GUEST_GLOBALS_SOURCE_HASH).toBe((await sha256Hex(new TextEncoder().encode(glf))).slice(0, 16));
+  });
+
+  it("globals are installed before the bundle's module scope evaluates (issue #2 item 2)", async () => {
+    // Module-scope use of Buffer/process/global/RS2Socket and a module-scope
+    // capture of `fetch` — the captured fetch must be the WRAPPED one, so
+    // the egress it issues is still stamped with the invocation.
+    const out = await invokeGuest(
+      "test:module-scope",
+      `const b64 = Buffer.from("hi").toString("base64");
+       const plat = typeof process.platform;
+       const g = global === globalThis;
+       const sock = typeof RS2Socket;
+       const capturedFetch = fetch;
+       export default async () => {
+         const r = await capturedFetch("https://echo.test/");
+         const { invocation } = await r.json();
+         return { status: 200, body: { b64, plat, g, sock, invocation } };
+       };`,
+      RUN_MSG,
+      {},
+      outboundStub(),
+      "inv-module-scope",
+    );
+    expect(out.body).toEqual({ b64: "aGk=", plat: "string", g: true, sock: "function", invocation: "inv-module-scope" });
+  });
+
+  it("concurrent invocations of one isolate keep their own attribution (issue #2 item 1)", async () => {
+    // Two invocations interleave inside the same worker: A enters first,
+    // waits, then fetches; B enters while A is waiting and fetches at once.
+    // Every fetch must carry the id of the invocation whose async chain
+    // issued it — not the id of whichever invocation entered last.
+    const source = `export default async (msg) => {
+      await new Promise((r) => setTimeout(r, msg.body.delayMs));
+      const r = await fetch("https://echo.test/" + msg.body.who);
+      const { invocation } = await r.json();
+      // A late fetch from a nested timer stays attributed too.
+      const late = await new Promise((resolve) =>
+        setTimeout(async () => {
+          const rr = await fetch("https://echo.test/late");
+          resolve((await rr.json()).invocation);
+        }, 5),
+      );
+      return { status: 200, body: { who: msg.body.who, invocation, late } };
+    };`;
+    const outbound = outboundStub();
+    const run = (who: string, delayMs: number) =>
+      invokeGuest("test:concurrent", source, { ...RUN_MSG, body: { who, delayMs } }, {}, outbound, `inv-${who}`);
+    const [a, b] = await Promise.all([run("a", 60), run("b", 0)]);
+    expect(a.body).toEqual({ who: "a", invocation: "inv-a", late: "inv-a" });
+    expect(b.body).toEqual({ who: "b", invocation: "inv-b", late: "inv-b" });
   });
 
   it("normalizes envelopes like js.rs (bare value → 200 body, null → 204)", async () => {

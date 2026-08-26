@@ -194,7 +194,10 @@ export class CodeService implements Service {
     };
     const grants = this.grants(ctx);
     const resp = await engine.invoke({
-      codeId: `${msg.tenant}:${serviceRef}`,
+      // Mount-addressed as well as content-addressed: one isolate per mount
+      // of a bundle, so grants never cross mounts through shared module
+      // state (issue #2 item 1).
+      codeId: `${msg.tenant}:${base}:${serviceRef}`,
       source,
       msg,
       config: ctx.config,

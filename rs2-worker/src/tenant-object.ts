@@ -20,7 +20,11 @@ import {
 import type { Invocations, SerializedRequest, SerializedResponse } from "./engines/dynamic-worker";
 import { R2FileStore } from "./capabilities/r2-file-store";
 import { DATA_SCHEMA_SQL, SqliteDataStore } from "./capabilities/sqlite-data-store";
-import { IDEMPOTENCY_SCHEMA_SQL, SqliteIdempotencyStore } from "./capabilities/sqlite-idempotency";
+import {
+  IDEMPOTENCY_SCHEMA_SQL,
+  SqliteIdempotencyStore,
+  migrateIdempotencySchema,
+} from "./capabilities/sqlite-idempotency";
 import { LOG_SCHEMA_SQL, SqliteLogStore } from "./capabilities/sqlite-log-store";
 import type { Env } from "./env";
 import { INFRAS_VERSION_HEADER, TENANT_HEADER, TRACE_HEADER } from "./env";
@@ -98,6 +102,7 @@ export class TenantObject extends DurableObject<Env> {
       for (const stmt of [DATA_SCHEMA_SQL, IDEMPOTENCY_SCHEMA_SQL, LOG_SCHEMA_SQL, SCHEDULE_SCHEMA_SQL]) {
         ctx.storage.sql.exec(stmt);
       }
+      migrateIdempotencySchema(ctx.storage.sql);
     });
   }
 
