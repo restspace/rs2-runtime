@@ -34,6 +34,22 @@ import { InfraSet } from "./runtime/infra";
 import { NullLogStore, parseSeverity } from "./runtime/logging";
 import type { LogStore } from "./runtime/logging";
 import { MediaType } from "./runtime/media-type";
+
+/// A forward that names a tenant this object does not embody (see
+/// `TenantObject.isSelf`). Not a client-visible condition in a correct
+/// deployment, so a plain 500 problem rather than a tenant-scoped one.
+function misrouted(tenant: string): Response {
+  return new Response(
+    JSON.stringify({
+      type: "https://rs2.dev/errors#internal",
+      title: "Internal Error",
+      status: 500,
+      code: "internal",
+      detail: `request for tenant '${tenant}' reached a different tenant object`,
+    }),
+    { status: 500, headers: { "content-type": "application/problem+json" } },
+  );
+}
 import { Message, TraceContext } from "./runtime/message";
 import { claimOccurrence, claimTtlMs, dueOccurrenceMs, earliestNextDueMs, scheduledMounts, tickMessage } from "./runtime/scheduler";
 import { buildTenant, seedBuiltins } from "./runtime/tenant-build";
@@ -170,6 +186,7 @@ export class TenantObject extends DurableObject<Env> {
   }
 
   private async runtimeFor(tenant: string): Promise<Runtime> {
+    this.assertSelf(tenant);
     if (this.runtime && this.tenantName === tenant) return this.runtime;
     this.tenantName = tenant;
     if (this.builtInfrasVersion === undefined) await this.refreshInfras();
@@ -209,10 +226,25 @@ export class TenantObject extends DurableObject<Env> {
     this.runtime = undefined;
   }
 
+  /// Defence in depth: this object serves exactly the tenant whose name
+  /// derives its id (`TENANTS.idFromName(tenant)`). A caller naming another
+  /// tenant — a leaked stub, a forged forward header — is refused rather
+  /// than trusted, so the R2 prefix can never diverge from the DO identity.
+  private isSelf(tenant: string): boolean {
+    return this.env.TENANTS.idFromName(tenant).equals(this.ctx.id);
+  }
+
+  private assertSelf(tenant: string): void {
+    if (!this.isSelf(tenant)) {
+      throw new Error(`tenant object identity mismatch: this object is not tenant '${tenant}'`);
+    }
+  }
+
   // ---- HTTP entry (§B.3 steps 4–8) -----------------------------------------
 
   override async fetch(request: Request): Promise<Response> {
     const tenant = request.headers.get(TENANT_HEADER) ?? this.env.RS2_DEFAULT_TENANT ?? "main";
+    if (!this.isSelf(tenant)) return misrouted(tenant);
     const traceId = request.headers.get(TRACE_HEADER) ?? undefined;
     const infrasVersion = request.headers.get(INFRAS_VERSION_HEADER);
     if (infrasVersion !== null && this.builtInfrasVersion !== undefined && infrasVersion !== this.builtInfrasVersion) {
@@ -235,6 +267,7 @@ export class TenantObject extends DurableObject<Env> {
   /// `PUT /admin/tenants/<name>`: dry-build, persist, register. The config
   /// travels as JSON text so the RPC types stay shallow.
   async putConfig(tenant: string, configText: string, ifMatch: string | undefined): Promise<{ version: string; created: boolean }> {
+    this.assertSelf(tenant);
     const runtime = await this.runtimeFor(tenant);
     const existed = (await this.ctx.storage.get<string>("config")) !== undefined;
     const config = JSON.parse(configText) as JsonObject;
@@ -249,6 +282,7 @@ export class TenantObject extends DurableObject<Env> {
 
   /// Seed the bootstrap admin **if absent** exactly as `seed_bootstrap_admin`.
   async seedAdmin(tenant: string, email: string, password: string): Promise<"seeded" | "present"> {
+    this.assertSelf(tenant);
     const raw = await this.loadRaw();
     if (!raw) throw RsError.notFound(`unknown tenant '${tenant}'`);
     const auth = raw[0].auth;
@@ -281,6 +315,7 @@ export class TenantObject extends DurableObject<Env> {
   /// Validate a config without persisting (used by the admin API before any
   /// registry write). Errors are the same 400s `PUT /raw` produces.
   async dryBuild(tenant: string, configText: string): Promise<void> {
+    this.assertSelf(tenant);
     if (this.builtInfrasVersion === undefined) await this.refreshInfras();
     const config = JSON.parse(configText) as JsonObject;
     const parsed = parseTenantConfig(config);
@@ -317,8 +352,11 @@ export class TenantObject extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     const raw = await this.loadRaw();
     if (!raw) return; // tenant deleted; the alarm dies with it
-    const tenant =
-      this.tenantName ?? (await this.ctx.storage.get<string>("tenant.name")) ?? this.env.RS2_DEFAULT_TENANT ?? "main";
+    // No guessing: a tenant configured before names were persisted has no
+    // recorded name, and defaulting would tick under the wrong R2 prefix.
+    // Its next config write persists the name and re-arms the alarm.
+    const tenant = this.tenantName ?? (await this.ctx.storage.get<string>("tenant.name"));
+    if (tenant === undefined || !this.isSelf(tenant)) return;
     const mounts = scheduledMounts(raw[0]);
     const nowMs = Date.now();
     const fires: Array<Promise<void>> = [];

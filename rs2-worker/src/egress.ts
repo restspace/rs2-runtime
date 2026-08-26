@@ -52,48 +52,49 @@ function stub(env: Env, ctx: { props?: unknown }): TenantGuestRpc {
   return env.TENANTS.get(env.TENANTS.idFromName(tenant)) as unknown as TenantGuestRpc;
 }
 
+/// Every prototype method of a `WorkerEntrypoint` is callable over RPC by
+/// whoever holds the binding — here, the guest. So this class carries ONLY
+/// the op table: no helpers, no accessors, nothing that returns the tenant
+/// stub (which would hand the guest `putConfig`/`rawConfig`/`deleteAll`).
+/// `test/egress-surface.test.ts` pins the exact method set.
 export class HostApi extends WorkerEntrypoint<Env> {
-  private tenant(): TenantGuestRpc {
-    return stub(this.env, this.ctx as unknown as { props?: unknown });
-  }
-
   request(invocationId: string, capability: string, req: Json): Promise<Json> {
-    return this.tenant().guestRequest(invocationId, capability, req);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestRequest(invocationId, capability, req);
   }
 
   log(invocationId: string, level: string, text: string): Promise<void> {
-    return this.tenant().guestLog(invocationId, level, text);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestLog(invocationId, level, text);
   }
 
   stateGet(invocationId: string, key: string): Promise<Json> {
-    return this.tenant().guestStateGet(invocationId, key);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestStateGet(invocationId, key);
   }
 
   statePut(invocationId: string, key: string, value: string): Promise<Json> {
-    return this.tenant().guestStatePut(invocationId, key, value);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestStatePut(invocationId, key, value);
   }
 
   bodyRead(invocationId: string): Promise<Json | { data: Uint8Array }> {
-    return this.tenant().guestBodyRead(invocationId);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestBodyRead(invocationId);
   }
 
   streamBegin(invocationId: string, envelope: Json): Promise<Json> {
-    return this.tenant().guestStreamBegin(invocationId, envelope);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestStreamBegin(invocationId, envelope);
   }
 
   bodyWrite(invocationId: string, data: Uint8Array): Promise<Json> {
-    return this.tenant().guestBodyWrite(invocationId, data);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestBodyWrite(invocationId, data);
   }
 
   socketCheck(invocationId: string, host: string, port: number, _tls: boolean): Promise<Json> {
-    return this.tenant().guestSocketCheck(invocationId, host, port);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketCheck(invocationId, host, port);
   }
 
   /// The serialized-fetch path (spec §E.3 `fetchOut`) for callers that hold
   /// an explicit invocation id; the gateway's `fetch` below is the normal
   /// route.
   async fetchOut(invocationId: string, req: SerializedRequest): Promise<SerializedResponse> {
-    return this.tenant().guestFetch(invocationId, req);
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestFetch(invocationId, req);
   }
 }
 

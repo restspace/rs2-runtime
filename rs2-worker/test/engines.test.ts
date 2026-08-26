@@ -89,8 +89,11 @@ const RUN_MSG = {
 
 describe("guest shim", () => {
   it("generated shim module is current (run `npm run build:shim` after editing guest-shim.js)", async () => {
-    expect(GUEST_SHIM).toBe(shimSource);
-    expect(GUEST_SHIM_SOURCE_HASH).toBe((await sha256Hex(new TextEncoder().encode(shimSource))).slice(0, 16));
+    // Compare on LF: a Windows checkout (core.autocrlf) hands vite the
+    // .js with CRLF while the generated module was built from LF.
+    const lf = shimSource.replace(/\r\n/g, "\n");
+    expect(GUEST_SHIM.replace(/\r\n/g, "\n")).toBe(lf);
+    expect(GUEST_SHIM_SOURCE_HASH).toBe((await sha256Hex(new TextEncoder().encode(lf))).slice(0, 16));
   });
 
   it("normalizes envelopes like js.rs (bare value → 200 body, null → 204)", async () => {
