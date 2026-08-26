@@ -31,281 +31,15 @@ use rs2_core::{RsError, Runtime};
 
 // ---- the adapter bundle: a store-pattern surface over RESP -----------------
 
-/// A minimal RESP (Redis) client over the pooled socket, shared by the data and
-/// query adapters below — it connects lazily and caches the socket in a
-/// module-level var, so the resident runtime keeps one connection across
-/// requests. A concrete adapter appends its handler (`export default …`).
-const RESP_CLIENT: &str = r#"
-let SOCK = null;
-let RBUF = new Uint8Array(0);
-
-function connect(config) {
-  if (SOCK) return;
-  SOCK = RS2Socket.connect(config.host || "127.0.0.1", config.port | 0);
-  RBUF = new Uint8Array(0);
-}
-function append(a, b) {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a, 0); out.set(b, a.length);
-  return out;
-}
-function readLine() {
-  let i = 0;
-  for (;;) {
-    while (i + 1 < RBUF.length) {
-      if (RBUF[i] === 13 && RBUF[i + 1] === 10) {
-        const line = new TextDecoder().decode(RBUF.slice(0, i));
-        RBUF = RBUF.slice(i + 2);
-        return line;
-      }
-      i++;
-    }
-    const chunk = SOCK.read(65536);
-    if (chunk === null) throw new Error("redis: connection closed");
-    RBUF = append(RBUF, chunk);
-  }
-}
-function readN(n) {
-  while (RBUF.length < n) {
-    const chunk = SOCK.read(65536);
-    if (chunk === null) throw new Error("redis: connection closed");
-    RBUF = append(RBUF, chunk);
-  }
-  const out = RBUF.slice(0, n);
-  RBUF = RBUF.slice(n);
-  return out;
-}
-function readReply() {
-  const line = readLine();
-  const t = line[0], rest = line.slice(1);
-  if (t === "+") return rest;
-  if (t === "-") throw new Error("redis: " + rest);
-  if (t === ":") return parseInt(rest, 10);
-  if (t === "$") {
-    const len = parseInt(rest, 10);
-    if (len < 0) return null;
-    const data = readN(len);
-    readN(2);
-    return new TextDecoder().decode(data);
-  }
-  if (t === "*") {
-    const count = parseInt(rest, 10);
-    if (count < 0) return null;
-    const arr = [];
-    for (let k = 0; k < count; k++) arr.push(readReply());
-    return arr;
-  }
-  throw new Error("redis: bad reply " + line);
-}
-function cmd(...args) {
-  let s = "*" + args.length + "\r\n";
-  for (const a of args) {
-    const str = String(a);
-    s += "$" + new TextEncoder().encode(str).length + "\r\n" + str + "\r\n";
-  }
-  SOCK.write(s);
-  return readReply();
-}
-"#;
-
-/// The data adapter: a store-pattern surface (`GET/PUT/DELETE /{ds}/{key}`,
-/// container + root listings) over the RESP client. Appended to `RESP_CLIENT`.
-const DATA_HANDLER: &str = r#"
-export default async (msg, ctx) => {
-  connect(ctx.config);
-  const url = String(msg.url);
-  const path = url.split("?")[0];
-  const params = new URLSearchParams(url.split("?")[1] || "");
-  const skip = parseInt(params.get("$skip") || "0", 10);
-  const take = parseInt(params.get("$take") || "1000", 10);
-  const page = (all) => all.slice(skip, skip + take);
-  const isContainer = path.endsWith("/");
-  const segs = path.split("/").filter(Boolean);
-
-  if (segs.length === 0) {
-    if (msg.method !== "GET") return { status: 400, body: { detail: "root supports GET" } };
-    const keys = cmd("KEYS", "*") || [];
-    const datasets = {};
-    for (const k of keys) datasets[k.split(":")[0]] = true;
-    const names = Object.keys(datasets).sort();
-    const entries = page(names).map((n) => ({ name: n + "/", dir: true }));
-    return { status: 200, body: { path: "/", entries, total: names.length } };
-  }
-
-  const dataset = segs[0];
-  if (segs.length === 1 && isContainer) {
-    if (msg.method === "GET") {
-      const keys = cmd("KEYS", dataset + ":*") || [];
-      const names = keys
-        .map((k) => k.slice(dataset.length + 1))
-        .filter((n) => n !== ".schema.json")
-        .sort();
-      const entries = page(names).map((n) => ({ name: n, dir: false, contentType: "application/json" }));
-      return { status: 200, body: { path: "/" + dataset + "/", entries, total: names.length } };
-    }
-    if (msg.method === "DELETE") {
-      for (const k of cmd("KEYS", dataset + ":*") || []) cmd("DEL", k);
-      return { status: 204 };
-    }
-    return { status: 400, body: { detail: "container supports GET, DELETE" } };
-  }
-
-  const key = segs.slice(1).join("/");
-  const rkey = dataset + ":" + key;
-  if (msg.method === "GET") {
-    const v = cmd("GET", rkey);
-    if (v === null) return { status: 404, body: { detail: "no record '" + key + "'" } };
-    return { status: 200, body: JSON.parse(v) };
-  }
-  if (msg.method === "PUT") {
-    const existed = cmd("EXISTS", rkey);
-    cmd("SET", rkey, JSON.stringify(msg.body));
-    return { status: existed ? 200 : 201 };
-  }
-  if (msg.method === "DELETE") {
-    if (!cmd("DEL", rkey)) return { status: 404, body: { detail: "no record '" + key + "'" } };
-    return { status: 204 };
-  }
-  return { status: 400, body: { detail: "method not supported" } };
-};
-"#;
-
-/// The query adapter: executes a stored query (`POST /query` with
-/// `{query, params, take, skip}`) by scanning the dataset over the RESP client
-/// and filtering by the substituted `where` clause — query push-down to the
-/// backend. Appended to `RESP_CLIENT`.
-const QUERY_HANDLER: &str = r#"
-function keep(record, where) {
-  return Object.entries(where).every(([field, clause]) => {
-    if (clause && typeof clause === "object" && clause.op) {
-      const a = record[field], b = clause.value;
-      switch (clause.op) {
-        case ">=": return a >= b;
-        case ">":  return a > b;
-        case "<=": return a <= b;
-        case "<":  return a < b;
-        case "!=": return a !== b;
-        default:    return a === b;
-      }
-    }
-    return record[field] === clause;
-  });
-}
-export default async (msg, ctx) => {
-  connect(ctx.config);
-  const { query, take, skip } = msg.body;
-  const dataset = query.dataset;
-  const where = query.where || {};
-  const keys = cmd("KEYS", dataset + ":*") || [];
-  let rows = [];
-  for (const k of keys) {
-    const name = k.slice(dataset.length + 1);
-    if (name === ".schema.json") continue;
-    const rec = JSON.parse(cmd("GET", k));
-    rec._key = name;
-    if (keep(rec, where)) rows.push(rec);
-  }
-  if (query.orderBy) rows.sort((a, b) => (a[query.orderBy] > b[query.orderBy] ? 1 : -1));
-  const total = rows.length;
-  return { status: 200, body: { rows: rows.slice(skip, skip + take), total } };
-};
-"#;
-
-/// A self-contained `FileStore` adapter that keeps files in a module-level map
-/// (no backend needed — the socket/pooling path is proven by the data/query
-/// adapters). It implements the store pattern the host's `GuestFileStore`
-/// speaks: `HEAD`/`GET`/`PUT`/`DELETE`/`MOVE` on `/{path}`, container listings
-/// on `/{path}/`, content base64 across the JSON boundary.
-const FILE_ADAPTER: &str = r#"
-let FILES = {}; // path -> { data: base64, mediaType }
-
-function b64len(b64) {
-  if (!b64) return 0;
-  let n = Math.floor((b64.length * 3) / 4);
-  if (b64.endsWith("==")) n -= 2;
-  else if (b64.endsWith("=")) n -= 1;
-  return n;
-}
-
-export default async (msg) => {
-  const url = String(msg.url);
-  const path = url.split("?")[0];
-  const qs = new URLSearchParams(url.split("?")[1] || "");
-  const isDir = path.endsWith("/");
-  const m = msg.method;
-
-  if (m === "HEAD") {
-    if (isDir) {
-      const exists = path === "/" || Object.keys(FILES).some((k) => k.startsWith(path));
-      return exists ? { status: 200, body: { size: 0, isDir: true } } : { status: 404, body: { detail: "no directory" } };
-    }
-    const f = FILES[path];
-    return f
-      ? { status: 200, body: { size: b64len(f.data), isDir: false, mediaType: f.mediaType } }
-      : { status: 404, body: { detail: "not found" } };
-  }
-
-  if (m === "GET" && isDir) {
-    const fileSet = new Set(), dirSet = new Set();
-    for (const k of Object.keys(FILES)) {
-      if (path !== "/" && !k.startsWith(path)) continue;
-      const rest = path === "/" ? k.slice(1) : k.slice(path.length);
-      if (!rest) continue;
-      const slash = rest.indexOf("/");
-      if (slash === -1) fileSet.add(rest);
-      else dirSet.add(rest.slice(0, slash));
-    }
-    const base = path === "/" ? "/" : path;
-    const entries = [];
-    for (const d of [...dirSet].sort()) entries.push({ name: d + "/", dir: true, size: 0 });
-    for (const f of [...fileSet].sort()) {
-      entries.push({ name: f, dir: false, size: b64len(FILES[base + f].data), contentType: FILES[base + f].mediaType });
-    }
-    const total = entries.length;
-    const skip = parseInt(qs.get("$skip") || "0", 10), take = parseInt(qs.get("$take") || "1000", 10);
-    return { status: 200, body: { entries: entries.slice(skip, skip + take), total } };
-  }
-
-  if (m === "GET") {
-    const f = FILES[path];
-    return f
-      ? { status: 200, body: { contentBase64: f.data, mediaType: f.mediaType } }
-      : { status: 404, body: { detail: "not found" } };
-  }
-
-  if (m === "PUT") {
-    const existed = !!FILES[path];
-    FILES[path] = { data: msg.body.contentBase64 || "", mediaType: msg.body.mediaType || "application/octet-stream" };
-    return { status: existed ? 200 : 201 };
-  }
-
-  if (m === "MOVE") {
-    const f = FILES[path];
-    if (!f) return { status: 404, body: { detail: "source missing" } };
-    const existed = !!FILES[msg.body.to];
-    FILES[msg.body.to] = f;
-    delete FILES[path];
-    return { status: existed ? 200 : 201 };
-  }
-
-  if (m === "DELETE") {
-    if (isDir) {
-      const under = Object.keys(FILES).filter((k) => k.startsWith(path));
-      if (msg.body && msg.body.recursive) {
-        for (const k of under) delete FILES[k];
-        return { status: 204 };
-      }
-      if (under.length > 0) return { status: 409, body: { detail: "directory not empty" } };
-      return { status: 204 };
-    }
-    if (!FILES[path]) return { status: 404, body: { detail: "not found" } };
-    delete FILES[path];
-    return { status: 204 };
-  }
-
-  return { status: 400, body: { detail: "unsupported method" } };
-};
-"#;
+/// The Redis (RESP) data/query adapters and the in-memory file adapter are
+/// the conformance fixtures under `conformance/http/fixtures/` — embedded
+/// verbatim so ONE copy is held to the store contract both in-process
+/// (here) and over HTTP on both hosts (`conformance/http/guest-adapter.test.ts`).
+/// They are await-based (host-portable: RS2Socket is sync here, async on
+/// the Worker) with a module-level lock serializing wire exchanges.
+const REDIS_DATA_ADAPTER: &str = include_str!("../../conformance/http/fixtures/redis-data.js");
+const REDIS_QUERY_ADAPTER: &str = include_str!("../../conformance/http/fixtures/redis-query.js");
+const FILE_ADAPTER: &str = include_str!("../../conformance/http/fixtures/guest-file.js");
 
 /// The MongoDB adapters are the checked-in deployable bundles under
 /// `guest-adapters/` — embedded verbatim so the contract tests hold the
@@ -986,7 +720,7 @@ async fn guest_backed_data_store_satisfies_the_store_contract() {
             "t",
             ".rs2-code/redis/v1.js",
             Body::from_string(
-                format!("{RESP_CLIENT}{DATA_HANDLER}"),
+                REDIS_DATA_ADAPTER.to_string(),
                 MediaType::new("application/javascript"),
             ),
         )
@@ -1188,7 +922,7 @@ async fn guest_backed_query_store_executes_a_stored_query() {
         .write(
             "t",
             ".rs2-code/redis/v1.js",
-            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+            js(REDIS_DATA_ADAPTER.to_string()),
         )
         .await
         .unwrap();
@@ -1196,7 +930,7 @@ async fn guest_backed_query_store_executes_a_stored_query() {
         .write(
             "t",
             ".rs2-code/redis-query/v1.js",
-            js(format!("{RESP_CLIENT}{QUERY_HANDLER}")),
+            js(REDIS_QUERY_ADAPTER.to_string()),
         )
         .await
         .unwrap();
@@ -1325,7 +1059,7 @@ async fn pool_grows_under_concurrency_and_caps_at_max_runtimes() {
         .write(
             "t",
             ".rs2-code/redis/v1.js",
-            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+            js(REDIS_DATA_ADAPTER.to_string()),
         )
         .await
         .unwrap();
@@ -1358,7 +1092,7 @@ async fn idle_runtimes_are_evicted_and_respawn() {
         .write(
             "t",
             ".rs2-code/redis/v1.js",
-            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+            js(REDIS_DATA_ADAPTER.to_string()),
         )
         .await
         .unwrap();
@@ -2028,7 +1762,7 @@ async fn guest_data_listing_fallback_and_native_pushdown_match_the_contract() {
         .write(
             "t",
             ".rs2-code/redis/v1.js",
-            js(format!("{RESP_CLIENT}{DATA_HANDLER}")),
+            js(REDIS_DATA_ADAPTER.to_string()),
         )
         .await
         .unwrap();

@@ -15,6 +15,7 @@
 // `ctx.exports.Egress({props: {tenant}})` — the props are invisible to and
 // unforgeable by the guest.
 
+import { connect as connectSocket } from "cloudflare:sockets";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Json } from "./runtime/error";
 import type { SerializedRequest, SerializedResponse } from "./engines/dynamic-worker";
@@ -36,6 +37,7 @@ interface TenantGuestRpc {
   guestStreamBegin(invocationId: string, envelope: Json): Promise<Json>;
   guestBodyWrite(invocationId: string, data: Uint8Array): Promise<Json>;
   guestSocketCheck(invocationId: string, host: string, port: number): Promise<Json>;
+  guestSocketConsume(host: string, port: number): Promise<boolean>;
   guestFetch(invocationId: string | null, req: SerializedRequest): Promise<SerializedResponse>;
 }
 
@@ -127,5 +129,50 @@ export class Egress extends WorkerEntrypoint<Env> {
     const status = out.status >= 200 && out.status <= 599 ? out.status : 502;
     const noBody = status === 204 || status === 304 || !out.body || out.body.byteLength === 0;
     return new Response(noBody ? null : (out.body as Uint8Array<ArrayBuffer>), { status, headers: respHeaders });
+  }
+}
+
+/// The egress gateway **with the §E.4 socket hook** — what dynamic workers
+/// actually get as `globalOutbound`. A guest's `connect()` from
+/// `cloudflare:sockets` dispatches here with the dialed target in
+/// `socket.opened.localAddress` (raw TCP carries no header channel, so no
+/// invocation id reaches this hook). Enforcement therefore happens in two
+/// steps: the shim's `RS2Socket.connect` first calls `socketCheck` (full
+/// invocation attribution — the allowlist and the `capability_denied`
+/// identity live there), and an allowed check records a short-lived
+/// one-shot approval for `<host>:<port>` in the tenant DO; this hook
+/// consumes the approval and bridges to the real backend, and closes the
+/// inbound socket when no approval exists (a bundle bypassing `RS2Socket`
+/// straight to the platform `connect` gets a dead socket, never egress).
+/// A subclass so the base `Egress` surface stays exactly `["fetch"]`
+/// (`test/egress-surface.test.ts` pins both).
+export class EgressSockets extends Egress {
+  override async connect(socket: Socket): Promise<void> {
+    let host: string | undefined;
+    let port = NaN;
+    try {
+      const info = await socket.opened;
+      const target = info.localAddress ?? "";
+      const colon = target.lastIndexOf(":");
+      if (colon > 0) {
+        host = target.slice(0, colon);
+        port = Number(target.slice(colon + 1));
+      }
+    } catch {
+      /* no target → treated as unapproved below */
+    }
+    const approved =
+      host !== undefined && Number.isInteger(port) && port > 0
+        ? await stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketConsume(host, port)
+        : false;
+    if (!approved) {
+      await socket.close().catch(() => undefined);
+      return;
+    }
+    const upstream = connectSocket({ hostname: host!, port }, { allowHalfOpen: false });
+    const inbound = socket.readable.pipeTo(upstream.writable).catch(() => undefined);
+    const outbound = upstream.readable.pipeTo(socket.writable).catch(() => undefined);
+    this.ctx.waitUntil(Promise.all([inbound, outbound]).then(() => undefined));
+    await Promise.all([inbound, outbound]);
   }
 }

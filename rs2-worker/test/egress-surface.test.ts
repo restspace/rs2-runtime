@@ -3,7 +3,7 @@
 // (a helper returning the tenant stub, say) is a capability leak. Pin the
 // exact surface so an added helper fails the build rather than shipping.
 import { describe, expect, it } from "vitest";
-import { Egress, HostApi } from "../src/egress";
+import { Egress, EgressSockets, HostApi } from "../src/egress";
 
 const HOST_API_OPS = [
   "request",
@@ -30,5 +30,13 @@ describe("guest-boundary entrypoints expose only the op table", () => {
 
   it("Egress exposes only fetch", () => {
     expect(ownMethods(Egress)).toEqual(["fetch"]);
+  });
+
+  it("EgressSockets adds only the §E.4 connect hook", () => {
+    // The gateway dynamic workers actually get as `globalOutbound`: the
+    // fetch gateway plus the socket bridge. `connect` is a platform event
+    // handler (workerd dispatches guest `cloudflare:sockets` connects to
+    // it), not an op a guest can call with arguments of its choosing.
+    expect(ownMethods(EgressSockets)).toEqual(["connect"]);
   });
 });

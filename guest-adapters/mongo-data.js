@@ -17,13 +17,49 @@
 // Bundles are single-file ESM with no build step, so this section is
 // duplicated verbatim in both adapters; edit both or they diverge.
 // ============================================================================
-let SOCK = null, RBUF = new Uint8Array(0), DB = "test", REQID = 0;
+let SOCK = null, RBUF = new Uint8Array(0), DB = "test", REQID = 0, LOCK = Promise.resolve(), CONF = {};
 
-function connect(config) {
-  if (SOCK) return;
+// Serializes connect + command exchanges: on the Worker host, concurrent
+// invocations share one isolate (and the one pooled socket), so wire
+// exchanges must not interleave. On the Rust host jobs are serialized
+// already; the lock is a no-op there.
+function locked(fn) {
+  const run = LOCK.then(fn);
+  LOCK = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+// Host-portable sockets: RS2Socket is synchronous on the Rust host and
+// async on the Worker (the `guest-async` facet) — awaiting a plain value
+// is a no-op, so awaiting everywhere runs on both hosts unchanged.
+// `connect` only remembers the config; the socket opens lazily inside
+// `exchange` so a dead pooled socket can be replaced.
+async function connect(config) {
+  CONF = config;
   DB = config.db || "test";
-  SOCK = RS2Socket.connect(config.host || "127.0.0.1", config.port | 0);
+}
+async function ensureConnected() {
+  if (SOCK) return;
+  SOCK = await RS2Socket.connect(CONF.host || "127.0.0.1", CONF.port | 0);
   RBUF = new Uint8Array(0);
+}
+// Run one whole command exchange under the lock. On the Rust host the
+// resident isolate pools the socket for its lifetime and the retry path
+// never runs; on the Worker host I/O objects are request-scoped, so a
+// socket pooled in module scope dies at the invocation boundary — the
+// first use then throws, and the exchange reconnects and retries once.
+async function exchange(fn) {
+  return locked(async () => {
+    try {
+      await ensureConnected();
+      return await fn();
+    } catch (e) {
+      try { if (SOCK) await SOCK.close(); } catch {}
+      SOCK = null;
+      await ensureConnected();
+      return await fn();
+    }
+  });
 }
 
 // --- BSON encode (subset: doc/array/string/int32/int64/double/bool/null) ---
@@ -87,8 +123,8 @@ function decodeDoc(bytes, start) {
 
 // --- OP_MSG over the socket ---
 function cat(a, b) { const o = new Uint8Array(a.length + b.length); o.set(a, 0); o.set(b, a.length); return o; }
-function ensure(n) { while (RBUF.length < n) { const c = SOCK.read(65536); if (c === null) throw new Error("mongo: closed"); RBUF = cat(RBUF, c); } }
-function command(doc) {
+async function ensure(n) { while (RBUF.length < n) { const c = await SOCK.read(65536); if (c === null) throw new Error("mongo: closed"); RBUF = cat(RBUF, c); } }
+async function command(doc) {
   doc["$db"] = DB;
   const body = encodeDoc(doc);
   const msg = new Uint8Array(21 + body.length);
@@ -98,14 +134,16 @@ function command(doc) {
   dv.setInt32(12, 2013, true); // OP_MSG
   msg[20] = 0; // section kind 0
   msg.set(body, 21);
-  SOCK.write(msg);
-  ensure(4);
-  const len = new DataView(RBUF.buffer, RBUF.byteOffset, RBUF.byteLength).getInt32(0, true);
-  ensure(len);
-  const reply = decodeDoc(RBUF.slice(0, len), 21)[0];
-  RBUF = RBUF.slice(len);
-  if (!reply.ok) throw new Error("mongo error: " + JSON.stringify(reply));
-  return reply;
+  return exchange(async () => {
+    await SOCK.write(msg);
+    await ensure(4);
+    const len = new DataView(RBUF.buffer, RBUF.byteOffset, RBUF.byteLength).getInt32(0, true);
+    await ensure(len);
+    const reply = decodeDoc(RBUF.slice(0, len), 21)[0];
+    RBUF = RBUF.slice(len);
+    if (!reply.ok) throw new Error("mongo error: " + JSON.stringify(reply));
+    return reply;
+  });
 }
 // ============================================================================
 // end of shared wire section
@@ -146,7 +184,7 @@ function pick(doc, paths) {
 }
 
 export default async (msg, ctx) => {
-  connect(ctx.config);
+  await connect(ctx.config);
   const path = String(msg.url).split("?")[0];
   const qs = new URLSearchParams(String(msg.url).split("?")[1] || "");
   const segs = path.split("/").filter(Boolean);
@@ -154,7 +192,7 @@ export default async (msg, ctx) => {
 
   if (segs.length === 0) {
     if (msg.method !== "GET") return { status: 400, body: { detail: "root supports GET" } };
-    const reply = command({ listCollections: 1, nameOnly: true });
+    const reply = await command({ listCollections: 1, nameOnly: true });
     const names = (reply.cursor.firstBatch || []).map((c) => c.name).filter((n) => n !== SCHEMA_COLL).sort();
     const entries = names.slice(skip, skip + take).map((n) => ({ name: n + "/", dir: true }));
     return { status: 200, body: { path: "/", entries, total: names.length } };
@@ -178,50 +216,50 @@ export default async (msg, ctx) => {
         if (k.startsWith("-")) sort[k.slice(1)] = -1; else sort[k] = 1;
       }
       if (!("_id" in sort)) sort._id = 1;
-      const total = command({ count: dataset }).n || 0;
-      const found = command({ find: dataset, filter: {}, projection, sort, skip, limit: take });
+      const total = (await command({ count: dataset })).n || 0;
+      const found = await command({ find: dataset, filter: {}, projection, sort, skip, limit: take });
       const entries = (found.cursor.firstBatch || []).map((d) => ({
         name: String(d._id), dir: false, contentType: "application/json", fields: pick(d, fields),
       }));
       return { status: 200, body: { path: "/" + dataset + "/", entries, total } };
     }
     if (msg.method === "GET") {
-      const total = command({ count: dataset }).n || 0;
-      const found = command({ find: dataset, filter: {}, skip, limit: take });
+      const total = (await command({ count: dataset })).n || 0;
+      const found = await command({ find: dataset, filter: {}, skip, limit: take });
       const names = (found.cursor.firstBatch || []).map((d) => String(d._id)).sort();
       const entries = names.map((n) => ({ name: n, dir: false, contentType: "application/json" }));
       return { status: 200, body: { path: "/" + dataset + "/", entries, total } };
     }
-    if (msg.method === "DELETE") { command({ drop: dataset }); return { status: 204 }; }
+    if (msg.method === "DELETE") { await command({ drop: dataset }); return { status: 204 }; }
     return { status: 400, body: { detail: "container supports GET, DELETE" } };
   }
 
   const key = segs.slice(1).join("/");
   if (key === ".schema.json") {
     if (msg.method === "GET") {
-      const doc = (command({ find: SCHEMA_COLL, filter: { _id: dataset }, limit: 1 }).cursor.firstBatch || [])[0];
+      const doc = ((await command({ find: SCHEMA_COLL, filter: { _id: dataset }, limit: 1 })).cursor.firstBatch || [])[0];
       return doc ? { status: 200, body: doc.schema } : { status: 404, body: { detail: "no schema" } };
     }
     if (msg.method === "PUT") {
-      command({ update: SCHEMA_COLL, updates: [{ q: { _id: dataset }, u: { _id: dataset, schema: msg.body }, upsert: true }] });
+      await command({ update: SCHEMA_COLL, updates: [{ q: { _id: dataset }, u: { _id: dataset, schema: msg.body }, upsert: true }] });
       return { status: 200 };
     }
     return { status: 400, body: { detail: "schema supports GET, PUT" } };
   }
 
   if (msg.method === "GET") {
-    const doc = (command({ find: dataset, filter: { _id: key }, limit: 1 }).cursor.firstBatch || [])[0];
+    const doc = ((await command({ find: dataset, filter: { _id: key }, limit: 1 })).cursor.firstBatch || [])[0];
     if (!doc) return { status: 404, body: { detail: "no record '" + key + "'" } };
     delete doc._id;
     return { status: 200, body: doc };
   }
   if (msg.method === "PUT") {
-    const reply = command({ update: dataset, updates: [{ q: { _id: key }, u: Object.assign({}, msg.body, { _id: key }), upsert: true }] });
+    const reply = await command({ update: dataset, updates: [{ q: { _id: key }, u: Object.assign({}, msg.body, { _id: key }), upsert: true }] });
     const created = reply.upserted && reply.upserted.length > 0;
     return { status: created ? 201 : 200 };
   }
   if (msg.method === "DELETE") {
-    if (!command({ delete: dataset, deletes: [{ q: { _id: key }, limit: 1 }] }).n) return { status: 404, body: { detail: "no record" } };
+    if (!(await command({ delete: dataset, deletes: [{ q: { _id: key }, limit: 1 }] })).n) return { status: 404, body: { detail: "no record" } };
     return { status: 204 };
   }
   return { status: 400, body: { detail: "unsupported" } };

@@ -19,13 +19,49 @@
 // Bundles are single-file ESM with no build step, so this section is
 // duplicated verbatim in both adapters; edit both or they diverge.
 // ============================================================================
-let SOCK = null, RBUF = new Uint8Array(0), DB = "test", REQID = 0;
+let SOCK = null, RBUF = new Uint8Array(0), DB = "test", REQID = 0, LOCK = Promise.resolve(), CONF = {};
 
-function connect(config) {
-  if (SOCK) return;
+// Serializes connect + command exchanges: on the Worker host, concurrent
+// invocations share one isolate (and the one pooled socket), so wire
+// exchanges must not interleave. On the Rust host jobs are serialized
+// already; the lock is a no-op there.
+function locked(fn) {
+  const run = LOCK.then(fn);
+  LOCK = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+// Host-portable sockets: RS2Socket is synchronous on the Rust host and
+// async on the Worker (the `guest-async` facet) — awaiting a plain value
+// is a no-op, so awaiting everywhere runs on both hosts unchanged.
+// `connect` only remembers the config; the socket opens lazily inside
+// `exchange` so a dead pooled socket can be replaced.
+async function connect(config) {
+  CONF = config;
   DB = config.db || "test";
-  SOCK = RS2Socket.connect(config.host || "127.0.0.1", config.port | 0);
+}
+async function ensureConnected() {
+  if (SOCK) return;
+  SOCK = await RS2Socket.connect(CONF.host || "127.0.0.1", CONF.port | 0);
   RBUF = new Uint8Array(0);
+}
+// Run one whole command exchange under the lock. On the Rust host the
+// resident isolate pools the socket for its lifetime and the retry path
+// never runs; on the Worker host I/O objects are request-scoped, so a
+// socket pooled in module scope dies at the invocation boundary — the
+// first use then throws, and the exchange reconnects and retries once.
+async function exchange(fn) {
+  return locked(async () => {
+    try {
+      await ensureConnected();
+      return await fn();
+    } catch (e) {
+      try { if (SOCK) await SOCK.close(); } catch {}
+      SOCK = null;
+      await ensureConnected();
+      return await fn();
+    }
+  });
 }
 
 // --- BSON encode (subset: doc/array/string/int32/int64/double/bool/null) ---
@@ -89,8 +125,8 @@ function decodeDoc(bytes, start) {
 
 // --- OP_MSG over the socket ---
 function cat(a, b) { const o = new Uint8Array(a.length + b.length); o.set(a, 0); o.set(b, a.length); return o; }
-function ensure(n) { while (RBUF.length < n) { const c = SOCK.read(65536); if (c === null) throw new Error("mongo: closed"); RBUF = cat(RBUF, c); } }
-function command(doc) {
+async function ensure(n) { while (RBUF.length < n) { const c = await SOCK.read(65536); if (c === null) throw new Error("mongo: closed"); RBUF = cat(RBUF, c); } }
+async function command(doc) {
   doc["$db"] = DB;
   const body = encodeDoc(doc);
   const msg = new Uint8Array(21 + body.length);
@@ -100,21 +136,23 @@ function command(doc) {
   dv.setInt32(12, 2013, true); // OP_MSG
   msg[20] = 0; // section kind 0
   msg.set(body, 21);
-  SOCK.write(msg);
-  ensure(4);
-  const len = new DataView(RBUF.buffer, RBUF.byteOffset, RBUF.byteLength).getInt32(0, true);
-  ensure(len);
-  const reply = decodeDoc(RBUF.slice(0, len), 21)[0];
-  RBUF = RBUF.slice(len);
-  if (!reply.ok) throw new Error("mongo error: " + JSON.stringify(reply));
-  return reply;
+  return exchange(async () => {
+    await SOCK.write(msg);
+    await ensure(4);
+    const len = new DataView(RBUF.buffer, RBUF.byteOffset, RBUF.byteLength).getInt32(0, true);
+    await ensure(len);
+    const reply = decodeDoc(RBUF.slice(0, len), 21)[0];
+    RBUF = RBUF.slice(len);
+    if (!reply.ok) throw new Error("mongo error: " + JSON.stringify(reply));
+    return reply;
+  });
 }
 // ============================================================================
 // end of shared wire section
 // ============================================================================
 
 export default async (msg, ctx) => {
-  connect(ctx.config);
+  await connect(ctx.config);
   const path = String(msg.url).split("?")[0];
   if (msg.method !== "POST" || path !== "/query")
     return { status: 400, body: { detail: "mongo query adapter supports POST /query" } };
@@ -136,7 +174,7 @@ export default async (msg, ctx) => {
       total: [{ $count: "n" }],
     },
   }]);
-  const reply = command({ aggregate: query.collection, pipeline, cursor: {} });
+  const reply = await command({ aggregate: query.collection, pipeline, cursor: {} });
   const facet = ((reply.cursor && reply.cursor.firstBatch) || [])[0] || {};
   const counted = (facet.total || [])[0];
   return { status: 200, body: { rows: facet.rows || [], total: counted ? counted.n : 0 } };

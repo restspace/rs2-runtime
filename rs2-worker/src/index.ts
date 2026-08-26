@@ -19,7 +19,7 @@ import { TenantObject, drainUnread } from "./tenant-object";
 export { RegistryObject, TenantObject };
 // Guest-boundary entrypoints (§E.3/§E.4): top-level exports so the tenant
 // DO can instantiate them via `ctx.exports` with per-tenant props.
-export { Egress, HostApi } from "./egress";
+export { Egress, EgressSockets, HostApi } from "./egress";
 
 const SNAPSHOT_TTL_MS = 30_000;
 /// The Cache API key for the registry snapshot (a synthetic, never-served URL).

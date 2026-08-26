@@ -57,6 +57,9 @@ jobs:
 
   # Black-box HTTP conformance (docs/agents/cloudflare.md section F): the
   # same vitest suite against each host. Required for merge from P2 on.
+  # The guest-adapter suite's mock Redis/Mongo backends are in-process Node
+  # TCP servers started by the test file itself (fixtures/mock-*.mjs), so
+  # neither job needs extra services.
   conformance-rust:
     name: conformance (rust host)
     runs-on: ubuntu-latest

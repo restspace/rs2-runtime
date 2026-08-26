@@ -95,6 +95,13 @@ fixtures/
   rust/              serverConfig.json + tenants/conf.json for host:rust
   echo.js            JS port of conformance/echo-guest for code: mounts
   catalogue.json     `rs2 catalogue-dump` output (the Worker checks in a copy)
+  redis-data.js      guest-adapter bundles (P4b): a RESP DataStore, a RESP
+  redis-query.js     QueryStore, and an in-memory FileStore — ALSO embedded
+  guest-file.js      into rs2-core/tests/guest_adapter.rs via include_str!,
+                     so one copy is held to the contract on every host
+  mock-redis.mjs     in-process Node TCP mock backends for the guest-adapter
+  mock-mongo.mjs     suite (RESP subset with a connection counter; MongoDB
+                     OP_MSG + a hand-rolled BSON codec)
 scripts/
   host-rust.mjs  host-cf.mjs
 *.test.ts            one file per Rust test file it replaces (spec §F.3)
@@ -142,6 +149,27 @@ scripts/
    Redirects are not followed (`redirect: "manual"`) so 301s are observable.
 5. Run it alone first on its own port, then the whole suite, before opening
    a PR: `RS2_PORT=3105 npx vitest run yours.test.ts`.
+
+## The guest-adapter suite and its mock backends
+
+`guest-adapter.test.ts` (spec P4b) proves `store.adapter:
+"code:<name>@<version>"` mounts — the guest-backed data/file/query stores —
+over real wire protocols. Its backends are **in-process Node TCP servers**
+the test file starts in `beforeAll` (`fixtures/mock-redis.mjs`,
+`fixtures/mock-mongo.mjs`) on ephemeral 127.0.0.1 ports, written into the
+mount configs it applies — so the suite is self-contained: no external
+services, no extra env vars, and the CI conformance jobs run it on both
+hosts unchanged. The Mongo bundles are deployed from `guest-adapters/`
+(the shipped adapters); the Redis/file bundles are fixtures here and are
+embedded into `rs2-core/tests/guest_adapter.rs` via `include_str!` (edit
+them and re-run BOTH the Rust test and this suite).
+
+Local `wrangler dev` workerd reaches 127.0.0.1 backends through the
+worker's socket bridge without special configuration (the mocks bind
+127.0.0.1; nothing needs 0.0.0.0). Note the `guestAdapterPooling`
+divergence: the Rust host pools one backend connection per mount for the
+whole run; the Worker reconnects per invocation (I/O objects are
+request-scoped on that platform).
 
 ## Regenerating `fixtures/catalogue.json`
 

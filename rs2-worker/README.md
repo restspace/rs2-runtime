@@ -4,12 +4,14 @@ The TypeScript host of the RS2 HTTP API: one stateless Worker in front of
 one `TenantObject` Durable Object per tenant (R2 for files, DO SQLite for
 data/idempotency/logs) plus a single `RegistryObject` for the operator
 table. The spec is `docs/agents/cloudflare.md`; this file is the operator's
-card. Phase status: **P4** — every service executes (`file`, `data`, spec
+card. Phase status: **P4b** — every service executes (`file`, `data`, spec
 stores, `pipeline`, `wrapper`, `query`, `query-template`, `template`, `auth`,
-`proxy`, `sms`, `log`, `catalogue`, `services`) and `code:` mounts run as
+`proxy`, `sms`, `log`, `catalogue`, `services`), `code:` mounts run as
 Dynamic Workers with `prefix`/`httpOut`/`store` grants, streaming, and
-`compile_check` at deploy. Remaining: resident `code:` store/sms adapters
-(501 until P4b) and the `transfer` API (P5).
+`compile_check` at deploy, and guest (`code:`) **store adapters** back
+data/file/query/sms mounts (`store.adapter: "code:<name>@<version>"` with
+socket grants — the `guest-adapters/` Redis/Mongo bundles run here).
+Remaining: the `transfer` API (P5).
 
 ```sh
 npm ci
@@ -122,8 +124,14 @@ All declared in the spec (`docs/agents/cloudflare.md` §A) and observable in
 - `conditional-write` is atomic here (DO-serialized); absent-directory
   DELETE is 204 (R2 has no directories); platform-canonicalized dot
   segments route on the normalized path.
-- Resident (`code:`) store/sms adapters answer 501 until P4b; `builtin:mem`
-  is durable (DO SQLite), not ephemeral.
+- Guest (`code:`) store adapters run one Dynamic Worker isolate per mount:
+  `store.maxRuntimes`/`store.idleMs`/`store.idleSeconds` are accepted and
+  **ignored** (the platform owns eviction), and backend connections cannot
+  pool across requests (I/O objects are request-scoped) — portable
+  adapters reconnect per invocation; the shipped `guest-adapters/` bundles
+  do. The 501 `engine_unavailable` remains only when the deployment has no
+  `worker_loaders` binding. `builtin:mem` is durable (DO SQLite), not
+  ephemeral.
 
 ## Conformance
 

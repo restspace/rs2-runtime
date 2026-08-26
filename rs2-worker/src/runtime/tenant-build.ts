@@ -5,10 +5,16 @@
 
 import { BuiltinRegistry } from "../capabilities/builtin-registry";
 import { CredentialInjector } from "../capabilities/credential";
+import {
+  GuestDataStore,
+  GuestFileStore,
+  GuestQueryStore,
+  GuestSmsGateway,
+} from "../capabilities/guest-stores";
+import type { GuestAdapterWiring } from "../capabilities/guest-stores";
 import { PrefixedFileStore } from "../capabilities/prefixed";
 import { ReferenceQueryStore } from "../capabilities/reference-query-store";
-import { ScopedDataStore, ScopedFileStore, ScopedQueryStore } from "../capabilities/scoped";
-import type { ScopedSmsGateway } from "../capabilities/scoped";
+import { ScopedDataStore, ScopedFileStore, ScopedQueryStore, ScopedSmsGateway } from "../capabilities/scoped";
 import type { DataStore, FileStore, HttpOut, QueryStore } from "../capabilities/types";
 import { requireStoreRoot, sanitizedStoreRoot } from "../capabilities/types";
 import { AuthService } from "../services/auth";
@@ -36,6 +42,7 @@ import { ProxyService } from "../services/proxy";
 import { SmsService } from "../services/sms";
 import { TemplateService } from "../services/template";
 import { WrapperService } from "../services/wrapper-service";
+import { cpuMsFromConfig } from "../engines/dynamic-worker";
 import type { DynamicWorkerEngine } from "../engines/dynamic-worker";
 import type { TenantConfig } from "./config-schema";
 import { RsError } from "./error";
@@ -48,7 +55,7 @@ import { MountTable } from "./router";
 import type { Mount } from "./router";
 import { scheduleFromConfig } from "./scheduler";
 import { CachePolicy, CorsPolicy, invocationLimits } from "./wrapper";
-import type { LimitTable } from "./wrapper";
+import type { InvocationLimits, LimitTable } from "./wrapper";
 
 /// Shared adapter wiring handed to tenants (the DO builds one per instance).
 export interface Adapters {
@@ -144,14 +151,48 @@ function unknownBuiltin(kind: string, name: string, available: string[]): RsErro
   return RsError.badRequest(`${kind} store adapter 'builtin:${name}' is unknown (available: ${available.join(", ")})`);
 }
 
-/// Resident (`code:`) adapters are 501 on this host until P4b (cloudflare.md §C.1).
+/// A `code:` adapter on a deployment without the Dynamic Worker loader —
+/// the same identity Rust raises without `--features js` (cloudflare.md §C.1).
 function loadableUnavailable(kind: string, mount: Mount, adapterRef: string): RsError {
   return RsError.engineUnavailable(
     `${kind} mount '${mountLabel(mount)}' uses a loadable adapter ('${adapterRef}') but this build has no JS engine (rebuild with --features js)`,
   );
 }
 
-function buildFileBackend(kind: StoreKind, store: Json, adapters: Adapters, label: string, mount: Mount): FileStore {
+/// The per-mount wiring a guest (`code:`) store adapter needs, or the 501
+/// when the deployment has no loader binding. The bundle loads from the
+/// **built-in** tenant file store (no circularity), and the mount base is
+/// part of the isolate id (`<tenant>:<base>:adapter:<ref>`).
+function guestWiring(
+  kind: string,
+  mount: Mount,
+  adapterRef: string,
+  adapters: Adapters,
+  tenant: string,
+  limits: InvocationLimits,
+): GuestAdapterWiring {
+  const engine = adapters.engine;
+  if (!engine) throw loadableUnavailable(kind, mount, adapterRef);
+  return {
+    engine,
+    files: new ScopedFileStore(adapters.files, tenant),
+    tenant,
+    mountBase: mount.basePath,
+    materializedBodyBytes: limits.materializedBodyBytes,
+    wallClockMs: limits.wallClockMs,
+    cpuMs: cpuMsFromConfig(mount.config),
+  };
+}
+
+function buildFileBackend(
+  kind: StoreKind,
+  store: Json,
+  adapters: Adapters,
+  label: string,
+  mount: Mount,
+  tenant: string,
+  limits: InvocationLimits,
+): FileStore {
   switch (kind.kind) {
     case "default":
       return adapters.files;
@@ -160,15 +201,23 @@ function buildFileBackend(kind: StoreKind, store: Json, adapters: Adapters, labe
       if (!built) throw unknownBuiltin(label, kind.name, adapters.builtins.filesNames());
       return built;
     }
-    case "code":
-      throw loadableUnavailable(label, mount, kind.ref);
+    case "code": {
+      const storeObj = store && typeof store === "object" && !Array.isArray(store) ? store : {};
+      return GuestFileStore.fromConfig(kind.ref, storeObj, guestWiring(label, mount, kind.ref, adapters, tenant, limits));
+    }
   }
 }
 
-function resolveSpecBackend(mount: Mount, adapters: Adapters, tenant: string, infras: InfraSet): FileStore {
+function resolveSpecBackend(
+  mount: Mount,
+  adapters: Adapters,
+  tenant: string,
+  infras: InfraSet,
+  limits: InvocationLimits,
+): FileStore {
   const raw = mount.config.specStore ?? {};
   const expanded = expandInfra(raw, infras, tenant);
-  return buildFileBackend(classifyStore(expanded), expanded, adapters, "spec", mount);
+  return buildFileBackend(classifyStore(expanded), expanded, adapters, "spec", mount, tenant, limits);
 }
 
 function resolveSecrets(mountConfig: JsonObject, tenantSecrets: Json | undefined): JsonObject | undefined {
@@ -244,7 +293,13 @@ function resolveOutboundInjectors(
   return out;
 }
 
-function dataCapability(mount: Mount, adapters: Adapters, name: string, infras: InfraSet): ScopedDataStore {
+function dataCapability(
+  mount: Mount,
+  adapters: Adapters,
+  name: string,
+  infras: InfraSet,
+  limits: InvocationLimits,
+): ScopedDataStore {
   const [kind, store] = expandStore(mount, "data", name, infras);
   switch (kind.kind) {
     case "default":
@@ -255,19 +310,34 @@ function dataCapability(mount: Mount, adapters: Adapters, name: string, infras: 
       if (!inner) throw unknownBuiltin("data", kind.name, adapters.builtins.dataNames());
       return new ScopedDataStore(inner, name);
     }
-    case "code":
-      throw loadableUnavailable("data", mount, kind.ref);
+    case "code": {
+      const storeObj = store && typeof store === "object" && !Array.isArray(store) ? store : {};
+      const guest = GuestDataStore.fromConfig(kind.ref, storeObj, guestWiring("data", mount, kind.ref, adapters, name, limits));
+      return new ScopedDataStore(guest, name);
+    }
   }
 }
 
-function fileCapability(mount: Mount, adapters: Adapters, name: string, infras: InfraSet): ScopedFileStore {
+function fileCapability(
+  mount: Mount,
+  adapters: Adapters,
+  name: string,
+  infras: InfraSet,
+  limits: InvocationLimits,
+): ScopedFileStore {
   const [kind, store] = expandStore(mount, "file", name, infras);
   if (kind.kind === "builtin" && kind.name === NODE_FILE_BUILTIN) requireStoreRoot(store);
-  const inner = buildFileBackend(kind, store, adapters, "file", mount);
+  const inner = buildFileBackend(kind, store, adapters, "file", mount, name, limits);
   return new ScopedFileStore(inner, name);
 }
 
-function queryCapability(mount: Mount, adapters: Adapters, name: string, infras: InfraSet): ScopedQueryStore | undefined {
+function queryCapability(
+  mount: Mount,
+  adapters: Adapters,
+  name: string,
+  infras: InfraSet,
+  limits: InvocationLimits,
+): ScopedQueryStore | undefined {
   const [kind, store] = expandStore(mount, "query", name, infras);
   switch (kind.kind) {
     case "default":
@@ -279,14 +349,23 @@ function queryCapability(mount: Mount, adapters: Adapters, name: string, infras:
       if (!inner) throw unknownBuiltin("query", kind.name, adapters.builtins.queryNames());
       return new ScopedQueryStore(inner, name);
     }
-    case "code":
-      throw loadableUnavailable("query", mount, kind.ref);
+    case "code": {
+      const storeObj = store && typeof store === "object" && !Array.isArray(store) ? store : {};
+      const guest = GuestQueryStore.fromConfig(kind.ref, storeObj, guestWiring("query", mount, kind.ref, adapters, name, limits));
+      return new ScopedQueryStore(guest, name);
+    }
   }
 }
 
-function smsCapability(mount: Mount, name: string, infras: InfraSet): ScopedSmsGateway | undefined {
+function smsCapability(
+  mount: Mount,
+  adapters: Adapters,
+  name: string,
+  infras: InfraSet,
+  limits: InvocationLimits,
+): ScopedSmsGateway | undefined {
   if (mount.service !== "sms") return undefined;
-  const [kind] = expandStore(mount, "sms", name, infras);
+  const [kind, store] = expandStore(mount, "sms", name, infras);
   switch (kind.kind) {
     case "default":
       throw RsError.badRequest("sms mount requires a store.adapter ('code:<name>@<version>' or 'infra:<name>')");
@@ -294,8 +373,11 @@ function smsCapability(mount: Mount, name: string, infras: InfraSet): ScopedSmsG
       throw RsError.badRequest(
         `sms store adapter 'builtin:${kind.name}' is unknown (no first-party SMS providers ship yet; use a 'code:<name>@<version>' adapter)`,
       );
-    case "code":
-      throw loadableUnavailable("sms", mount, kind.ref);
+    case "code": {
+      const storeObj = store && typeof store === "object" && !Array.isArray(store) ? store : {};
+      const guest = GuestSmsGateway.fromConfig(kind.ref, storeObj, guestWiring("sms", mount, kind.ref, adapters, name, limits));
+      return new ScopedSmsGateway(guest, name);
+    }
   }
 }
 
@@ -313,7 +395,7 @@ function specStoreFor(
   validator: SpecValidator = identityValidator,
 ): SpecStore {
   const root = storeRoot(prefix, mount.basePath, mount.config);
-  const backend = resolveSpecBackend(mount, adapters, name, infras);
+  const backend = resolveSpecBackend(mount, adapters, name, infras, invocationLimits(limits));
   return new SpecStore(backend, name, root, subtree, invocationLimits(limits), validator, operatorRoles);
 }
 
@@ -431,10 +513,11 @@ export function buildTenant(
         );
     }
 
-    const files = fileCapability(mount, adapters, name, infras);
-    const data = dataCapability(mount, adapters, name, infras);
-    const query = queryCapability(mount, adapters, name, infras);
-    const sms = smsCapability(mount, name, infras);
+    const invLimits = invocationLimits(limits);
+    const files = fileCapability(mount, adapters, name, infras, invLimits);
+    const data = dataCapability(mount, adapters, name, infras, invLimits);
+    const query = queryCapability(mount, adapters, name, infras, invLimits);
+    const sms = smsCapability(mount, adapters, name, infras, invLimits);
     const mountSecrets = resolveSecrets(mount.config, config.secrets);
     const outboundInjectors = resolveOutboundInjectors(mount, infras, name, mountSecrets);
 

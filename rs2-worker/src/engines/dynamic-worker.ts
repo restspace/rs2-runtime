@@ -326,9 +326,51 @@ export async function guestBodyWriteOp(invocations: Invocations, id: string, dat
   }
 }
 
+/// Short-lived one-shot approvals bridging `socketCheck` (which has the
+/// invocation identity) to the `EgressSockets.connect` hook (which has
+/// only the dialed target — raw TCP carries no header channel). One
+/// allowed check buys one platform `connect` to that exact target within
+/// the window; anything else the hook sees is closed unapproved.
+export type SocketApprovals = Map<string, { count: number; expires: number }>;
+
+const SOCKET_APPROVAL_MS = 30_000;
+
+export function recordSocketApproval(approvals: SocketApprovals, host: string, port: number): void {
+  const key = `${host}:${port}`;
+  const now = Date.now();
+  const entry = approvals.get(key);
+  if (entry && entry.expires >= now) {
+    entry.count += 1;
+    entry.expires = now + SOCKET_APPROVAL_MS;
+  } else {
+    approvals.set(key, { count: 1, expires: now + SOCKET_APPROVAL_MS });
+  }
+}
+
+export function consumeSocketApproval(approvals: SocketApprovals, host: string, port: number): boolean {
+  // Opportunistically drop expired entries so the map stays bounded.
+  const now = Date.now();
+  for (const [k, v] of approvals) {
+    if (v.expires < now) approvals.delete(k);
+  }
+  const key = `${host}:${port}`;
+  const entry = approvals.get(key);
+  if (!entry || entry.count <= 0) return false;
+  entry.count -= 1;
+  if (entry.count === 0) approvals.delete(key);
+  return true;
+}
+
 /// The `socket` grant allowlist check (spec §E.3: sockets stay in the
-/// guest; the host only gates the connect).
-export function guestSocketCheckOp(invocations: Invocations, id: string, host: string, port: number): Json {
+/// guest; the host only gates the connect). An allowed check records the
+/// approval the `EgressSockets.connect` hook consumes.
+export function guestSocketCheckOp(
+  invocations: Invocations,
+  approvals: SocketApprovals,
+  id: string,
+  host: string,
+  port: number,
+): Json {
   const record = invocations.get(id);
   if (!record) return errorMarker(RsError.internal(`unknown invocation '${id}'`));
   const target = `${host}:${port}`;
@@ -336,6 +378,7 @@ export function guestSocketCheckOp(invocations: Invocations, id: string, host: s
   if (!allowed) {
     return failGuest(record, RsError.capabilityDenied(`socket ${host}:${port}`));
   }
+  recordSocketApproval(approvals, host, port);
   return null;
 }
 
@@ -667,6 +710,109 @@ export class DynamicWorkerEngine {
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  /// The loader worker for a resident `code:` store adapter (P4b): the
+  /// guest shim over the bundle with `env.RS2` (socket check, logs, state)
+  /// and the egress gateway as `globalOutbound` — so `RS2Socket.connect`
+  /// goes through `socketCheck` and the store config's socket allowlist,
+  /// and platform `fetch` is denied (a resident adapter's host is
+  /// deny-all, as in Rust `ResidentAdapter::from_config`).
+  private adapterWorker(codeId: string, source: string, tenant: string, cpuMs: number) {
+    return this.hostEnv.loader.get(codeId, () => ({
+      ...guestCodeBase(source),
+      env: { RS2: this.hostEnv.hostApiStub(tenant) },
+      globalOutbound: this.hostEnv.egressStub(tenant),
+      limits: { cpuMs },
+    }));
+  }
+
+  /// The bundle's `features` export, read over RPC — the Worker analogue
+  /// of Rust's read-at-spawn handshake (`spawn_resident` returns the
+  /// export). A module-evaluation failure maps like a failed call: 502
+  /// `contract_violation`.
+  async adapterFeatures(codeId: string, source: string, tenant: string, cpuMs: number): Promise<string[]> {
+    const worker = this.adapterWorker(codeId, source, tenant, cpuMs);
+    const ep = worker.getEntrypoint("Rs2Guest") as unknown as { features(): Promise<unknown> };
+    let out: unknown;
+    try {
+      out = await ep.features();
+    } catch (e) {
+      throw this.mapPlatformKill(e, cpuMs) ?? RsError.contractViolation(`JS service failed: ${describe(e)}`);
+    }
+    return Array.isArray(out) ? out.filter((f): f is string => typeof f === "string") : [];
+  }
+
+  /// One store-pattern call into a resident `code:` adapter
+  /// (`ResidentAdapter::call` + one `dispatch_once`): dispatch `req`
+  /// (`{method, url, body?, mediaType?}`) with the mount's `store` config
+  /// block as the guest config, under an invocation record so the ambient
+  /// surfaces (`RS2Socket.connect` → `socketCheck`, console routing)
+  /// attribute to this call. Returns `(status, body)`; a recorded host
+  /// error (a denied socket) keeps its identity, a handler throw is 502
+  /// `contract_violation`, a platform kill maps to `limit_exceeded`.
+  async invokeAdapter(args: {
+    codeId: string;
+    source: string;
+    tenant: string;
+    req: JsonObject;
+    storeConfig: JsonObject;
+    socketAllowlist: string[];
+    serviceRef: string;
+    materializeCap: number;
+    wallClockMs: number;
+    cpuMs: number;
+  }): Promise<{ status: number; body: Json }> {
+    const host = new GrantedHost(new Map(), 0, this.hostEnv.stateKv, args.serviceRef);
+    const invocationId = crypto.randomUUID().replace(/-/g, "");
+    const record: InvocationRecord = {
+      host,
+      tenant: args.tenant,
+      depth: 0,
+      principal: undefined,
+      materializeCap: args.materializeCap,
+      hostError: undefined,
+      socketAllowlist: args.socketAllowlist,
+      bodyReader: undefined,
+      streamedIn: 0,
+      sink: undefined,
+    };
+    this.hostEnv.invocations.set(invocationId, record);
+    const worker = this.adapterWorker(args.codeId, args.source, args.tenant, args.cpuMs);
+    const ep = worker.getEntrypoint("Rs2Guest") as unknown as {
+      invoke(msg: Json, config: Json, invocationId: string): Promise<Json>;
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(RsError.limitExceeded("wall_clock_ms", args.wallClockMs, args.wallClockMs)),
+        args.wallClockMs,
+      );
+    });
+    let envelope: Json;
+    try {
+      envelope = await Promise.race([ep.invoke(args.req, args.storeConfig, invocationId), timeout]);
+    } catch (e) {
+      if (e instanceof RsError) throw e;
+      throw this.mapFailureRecorded(e, record, args.cpuMs);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      this.hostEnv.invocations.delete(invocationId);
+    }
+    if (isGuestThrow(envelope)) {
+      throw this.mapFailureRecorded(new Error(guestThrowMessage(envelope)), record, args.cpuMs);
+    }
+    const env = envelope && typeof envelope === "object" && !Array.isArray(envelope) ? envelope : {};
+    const status = typeof env.status === "number" ? Math.floor(env.status) : 200;
+    return { status, body: env.body ?? null };
+  }
+
+  /// `mapFailure` for callers that carry no `InvokeArgs`: a recorded host
+  /// error first (identity out of the engine), then platform kills, else
+  /// 502 `contract_violation`.
+  private mapFailureRecorded(error: unknown, record: InvocationRecord, cpuMs: number): RsError {
+    if (record.hostError) return record.hostError;
+    return this.mapPlatformKill(error, cpuMs) ?? RsError.contractViolation(`JS service failed: ${describe(error)}`);
   }
 
   /// Resident-envelope invocation (`template`, cloudflare.md §D): a locked

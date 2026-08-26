@@ -107,6 +107,14 @@ export class Rs2Guest extends WorkerEntrypoint {
     return true;
   }
 
+  /// The bundle's `features` export (`export const features = […]`), read
+  /// over RPC — the Worker analogue of Rust's read-at-spawn handshake by
+  /// which a resident adapter advertises native capabilities like
+  /// `"list-records"` (loadable-adapters.md).
+  async features() {
+    return features;
+  }
+
   /// Called by the host via RPC per invocation (§E.3, decision 10). A
   /// handler throw returns as a `__rs2_guest_throw` marker rather than an
   /// RPC rejection, so the failure text survives the boundary verbatim
