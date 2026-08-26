@@ -149,7 +149,7 @@ fn trust() -> &'static Trust {
         } else {
             Native::default()
         };
-        let (store, summary) = assemble(mode, native, ca_file_path());
+        let (store, summary) = assemble(mode, native, ca_file_path(), env_cert_override());
         let config = client_config_from(store);
         Trust { config, summary }
     })
@@ -181,9 +181,16 @@ fn ca_file_path() -> Option<PathBuf> {
 }
 
 /// Combine the sources into a root store, returning it with a description of
-/// what went in. Pure apart from reading `ca_file` off disk, so the branch a
-/// given environment takes is testable.
-fn assemble(mode: Mode, native: Native, ca_file: Option<PathBuf>) -> (RootCertStore, String) {
+/// what went in. Pure apart from reading `ca_file` off disk — the ambient
+/// `SSL_CERT_FILE`/`SSL_CERT_DIR` state arrives as `env_override` — so the
+/// branch a given environment takes is testable (CI runners export
+/// `SSL_CERT_FILE`, which used to leak into the injected-store tests here).
+fn assemble(
+    mode: Mode,
+    native: Native,
+    ca_file: Option<PathBuf>,
+    env_override: Option<String>,
+) -> (RootCertStore, String) {
     let mut store = RootCertStore::empty();
     let mut sources: Vec<String> = Vec::new();
 
@@ -192,7 +199,7 @@ fn assemble(mode: Mode, native: Native, ca_file: Option<PathBuf>) -> (RootCertSt
         // Name the override when one is in play: with `SSL_CERT_FILE` set,
         // these roots are *not* the platform store, and an operator debugging
         // a rejected certificate needs to know which of the two they got.
-        match env_cert_override() {
+        match env_override {
             Some(from) => sources.push(format!("{native_count} from {from}")),
             None => sources.push(format!("{native_count} from the OS trust store")),
         }
@@ -305,7 +312,7 @@ mod tests {
             certs: vec![],
             error: Some("no such file or directory".to_string()),
         };
-        let (store, summary) = assemble(Mode::Both, native, None);
+        let (store, summary) = assemble(Mode::Both, native, None, None);
         assert!(
             store.roots.len() > 50,
             "expected the bundled roots as a floor, got {}",
@@ -320,8 +327,8 @@ mod tests {
     /// public root that works today.
     #[test]
     fn os_store_is_added_to_the_bundled_roots() {
-        let (store, summary) = assemble(Mode::Both, one_cert(), None);
-        let (bundled, _) = assemble(Mode::Webpki, Native::default(), None);
+        let (store, summary) = assemble(Mode::Both, one_cert(), None, None);
+        let (bundled, _) = assemble(Mode::Webpki, Native::default(), None, None);
         assert_eq!(store.roots.len(), bundled.roots.len() + 1, "{summary}");
         assert!(summary.contains("OS trust store"), "{summary}");
         assert!(summary.contains("bundled"), "{summary}");
@@ -331,7 +338,7 @@ mod tests {
     /// public root and needs that to stick.
     #[test]
     fn native_mode_excludes_the_bundled_roots() {
-        let (store, summary) = assemble(Mode::Native, one_cert(), None);
+        let (store, summary) = assemble(Mode::Native, one_cert(), None, None);
         assert_eq!(store.roots.len(), 1);
         assert!(!summary.contains("bundled"), "{summary}");
     }
@@ -339,7 +346,7 @@ mod tests {
     #[test]
     fn webpki_mode_ignores_the_os_store() {
         assert!(!Mode::Webpki.wants_native());
-        let (store, summary) = assemble(Mode::Webpki, Native::default(), None);
+        let (store, summary) = assemble(Mode::Webpki, Native::default(), None, None);
         assert!(store.roots.len() > 50);
         assert!(!summary.contains("OS trust store"), "{summary}");
     }
@@ -361,11 +368,25 @@ mod tests {
         std::fs::write(&path, to_pem(ca.cert.der())).unwrap();
 
         // `native` keeps the count readable; the additive rule is the point.
-        let (store, summary) = assemble(Mode::Native, one_cert(), Some(path.clone()));
+        let (store, summary) = assemble(Mode::Native, one_cert(), Some(path.clone()), None);
         // The OS root is still there; the file was added, not substituted.
         assert_eq!(store.roots.len(), 2, "{summary}");
         assert!(summary.contains("OS trust store"), "{summary}");
         assert!(summary.contains("ca.pem"), "{summary}");
+    }
+
+    /// With `SSL_CERT_FILE`/`SSL_CERT_DIR` in play the roots are *not* the
+    /// platform store, and the summary must name which one the operator got.
+    #[test]
+    fn env_override_is_named_instead_of_the_os_store() {
+        let (_, summary) = assemble(
+            Mode::Native,
+            one_cert(),
+            None,
+            Some("SSL_CERT_FILE=/tmp/ca.pem".to_string()),
+        );
+        assert!(summary.contains("SSL_CERT_FILE=/tmp/ca.pem"), "{summary}");
+        assert!(!summary.contains("OS trust store"), "{summary}");
     }
 
     #[test]
@@ -374,6 +395,7 @@ mod tests {
             Mode::Native,
             one_cert(),
             Some(PathBuf::from("no/such/ca-bundle.pem")),
+            None,
         );
         assert_eq!(store.roots.len(), 1, "{summary}");
     }
@@ -448,7 +470,7 @@ mod tests {
 
         // Public roots only: the handshake fails, and the failure is one the
         // CLI will recognise and explain.
-        let (public_only, _) = assemble(Mode::Webpki, Native::default(), None);
+        let (public_only, _) = assemble(Mode::Webpki, Native::default(), None, None);
         let err = connect(client_config_from(public_only))
             .expect_err("a private CA must not be trusted by the public roots");
         assert!(is_certificate_error(&err), "unexpected failure: {err}");
@@ -457,7 +479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, to_pem(&cert_pem_der)).unwrap();
-        let (with_ca, summary) = assemble(Mode::Webpki, Native::default(), Some(ca_path));
+        let (with_ca, summary) = assemble(Mode::Webpki, Native::default(), Some(ca_path), None);
         connect(client_config_from(with_ca))
             .unwrap_or_else(|e| panic!("private CA should be trusted ({summary}): {e}"));
 
