@@ -21,16 +21,29 @@ export interface Divergences {
    * `%00` and other unsafe forms still reach the router and are 400.
    */
   dotSegmentTraversal: number[];
+  /**
+   * How a guest (`code:`) store adapter's backend connection behaves
+   * across requests. On Rust the resident isolate lives for the mount's
+   * lifetime and I/O handles pool in module scope, so a serial run opens
+   * exactly one connection (`"pooled"`). On the Worker, I/O objects are
+   * request-scoped by the platform ("Cannot perform I/O on behalf of a
+   * different request"), so a pooled socket dies at the invocation
+   * boundary and adapters reconnect per invocation (`"perInvocation"`);
+   * `store.maxRuntimes`/`idleMs` are accepted and ignored.
+   */
+  guestAdapterPooling: "pooled" | "perInvocation";
 }
 
 const TABLE: Record<HostKind, Divergences> = {
   rust: {
     absentDirectoryDelete: [404],
     dotSegmentTraversal: [400],
+    guestAdapterPooling: "pooled",
   },
   cloudflare: {
     absentDirectoryDelete: [204, 404],
     dotSegmentTraversal: [400, 404],
+    guestAdapterPooling: "perInvocation",
   },
 };
 
@@ -39,8 +52,11 @@ export function divergences(): Divergences {
   return TABLE[env().hostKind];
 }
 
+/** The divergence rows that are status-code sets. */
+type StatusDivergence = { [K in keyof Divergences]: Divergences[K] extends number[] ? K : never }[keyof Divergences];
+
 /** Assert `status` is one of the tolerated values for a divergence. */
-export function expectDivergent(name: keyof Divergences, status: number, context: string): void {
+export function expectDivergent(name: StatusDivergence, status: number, context: string): void {
   const allowed = divergences()[name];
   if (!allowed.includes(status)) {
     throw new Error(`${context}: status ${status} is not in the allowed set ${JSON.stringify(allowed)} for '${name}' on host '${env().hostKind}'`);
