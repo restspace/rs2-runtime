@@ -16,6 +16,7 @@ use crate::error::RsError;
 use crate::message::Message;
 use crate::router::Mount;
 use crate::tenant::Tenant;
+use crate::wrapper::LimitTable;
 
 pub const WELL_KNOWN_PREFIX: &str = "/.well-known/rs2/";
 
@@ -27,8 +28,14 @@ pub fn is_discovery_path(path: &str) -> bool {
 /// Handle a discovery request. The caller's principal must already be
 /// attached (read-permission filtering depends on it). Takes the message by
 /// value: the agent surface awaits store reads, and a `&Message` may not be
-/// held across an await (request bodies are not Sync).
-pub async fn handle(tenant: &Tenant, msg: Message) -> Result<Message, RsError> {
+/// held across an await (request bodies are not Sync). `limits` is the
+/// node's limit table, advertised on the services document so a client can
+/// see the host's per-invocation ceilings (they differ by host kind).
+pub async fn handle(
+    tenant: &Tenant,
+    msg: Message,
+    limits: &LimitTable,
+) -> Result<Message, RsError> {
     if msg.method != http::Method::GET {
         return Err(RsError::new(
             405,
@@ -38,7 +45,7 @@ pub async fn handle(tenant: &Tenant, msg: Message) -> Result<Message, RsError> {
         ));
     }
     let doc = match &msg.url.path[WELL_KNOWN_PREFIX.len()..] {
-        "services" => services_doc(tenant, &msg),
+        "services" => services_doc(tenant, &msg, limits),
         "agent-surface" => {
             let mounts = readable_mounts(tenant, &msg);
             let surface = msg.url.query_param("surface");
@@ -381,7 +388,22 @@ pub fn allowed_methods(mount: &Mount) -> Vec<&'static str> {
     methods
 }
 
-fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
+/// The per-invocation ceilings this host enforces, in the shape both hosts
+/// emit (`docs/agents/cloudflare.md` §A). The Cloudflare host reports its
+/// platform-fixed values under the same keys with `host: "cloudflare"`; the
+/// values are what differs between hosts, never the field names.
+fn limits_doc(limits: &LimitTable) -> Value {
+    json!({
+        "wallClockMs": limits.wall_clock_service.as_millis() as u64,
+        "memoryBytes": limits.memory_bytes,
+        "materializedBodyBytes": limits.materialized_body_bytes,
+        "outboundCalls": limits.outbound_calls,
+        "maxDepth": limits.max_depth,
+        "host": "rust",
+    })
+}
+
+fn services_doc(tenant: &Tenant, msg: &Message, limits: &LimitTable) -> Value {
     // `?surface=` prunes the catalogue exactly like the agent surface, so a
     // client can ask for e.g. the "editor" view of the tenant. The `control`
     // block derives from the same filtered list, so a `services` mount
@@ -442,7 +464,12 @@ fn services_doc(tenant: &Tenant, msg: &Message) -> Value {
                 "code": format!("{base}/code/"),
             })
         });
-    json!({ "tenant": msg.tenant, "services": services, "control": control })
+    json!({
+        "tenant": msg.tenant,
+        "services": services,
+        "control": control,
+        "limits": limits_doc(limits),
+    })
 }
 
 async fn agent_surface_doc(

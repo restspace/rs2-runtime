@@ -1,0 +1,10 @@
+{
+  "listen": "127.0.0.1:3100",
+  "tenancy": { "mode": "single", "tenant": "conf" },
+  "fileRoot": "./data",
+  "dataRoot": "./data-store",
+  "tenantsDir": "./tenants",
+  "logging": { "sink": "file", "level": "info", "file": { "path": "./logs" } },
+  "catalogueHosts": [],
+  "bootstrapAdmin": { "email": "admin@conf.test", "password": "conf-admin-pw" }
+}

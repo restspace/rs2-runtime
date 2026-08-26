@@ -1,0 +1,2 @@
+# Copy to `.dev.vars` for `wrangler dev`. Gates `/admin/*` (cloudflare.md §B.5).
+RS2_ADMIN_TOKEN=dev

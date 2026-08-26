@@ -1,0 +1,119 @@
+// DO SQLite `IdempotencyStore` (cloudflare.md §C.3). `begin` is one
+// `transactionSync`; expired `done` rows are swept every 4096 begins; the
+// row cap is 100 000 with oldest-done eviction (an eighth per sweep),
+// in-flight never evicted — `MemIdempotencyStore` semantics.
+
+import type { Begin, IdempotencyStore, StoredResponse } from "../runtime/idempotency";
+import { DEFAULT_REPLAY_WINDOW_MS } from "../runtime/idempotency";
+
+export const IDEMPOTENCY_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS idempotency (
+  scope TEXT NOT NULL, key TEXT NOT NULL,
+  payload_hash TEXT,
+  state INTEGER NOT NULL,
+  status INTEGER, headers TEXT,
+  body BLOB, media_type TEXT,
+  completed_at INTEGER,
+  PRIMARY KEY (scope, key));
+CREATE INDEX IF NOT EXISTS idem_done ON idempotency(completed_at);
+`;
+
+const SWEEP_EVERY = 4096;
+const MAX_ENTRIES = 100_000;
+
+interface Row extends Record<string, SqlStorageValue> {
+  payload_hash: string | null;
+  state: number;
+  status: number | null;
+  headers: string | null;
+  body: ArrayBuffer | null;
+  media_type: string | null;
+  completed_at: number | null;
+}
+
+export class SqliteIdempotencyStore implements IdempotencyStore {
+  private begins = 0;
+
+  constructor(
+    private readonly storage: DurableObjectStorage,
+    private readonly windowMs = DEFAULT_REPLAY_WINDOW_MS,
+    private readonly maxEntries = MAX_ENTRIES,
+  ) {}
+
+  private sweep(now: number, forceEvict: boolean): void {
+    const sql = this.storage.sql;
+    sql.exec("DELETE FROM idempotency WHERE state = 1 AND completed_at < ?", now - this.windowMs);
+    if (!forceEvict) return;
+    const n = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM idempotency").one().n;
+    if (n >= this.maxEntries) {
+      sql.exec(
+        "DELETE FROM idempotency WHERE rowid IN (SELECT rowid FROM idempotency WHERE state = 1 ORDER BY completed_at ASC LIMIT ?)",
+        Math.floor(this.maxEntries / 8) + 1,
+      );
+    }
+  }
+
+  async begin(scope: string, key: string, payloadHash: string | undefined): Promise<Begin> {
+    const n = this.begins++;
+    return this.storage.transactionSync(() => {
+      const sql = this.storage.sql;
+      const now = Date.now();
+      if (n % SWEEP_EVERY === 0) this.sweep(now, true);
+      else {
+        const count = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM idempotency").one().n;
+        if (count >= this.maxEntries) this.sweep(now, true);
+      }
+      // Opportunistic expiry of the addressed slot.
+      sql.exec(
+        "DELETE FROM idempotency WHERE scope = ? AND key = ? AND state = 1 AND completed_at < ?",
+        scope,
+        key,
+        now - this.windowMs,
+      );
+      const rows = sql
+        .exec<Row>(
+          "SELECT payload_hash, state, status, headers, body, media_type, completed_at FROM idempotency WHERE scope = ? AND key = ?",
+          scope,
+          key,
+        )
+        .toArray();
+      if (rows.length === 0) {
+        sql.exec(
+          "INSERT INTO idempotency (scope, key, payload_hash, state) VALUES (?, ?, ?, 0)",
+          scope,
+          key,
+          payloadHash ?? null,
+        );
+        return { kind: "fresh" } as Begin;
+      }
+      const row = rows[0]!;
+      if (row.payload_hash !== null && payloadHash !== undefined && row.payload_hash !== payloadHash) {
+        return { kind: "payloadMismatch" } as Begin;
+      }
+      if (row.state === 0) return { kind: "inFlight" } as Begin;
+      const stored: StoredResponse = {
+        status: row.status ?? 200,
+        headers: row.headers ? (JSON.parse(row.headers) as Array<[string, string]>) : [],
+        body: row.body && row.media_type !== null ? [new Uint8Array(row.body), row.media_type] : undefined,
+      };
+      return { kind: "replay", stored } as Begin;
+    });
+  }
+
+  async complete(scope: string, key: string, response: StoredResponse): Promise<void> {
+    this.storage.sql.exec(
+      "UPDATE idempotency SET state = 1, status = ?, headers = ?, body = ?, media_type = ?, completed_at = ? WHERE scope = ? AND key = ?",
+      response.status,
+      JSON.stringify(response.headers),
+      response.body ? response.body[0] : null,
+      response.body ? response.body[1] : null,
+      Date.now(),
+      scope,
+      key,
+    );
+  }
+
+  async abandon(scope: string, key: string): Promise<void> {
+    this.storage.sql.exec("DELETE FROM idempotency WHERE scope = ? AND key = ?", scope, key);
+  }
+}

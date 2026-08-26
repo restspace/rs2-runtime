@@ -58,6 +58,10 @@ enum Command {
         #[arg(long)]
         component: Option<String>,
     },
+    /// Print the service config catalogue (`GET /<services>/catalogue`) as
+    /// JSON. The Cloudflare host checks this output in as a fixture so both
+    /// hosts serve byte-identical config schemas.
+    CatalogueDump,
     /// Deploy a compiled component or JS bundle through the self-config API.
     Deploy {
         /// Path to the .wasm component or .js/.ts entry point.
@@ -296,6 +300,12 @@ fn dispatch(command: Command) -> Result<(), String> {
                 .map_err(|e| e.to_string())
         }
         Command::Test { path, component } => test_service(&path, component.as_deref()),
+        Command::CatalogueDump => {
+            let doc = rs2_core::config_schema::catalogue();
+            let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+            println!("{text}");
+            Ok(())
+        }
         Command::Deploy {
             component,
             name,

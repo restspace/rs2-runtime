@@ -55,6 +55,86 @@ jobs:
       # when corpus/bundles/ is absent (it is gitignored).
       - run: cargo test -p rs2-core --features js
 
+  # Black-box HTTP conformance (docs/agents/cloudflare.md section F): the
+  # same vitest suite against each host. Required for merge from P2 on.
+  conformance-rust:
+    name: conformance (rust host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: conformance-rust
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: conformance/http/package-lock.json
+      # The code-store cases deploy a JS bundle, so the host needs V8.
+      - run: cargo build -p rs2-server --features js
+      - run: npm ci
+        working-directory: conformance/http
+      - name: Start the Rust host on the fixtures
+        working-directory: conformance/http
+        env:
+          RS2_PORT: "3100"
+          RS2_SERVER_BIN: ${{ github.workspace }}/target/debug/rs2-server
+        run: |
+          node scripts/host-rust.mjs > host.log 2>&1 &
+          for i in $(seq 1 120); do
+            if curl -fsS http://127.0.0.1:3100/readyz >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          echo "host never became ready"; cat host.log; exit 1
+      - run: npx vitest run
+        working-directory: conformance/http
+        env:
+          RS2_PORT: "3100"
+          RS2_HOST_KIND: rust
+      - name: Host log
+        if: always()
+        run: cat conformance/http/host.log
+
+  conformance-cf:
+    name: conformance (cloudflare host)
+    runs-on: ubuntu-latest
+    # P1: the Worker host (rs2-worker/) is not built yet, so this job is
+    # advisory. When P2 lands, remove `continue-on-error` and make the job
+    # required for merge alongside conformance-rust (section F.4).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: rs2-worker
+      - run: npm ci
+        working-directory: conformance/http
+      # `wrangler dev` with local R2/DO/loader emulation — no account needed.
+      - name: Start the Worker host
+        working-directory: conformance/http
+        env:
+          RS2_PORT: "8787"
+          RS2_ADMIN_TOKEN: ci
+        run: |
+          node scripts/host-cf.mjs > host.log 2>&1 &
+          for i in $(seq 1 180); do
+            if curl -fsS http://127.0.0.1:8787/readyz >/dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          echo "worker never became ready"; cat host.log; exit 1
+      - run: npx vitest run
+        working-directory: conformance/http
+        env:
+          RS2_PORT: "8787"
+          RS2_HOST_KIND: cloudflare
+          RS2_ADMIN_TOKEN: ci
+      - name: Host log
+        if: always()
+        run: cat conformance/http/host.log
+
   test-wasm:
     name: test (wasm)
     runs-on: ubuntu-latest

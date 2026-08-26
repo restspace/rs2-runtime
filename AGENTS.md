@@ -21,6 +21,10 @@ it first.** This file is the agent working guide.
 - **[docs/agents/loadable-adapters.md](docs/agents/loadable-adapters.md)** — the
   deno_core engine + loadable-adapter arc (G13): Phase 0/1 done, Phase 2 design.
   Read before touching the JS engine, sockets, or adapter wiring.
+- **[docs/agents/cloudflare.md](docs/agents/cloudflare.md)** — the spec for the
+  second host (`rs2-worker/`, TypeScript on Cloudflare Workers) and the HTTP
+  conformance runner (`conformance/http/`) both hosts must pass. Read before
+  touching either, or before changing anything a client can observe.
 
 ## Five-second version
 

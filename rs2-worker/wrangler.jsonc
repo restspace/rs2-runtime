@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rs2-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-26",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "RS2_DEFAULT_TENANT": "main",
+    "RS2_MAIN_DOMAIN": "",
+    "RS2_LOG_LEVEL": "info",
+    "RS2_CATALOGUE_HOSTS": ""
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "TENANTS", "class_name": "TenantObject" },
+      { "name": "REGISTRY", "class_name": "RegistryObject" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TenantObject", "RegistryObject"] }],
+  "r2_buckets": [{ "binding": "RS2_FILES", "bucket_name": "rs2-files" }],
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "triggers": { "crons": ["* * * * *"] },
+  // The `workflows` binding (`TRANSFER` → `TransferWorkflow`) is added in P5.
+  "observability": { "enabled": true }
+}

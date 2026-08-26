@@ -1,0 +1,1172 @@
+{
+  "baseSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "AccessControl": {
+        "anyOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/definitions/AccessShorthand"
+              }
+            ],
+            "description": "`\"open\"` (anonymous) or `\"authenticated\"` (any valid principal)."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/definitions/RoleAccess"
+              }
+            ],
+            "description": "Per-verb role specs."
+          }
+        ],
+        "description": "Per-mount access control (the `access` field). Either a string shorthand (`\"open\"` / `\"authenticated\"`) or an object of space-separated role specs."
+      },
+      "AccessShorthand": {
+        "enum": [
+          "open",
+          "authenticated"
+        ],
+        "type": "string"
+      },
+      "CacheMode": {
+        "oneOf": [
+          {
+            "description": "Never stored anywhere (the default).",
+            "enum": [
+              "noStore"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "May be stored but must revalidate (`no-cache`) — pairs with the store services' conditional-GET 304s: always fresh, bandwidth saved.",
+            "enum": [
+              "revalidate"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Cached for `maxAgeSeconds`.",
+            "enum": [
+              "cache"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "CachePolicy": {
+        "description": "Caching policy (per mount, host-applied — v1's universal `caching` config). The default everywhere is **`no-store`**: RS2 responses are tenant-scoped and principal-filtered, so nothing caches unless a mount deliberately opts in. Applied only when the response carries no `Cache-Control` of its own (so composed services can pass upstream headers through), never to error responses, and never to responses that set cookies.",
+        "properties": {
+          "immutable": {
+            "default": false,
+            "type": "boolean"
+          },
+          "maxAgeSeconds": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "mode": {
+            "$ref": "#/definitions/CacheMode"
+          },
+          "public": {
+            "default": false,
+            "description": "`public` is honored only on mounts anonymously readable (`access` absent, `\"open\"`, or `read: \"all\"`); otherwise the policy is clamped to `private` + `Vary: Authorization, Cookie` — a shared cache must never serve one principal's response to another.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "Jitter": {
+        "enum": [
+          "none",
+          "full"
+        ],
+        "type": "string"
+      },
+      "RetryPolicy": {
+        "description": "Declarative retry policy (PRD §7.3, Restspace shape retained). Resolution: per-call override → mount config → tenant default → runtime default ([`RetryPolicy::resolve`]).",
+        "properties": {
+          "backoffMultiplier": {
+            "default": 2.0,
+            "format": "double",
+            "type": "number"
+          },
+          "baseDelayMs": {
+            "default": 250,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "jitter": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/Jitter"
+              }
+            ],
+            "default": "full"
+          },
+          "maxAttempts": {
+            "default": 4,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "maxDelayMs": {
+            "default": 5000,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "respectRetryAfter": {
+            "default": true,
+            "type": "boolean"
+          },
+          "retryOnNetworkError": {
+            "default": true,
+            "type": "boolean"
+          },
+          "retryStatuses": {
+            "default": [
+              408,
+              429,
+              500,
+              502,
+              503,
+              504
+            ],
+            "items": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "RoleAccess": {
+        "additionalProperties": false,
+        "description": "Space-separated role-spec strings per action. A token may be followed by a path pattern (`\"U /user/{email}\"`) scoping that role. Actions map to HTTP methods (PRD §5.2): `read` = GET/HEAD/OPTIONS, `write` = PUT/PATCH, `delete` = DELETE, `invoke` = POST (and other non-idempotent verbs). `delete` and `invoke` default to `write`; `read` defaults to `\"all\"`, `write` to `\"A\"`.",
+        "properties": {
+          "delete": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "invoke": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "write": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ScheduleConfig": {
+        "description": "A mount schedule: exactly one of `every` (interval) or `cron` (5-field, UTC). The \"exactly one\" rule is enforced when parsed (`scheduler::Schedule`), so a bad value is a 400 at `PUT /raw`.",
+        "properties": {
+          "cron": {
+            "default": null,
+            "description": "5-field cron (minute hour day-of-month month day-of-week), UTC, e.g. `\"0 9 * * *\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "every": {
+            "default": null,
+            "description": "Fixed interval, e.g. `\"500ms\"`, `\"30s\"`, `\"5m\"`, `\"2h\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      }
+    },
+    "description": "The common mount-config envelope every service shares (the `baseSchema`). A mount's full `config` is this merged with the service's own fields.",
+    "properties": {
+      "access": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/AccessControl"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Access control for this mount (default-deny writes, open reads)."
+      },
+      "caching": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/CachePolicy"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Host-applied response caching (default `no-store`)."
+      },
+      "retry": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/RetryPolicy"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "description": "Mount-level retry override in the resolution chain (PRD §7.3)."
+      },
+      "schedule": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/ScheduleConfig"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Periodic host-driven invocation: the runtime fires a synthetic internal `POST` (header `x-rs2-trigger: schedule`) at this mount on cadence."
+      },
+      "secrets": {
+        "default": null,
+        "description": "Names of tenant `secrets` this mount may use (default-deny). A `pipeline` mount binds each as a `$<name>` variable for inline HMAC verification (`$hmacVerify`); the secret value is never exposed on `GET /raw`.",
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      }
+    },
+    "title": "MountBaseConfig",
+    "type": "object"
+  },
+  "services": [
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "StoreConfig": {
+            "description": "Storage-root override shared by spec stores, plus per-mount backend selection.",
+            "properties": {
+              "adapter": {
+                "default": null,
+                "description": "Backend selection: `builtin:<name>` for a built-in Rust adapter (e.g. `builtin:mem`) or `code:<name>@<version>` for a deployed JS loadable adapter. Absent ⇒ the node default for this service kind.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "root": {
+                "default": null,
+                "description": "Storage root; defaults to `.rs2-<kind><mount>`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        },
+        "description": "`file` service config (beyond the base envelope).",
+        "properties": {
+          "defaultResource": {
+            "default": null,
+            "description": "Resource served for directory GETs (static-site mode), e.g. `index.html`. Defaults to `index.html` when `spaFallback` is set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "extensionPriority": {
+            "default": [],
+            "description": "Extension preference (no dots, e.g. `[\"html\", \"md\"]`) for friendly URLs. Its first entry is the canonical slot an extension-less PUT pins to (so a no-`Accept` GET of the slug always returns that write); the list also fronts the GET probe order. Required for extension-less PUTs when `friendlyUrls` is on (empty → such a PUT is a 400).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "friendlyUrls": {
+            "default": false,
+            "description": "Serve files at extension-less \"friendly\" URLs (e.g. `/docs/readme` resolves `docs/readme.md`). Exact matches still win; on a stem collision the variant is chosen by `Accept` negotiation. Default `false`.",
+            "type": "boolean"
+          },
+          "listings": {
+            "default": true,
+            "description": "Whether directory GETs return `dir+json` listings (default `true`). `false` conceals the mount's inventory from the public — it is not an authorization boundary (files stay readable by name under `access.read`), so tenant **operators** (`operatorRoles`) still get the listing on a deliberate `Accept: application/vnd.rs2.dir+json`: they can toggle this flag anyway, and the CLI/agent view of a mount shouldn't be hidden from its owner. Operator-only listings are `no-store`.",
+            "type": "boolean"
+          },
+          "spaFallback": {
+            "default": false,
+            "description": "Extension-less misses serve the root default resource (SPA routing).",
+            "type": "boolean"
+          },
+          "spaFallbackAll": {
+            "default": false,
+            "description": "Like `spaFallback`, but **every** miss falls back to the root default resource, including paths with an extension (`/users/42/report.pdf`). Implies `spaFallback`. For a mount that hosts nothing but one SPA build (e.g. a bundled admin UI) whose client-side router reflects arbitrary paths — including ones with dots — into the browser URL, so a genuinely missing asset can't be told apart from a client route by path shape alone. Don't set this on a mount that also serves real, independently-fetchable assets: a typo'd asset URL silently 200s with the app shell instead of 404ing. Default `false`.",
+            "type": "boolean"
+          },
+          "store": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Backend selection (`store.adapter`); see [`StoreConfig`]."
+          }
+        },
+        "title": "FileConfig",
+        "type": "object"
+      },
+      "description": "Streamed file storage (PRD §10.1)",
+      "name": "file"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "StoreConfig": {
+            "description": "Storage-root override shared by spec stores, plus per-mount backend selection.",
+            "properties": {
+              "adapter": {
+                "default": null,
+                "description": "Backend selection: `builtin:<name>` for a built-in Rust adapter (e.g. `builtin:mem`) or `code:<name>@<version>` for a deployed JS loadable adapter. Absent ⇒ the node default for this service kind.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "root": {
+                "default": null,
+                "description": "Storage root; defaults to `.rs2-<kind><mount>`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        },
+        "description": "`data` service config (beyond the base envelope).",
+        "properties": {
+          "enforceSchema": {
+            "default": false,
+            "description": "Reject writes that fail the dataset's `.schema.json` (default `false`).",
+            "type": "boolean"
+          },
+          "fieldLevelAuthz": {
+            "default": false,
+            "description": "Honor per-field access rules in the dataset schema (`x-rs-read` / `x-rs-write` on a property): reads redact fields the caller can't read, writes that change a field the caller can't write return a 4xx, and editing the schema itself requires an operator (PRD §5.2). Default `false`.",
+            "type": "boolean"
+          },
+          "store": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Backend selection (`store.adapter`); see [`StoreConfig`]."
+          }
+        },
+        "title": "DataConfig",
+        "type": "object"
+      },
+      "description": "Schema-validated JSON store (PRD §10.2)",
+      "name": "data"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "Jitter": {
+            "enum": [
+              "none",
+              "full"
+            ],
+            "type": "string"
+          },
+          "RetryPolicy": {
+            "description": "Declarative retry policy (PRD §7.3, Restspace shape retained). Resolution: per-call override → mount config → tenant default → runtime default ([`RetryPolicy::resolve`]).",
+            "properties": {
+              "backoffMultiplier": {
+                "default": 2.0,
+                "format": "double",
+                "type": "number"
+              },
+              "baseDelayMs": {
+                "default": 250,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "enabled": {
+                "default": true,
+                "type": "boolean"
+              },
+              "jitter": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/Jitter"
+                  }
+                ],
+                "default": "full"
+              },
+              "maxAttempts": {
+                "default": 4,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "maxDelayMs": {
+                "default": 5000,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "respectRetryAfter": {
+                "default": true,
+                "type": "boolean"
+              },
+              "retryOnNetworkError": {
+                "default": true,
+                "type": "boolean"
+              },
+              "retryStatuses": {
+                "default": [
+                  408,
+                  429,
+                  500,
+                  502,
+                  503,
+                  504
+                ],
+                "items": {
+                  "format": "uint16",
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "StoreConfig": {
+            "description": "Storage-root override shared by spec stores, plus per-mount backend selection.",
+            "properties": {
+              "adapter": {
+                "default": null,
+                "description": "Backend selection: `builtin:<name>` for a built-in Rust adapter (e.g. `builtin:mem`) or `code:<name>@<version>` for a deployed JS loadable adapter. Absent ⇒ the node default for this service kind.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "root": {
+                "default": null,
+                "description": "Storage root; defaults to `.rs2-<kind><mount>`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        },
+        "description": "`pipeline` service config (beyond the base envelope).",
+        "properties": {
+          "retry": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/RetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "specStore": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the authoring specs themselves are physically stored (`specStore.adapter` selects an `infra:`/`builtin:`/`code:` file backend, `specStore.root` the root). Absent ⇒ the node file store."
+          },
+          "store": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "PipelineConfig",
+        "type": "object"
+      },
+      "description": "Pipeline store (PRD §10.3): PUT spec envelopes to /<mount>/.pipelines/<name> (.root governs the mount root); every other path on any verb executes the longest-prefix match",
+      "name": "pipeline"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "StoreConfig": {
+            "description": "Storage-root override shared by spec stores, plus per-mount backend selection.",
+            "properties": {
+              "adapter": {
+                "default": null,
+                "description": "Backend selection: `builtin:<name>` for a built-in Rust adapter (e.g. `builtin:mem`) or `code:<name>@<version>` for a deployed JS loadable adapter. Absent ⇒ the node default for this service kind.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "root": {
+                "default": null,
+                "description": "Storage root; defaults to `.rs2-<kind><mount>`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        },
+        "description": "`query` service config (beyond the base envelope).",
+        "properties": {
+          "specStore": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the authoring specs are physically stored — independent of the execution backend in `store`. See [`PipelineConfig::spec_store`]."
+          },
+          "store": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Query *execution* backend (`store.adapter`); `store.root` relocates the authoring subtree. See [`StoreConfig`]."
+          }
+        },
+        "title": "QueryConfig",
+        "type": "object"
+      },
+      "description": "Stored parameterized queries (PRD §10.4): PUT envelopes {language?, query, params?, output?} to /<mount>/.queries/<name>; any verb elsewhere executes the longest-prefix match",
+      "name": "query"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "Jitter": {
+            "enum": [
+              "none",
+              "full"
+            ],
+            "type": "string"
+          },
+          "RetryPolicy": {
+            "description": "Declarative retry policy (PRD §7.3, Restspace shape retained). Resolution: per-call override → mount config → tenant default → runtime default ([`RetryPolicy::resolve`]).",
+            "properties": {
+              "backoffMultiplier": {
+                "default": 2.0,
+                "format": "double",
+                "type": "number"
+              },
+              "baseDelayMs": {
+                "default": 250,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "enabled": {
+                "default": true,
+                "type": "boolean"
+              },
+              "jitter": {
+                "allOf": [
+                  {
+                    "$ref": "#/definitions/Jitter"
+                  }
+                ],
+                "default": "full"
+              },
+              "maxAttempts": {
+                "default": 4,
+                "format": "uint32",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "maxDelayMs": {
+                "default": 5000,
+                "format": "uint64",
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              "respectRetryAfter": {
+                "default": true,
+                "type": "boolean"
+              },
+              "retryOnNetworkError": {
+                "default": true,
+                "type": "boolean"
+              },
+              "retryStatuses": {
+                "default": [
+                  408,
+                  429,
+                  500,
+                  502,
+                  503,
+                  504
+                ],
+                "items": {
+                  "format": "uint16",
+                  "minimum": 0.0,
+                  "type": "integer"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "description": "`wrapper` service config: one inline pipeline fronting another mount.",
+        "properties": {
+          "elevate": {
+            "default": null,
+            "description": "Role an `elevate` step adds to sub-calls (operator-controlled).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "facets": {
+            "default": null,
+            "description": "Optional discovery facets advertised alongside the pattern.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "inputSchema": {
+            "default": null,
+            "description": "JSON Schema for the request body the wrapper accepts. **Enforced**: a body that fails it is rejected with 422 before the pipeline runs (only on verbs that carry a body — PUT/POST/PATCH). Surfaced in discovery, OpenAPI (`requestBody`), and the agent surface.",
+            "editor": "json",
+            "type": "object"
+          },
+          "outputSchema": {
+            "default": null,
+            "description": "JSON Schema describing the wrapper's success response. **Advisory** — surfaced in discovery, OpenAPI (`200`), and the agent surface, but not enforced at runtime (a facade's responses vary: a keyed record vs a store listing, and field-authz may redact fields).",
+            "editor": "json",
+            "type": "object"
+          },
+          "pattern": {
+            "default": null,
+            "description": "Discovery pattern this mount advertises — it fronts a mount of that shape (e.g. `\"store\"`). One of store / store-transform / store-view / view / api. Defaults to `store-transform`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pipeline": {
+            "default": null,
+            "description": "The inline pipeline spec (typed object or string-DSL array) run for every verb and sub-path. A step forwards the exact remaining path with `${url.rest}` (e.g. `/wrapped${url.rest}`). Advertised as a JSON editor over an object (typed spec) or array (string DSL).",
+            "editor": "json",
+            "type": [
+              "object",
+              "array"
+            ]
+          },
+          "retry": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/RetryPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "title": "WrapperConfig",
+        "type": "object"
+      },
+      "description": "One inline pipeline fronting another mount: runs config.pipeline for every verb/sub-path. Declares its discovery pattern/facets and forwards the exact remaining path via ${url.rest}",
+      "name": "wrapper"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "StoreConfig": {
+            "description": "Storage-root override shared by spec stores, plus per-mount backend selection.",
+            "properties": {
+              "adapter": {
+                "default": null,
+                "description": "Backend selection: `builtin:<name>` for a built-in Rust adapter (e.g. `builtin:mem`) or `code:<name>@<version>` for a deployed JS loadable adapter. Absent ⇒ the node default for this service kind.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "root": {
+                "default": null,
+                "description": "Storage root; defaults to `.rs2-<kind><mount>`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        },
+        "description": "`template` service config (beyond the base envelope).",
+        "properties": {
+          "specStore": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the authoring specs are physically stored. See [`PipelineConfig::spec_store`]."
+          },
+          "store": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "TemplateConfig",
+        "type": "object"
+      },
+      "description": "JSX templates rendered to HTML: PUT compiled bundles (from `rs2 template build`) to /<mount>/.templates/<name> (.root governs the mount root); any verb elsewhere renders the longest-prefix match with the request body as props",
+      "name": "template"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Tenant auth settings (the tenant config's `auth` object).",
+        "properties": {
+          "allowedLoginOrigins": {
+            "default": [],
+            "description": "Browser origins allowed to call login/refresh (v1's `allowedLoginDomains`); empty = no origin restriction. Same-origin requests are always allowed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "jwtSecret": {
+            "default": "",
+            "description": "Per-tenant token signing key (PRD §10.5).",
+            "format": "password",
+            "type": "string",
+            "writeOnly": true
+          },
+          "jwtUserProps": {
+            "default": [],
+            "description": "User-record fields copied into the token as extra claims (and exposed on the [`Principal`]). These become bearer authority for the session, so every named field must be operator-writable-only in the user dataset (enforce via the data mount's field-level authz); never name a self-writable field here.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "lockMinutes": {
+            "default": 10,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "maxAttempts": {
+            "default": 5,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sessionMinutes": {
+            "default": 60,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "userDataset": {
+            "default": "users",
+            "description": "Dataset holding user records keyed by email.",
+            "type": "string"
+          }
+        },
+        "title": "AuthSettings",
+        "type": "object"
+      },
+      "description": "Authentication & RBAC (PRD §10.5)",
+      "name": "auth"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "definitions": {
+          "StoreConfig": {
+            "description": "Storage-root override shared by spec stores, plus per-mount backend selection.",
+            "properties": {
+              "adapter": {
+                "default": null,
+                "description": "Backend selection: `builtin:<name>` for a built-in Rust adapter (e.g. `builtin:mem`) or `code:<name>@<version>` for a deployed JS loadable adapter. Absent ⇒ the node default for this service kind.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "root": {
+                "default": null,
+                "description": "Storage root; defaults to `.rs2-<kind><mount>`.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        },
+        "description": "`sms` service config (beyond the base envelope). The provider is selected by `store.adapter` (`code:<name>@<version>` or `infra:<name>`); credentials for the provider call are injected host-side by the adapter's grants/infra.",
+        "properties": {
+          "store": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/StoreConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Provider backend selection (`store.adapter`). Required — no node default SMS provider ships. See [`StoreConfig`]."
+          }
+        },
+        "title": "SmsConfig",
+        "type": "object"
+      },
+      "description": "Outbound SMS over a swappable provider adapter (PRD §9.2): POST /send {to, body}, GET /status/{id}. Select the provider with store.adapter (code:/infra:)",
+      "name": "sms"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "`proxy` service config (beyond the base envelope): forward to a fixed external `target`, attaching auth host-side via `inject`.",
+        "properties": {
+          "inject": {
+            "default": null,
+            "description": "Credential to attach host-side: `\"infra:<name>\"` (operator-supplied) or an inline strategy object whose `secret:<name>` leaves draw on granted tenant secrets. The secret never appears in this config.",
+            "editor": "json",
+            "type": "object"
+          },
+          "target": {
+            "default": null,
+            "description": "External base URL every request is forwarded to (host fixed here).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ProxyConfig",
+        "type": "object"
+      },
+      "description": "Forward to a fixed external target, attaching operator-supplied auth host-side via `inject` (the credential never appears in config)",
+      "name": "proxy"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "`services` self-config API: no fields beyond the base envelope.",
+        "title": "ServicesConfig",
+        "type": "object"
+      },
+      "description": "Self-configuration API (PRD §10.6)",
+      "name": "services"
+    }
+  ],
+  "tenantSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "AuthSettings": {
+        "description": "Tenant auth settings (the tenant config's `auth` object).",
+        "properties": {
+          "allowedLoginOrigins": {
+            "default": [],
+            "description": "Browser origins allowed to call login/refresh (v1's `allowedLoginDomains`); empty = no origin restriction. Same-origin requests are always allowed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "jwtSecret": {
+            "default": "",
+            "description": "Per-tenant token signing key (PRD §10.5).",
+            "format": "password",
+            "type": "string",
+            "writeOnly": true
+          },
+          "jwtUserProps": {
+            "default": [],
+            "description": "User-record fields copied into the token as extra claims (and exposed on the [`Principal`]). These become bearer authority for the session, so every named field must be operator-writable-only in the user dataset (enforce via the data mount's field-level authz); never name a self-writable field here.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "lockMinutes": {
+            "default": 10,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "maxAttempts": {
+            "default": 5,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sessionMinutes": {
+            "default": 60,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "userDataset": {
+            "default": "users",
+            "description": "Dataset holding user records keyed by email.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "CatalogueRef": {
+        "description": "A registered external catalogue: a name and the URL serving its document.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "description": "Absolute http(s) URL serving the catalogue document.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "url"
+        ],
+        "type": "object"
+      },
+      "CorsPolicy": {
+        "description": "CORS policy (per tenant, host-enforced — carried over from v1 where the runtime enforced `trustedDomains`). Trusted origins receive credentialed CORS and may send cookie-authenticated unsafe requests; allowed origins receive plain CORS (bearer-token browser apps); everything else gets no CORS headers. Same-origin requests never involve this policy.",
+        "properties": {
+          "allowedOrigins": {
+            "default": [],
+            "description": "Non-credentialed CORS.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "trustedOrigins": {
+            "default": [],
+            "description": "Credentialed CORS + cross-site cookies (`SameSite=None; Secure`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "Jitter": {
+        "enum": [
+          "none",
+          "full"
+        ],
+        "type": "string"
+      },
+      "RetryPolicy": {
+        "description": "Declarative retry policy (PRD §7.3, Restspace shape retained). Resolution: per-call override → mount config → tenant default → runtime default ([`RetryPolicy::resolve`]).",
+        "properties": {
+          "backoffMultiplier": {
+            "default": 2.0,
+            "format": "double",
+            "type": "number"
+          },
+          "baseDelayMs": {
+            "default": 250,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "jitter": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/Jitter"
+              }
+            ],
+            "default": "full"
+          },
+          "maxAttempts": {
+            "default": 4,
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "maxDelayMs": {
+            "default": 5000,
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "respectRetryAfter": {
+            "default": true,
+            "type": "boolean"
+          },
+          "retryOnNetworkError": {
+            "default": true,
+            "type": "boolean"
+          },
+          "retryStatuses": {
+            "default": [
+              408,
+              429,
+              500,
+              502,
+              503,
+              504
+            ],
+            "items": {
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      }
+    },
+    "description": "Top-level tenant settings outside the mount list (the `tenantSchema`).",
+    "properties": {
+      "auth": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/AuthSettings"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "catalogues": {
+        "description": "External catalogues to browse/install services and adapters from.",
+        "items": {
+          "$ref": "#/definitions/CatalogueRef"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "cors": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/CorsPolicy"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "retry": {
+        "anyOf": [
+          {
+            "$ref": "#/definitions/RetryPolicy"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "title": "TenantSettings",
+    "type": "object"
+  }
+}

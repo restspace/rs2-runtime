@@ -437,7 +437,7 @@ impl Runtime {
         // The discovery surface (PRD §12) is generated, not mounted; its
         // documents are already filtered by the caller's read permission.
         if crate::discovery::is_discovery_path(&msg.url.path) {
-            return crate::discovery::handle(&tenant, msg).await;
+            return crate::discovery::handle(&tenant, msg, &self.limits).await;
         }
 
         let mount = tenant.mounts.route(&msg.url.path).ok_or_else(|| {

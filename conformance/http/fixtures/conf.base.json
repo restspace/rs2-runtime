@@ -1,0 +1,13 @@
+{
+  "auth": { "jwtSecret": "conf-secret", "userDataset": "users" },
+  "operatorRoles": "A",
+  "cors": {
+    "trustedOrigins": ["https://app.conf.test"],
+    "allowedOrigins": ["https://reader.example"]
+  },
+  "mounts": [
+    { "path": "/services", "service": "services", "config": { "access": { "read": "A", "write": "A" } } },
+    { "path": "/auth", "service": "auth", "config": { "access": "open" } },
+    { "path": "/data", "service": "data", "config": { "access": "open" } }
+  ]
+}

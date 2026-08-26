@@ -1,0 +1,22 @@
+{
+  "name": "rs2-http-conformance",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Black-box HTTP conformance runner for the RS2 API (docs/agents/cloudflare.md section F) — runs against the Rust host or the Cloudflare Worker host",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "host:rust": "node scripts/host-rust.mjs",
+    "host:cf": "node scripts/host-cf.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
