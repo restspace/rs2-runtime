@@ -7,8 +7,8 @@ export interface Env {
   TENANTS: DurableObjectNamespace<TenantObject>;
   REGISTRY: DurableObjectNamespace<RegistryObject>;
   RS2_FILES: R2Bucket;
-  /// Dynamic Workers (P4); present in the config so its local emulation can
-  /// be verified, unused until the engine lands.
+  /// Dynamic Workers (§E): `code:`/`template` mounts. Optional so a
+  /// deployment without the binding degrades to 501, not a build error.
   LOADER?: WorkerLoader;
   RS2_DEFAULT_TENANT?: string;
   RS2_MAIN_DOMAIN?: string;

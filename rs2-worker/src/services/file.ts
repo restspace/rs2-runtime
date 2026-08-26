@@ -347,6 +347,9 @@ export class FileService implements Service {
           if (!body) throw RsError.badRequest("write requires a body");
           const name = `${simpleUuid()}${extensionFor(body.mediaType)}`;
           const childPath = `${path}${name}`;
+          // Rust local-fs keeps no content-type metadata: files always serve
+          // as `MediaType::for_path`. Persist that, not the request's type.
+          body.mediaType = MediaType.forPath(childPath);
           await files.write(childPath, body);
           const etag = await files.currentEtag(childPath);
           const template = Message.request(msg.method, msg.url.path, msg.tenant);
@@ -368,6 +371,9 @@ export class FileService implements Service {
           if (e1 === undefined) throw RsError.badRequest("extension-less write requires a configured 'extensionPriority'");
           storePath = `${path}.${e1.replace(/^\.+/, "").toLowerCase()}`;
         }
+        // As above: serve-by-path parity with Rust local-fs, which matters
+        // observably when a pinned extension-less write carries another type.
+        body.mediaType = MediaType.forPath(storePath);
         const outcome = await files.writeCond(storePath, body, precondition);
         const template = Message.request(msg.method, msg.url.path, msg.tenant);
         const resp = template.response(outcome.created ? 201 : 200, undefined);

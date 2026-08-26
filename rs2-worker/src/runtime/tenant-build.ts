@@ -34,7 +34,6 @@ import { PipelineService } from "../services/pipeline-service";
 import { QueryService } from "../services/query";
 import { ProxyService } from "../services/proxy";
 import { SmsService } from "../services/sms";
-import { NotYetService, SpecBackedStub } from "../services/stubs";
 import { TemplateService } from "../services/template";
 import { WrapperService } from "../services/wrapper-service";
 import type { DynamicWorkerEngine } from "../engines/dynamic-worker";
@@ -62,7 +61,7 @@ export interface Adapters {
   builtins: BuiltinRegistry;
   catalogue: CatalogueClient | undefined;
   infras: InfraSet;
-  /// The Dynamic Worker engine (P4); absent when the deployment has no
+  /// The Dynamic Worker engine (§E); absent when the deployment has no
   /// `worker_loaders` binding — `code:`/`template` mounts then answer 501.
   engine: DynamicWorkerEngine | undefined;
 }

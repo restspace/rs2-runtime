@@ -255,13 +255,24 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
   }
 }
 
+/// Only the exact operator routes are claimed by the Worker — the Rust server
+/// claims just its own ops endpoints and lets every other path (a tenant mount
+/// at `/admin`, say) fall through to tenant routing, and the Worker must too.
+function isOperatorPath(path: string): boolean {
+  if (path === "/admin/reload-infras") return true;
+  for (const root of ["/admin/tenants", "/admin/domains", "/admin/infras"]) {
+    if (path === root || path.startsWith(root + "/")) return true;
+  }
+  return false;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     // Ops endpoints (PRD §14), outside tenant routing.
     if (path === "/healthz" || path === "/readyz") return text(200, "ok");
-    if (path === "/admin" || path.startsWith("/admin/")) return handleAdmin(request, env, url);
+    if (isOperatorPath(path)) return handleAdmin(request, env, url);
 
     // Hostname → tenant (§B.3 step 2).
     const host = request.headers.get("host") ?? "";

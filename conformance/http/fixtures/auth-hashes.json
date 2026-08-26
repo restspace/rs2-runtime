@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-host password hashes (spec F.3 auth row, decision I.22). Each entry is a `passwordHash` minted by the named host for `password`; auth.test.ts stores every non-null entry as a user record on the host under test and logs in with it, so a hash minted by one host must verify on the other. Mint the Rust one with the hashing facade (`Seed.createPrincipals` then `GET /data/users/<email>`); the Cloudflare slot is filled in P3 the same way. The bcrypt entry is the published `$2a$06` reference vector for 'abc' (the v1-migration verify path).",
+  "_comment": "Cross-host password hashes (spec F.3 auth row, decision I.22). Each entry is a `passwordHash` minted by the named host for `password`; auth.test.ts stores every non-null entry as a user record on the host under test and logs in with it, so a hash minted by one host must verify on the other. Each host's entry was minted through its hashing facade (`Seed.createPrincipals` then `GET /data/users/<email>`). The bcrypt entry is the published `$2a$06` reference vector for 'abc' (the v1-migration verify path).",
   "hashes": [
     {
       "mintedBy": "rust",

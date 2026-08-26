@@ -1,7 +1,7 @@
 // `TenantObject`: one Durable Object per tenant = `Runtime::dispatch` +
 // `handle` (cloudflare.md §B). KV: the tenant config + version. SQLite:
 // data, idempotency, logs, schedule claims. Memory: breaker, concurrency,
-// auth lockout, the built `Tenant`. Alarms: scheduled mounts (P3).
+// auth lockout, the built `Tenant`. Alarms: scheduled mounts (§B.6).
 
 import { DurableObject } from "cloudflare:workers";
 import { FetchHttpOut } from "./capabilities/fetch-http-out";
