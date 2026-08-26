@@ -118,6 +118,57 @@ export class Body {
     return bytes;
   }
 
+  /// Capture the payload as bytes **without consuming the body** when it
+  /// does not fit. Under `maxBytes` this is `materialize` (the body ends up
+  /// materialized and the bytes are returned); over it the body is left
+  /// readable — a fresh stream of the buffered prefix followed by the
+  /// untouched remainder — and `undefined` comes back. Idempotency capture
+  /// needs exactly this: a response too large to record must still reach
+  /// the client (issue #2 item 4).
+  async capture(maxBytes: number): Promise<Uint8Array | undefined> {
+    if (this.payload.kind === "bytes") {
+      return this.payload.bytes.byteLength <= maxBytes ? this.payload.bytes : undefined;
+    }
+    if (this.size !== undefined && this.size > maxBytes) return undefined;
+    const reader = this.payload.stream.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    let overflow = false;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value || value.byteLength === 0) continue;
+        chunks.push(value);
+        total += value.byteLength;
+        if (total > maxBytes) {
+          overflow = true;
+          break;
+        }
+      }
+    } catch (e) {
+      await reader.cancel().catch(() => undefined);
+      if (e instanceof RsError) throw e;
+      throw RsError.internal(`body stream error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (overflow) {
+      // Put the read prefix back in front of the rest of the stream. The
+      // body stays exactly as long as it was; only the recording is lost.
+      this.payload = { kind: "stream", stream: resumeStream(chunks, reader) };
+      return undefined;
+    }
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      buf.set(c, off);
+      off += c.byteLength;
+    }
+    this.size = total;
+    this.payload = { kind: "bytes", bytes: buf };
+    this.provenance = MATERIALIZED;
+    return buf;
+  }
+
   /// Materialize and parse as JSON (only for JSON-family media types).
   async asJson(maxBytes: number): Promise<Json> {
     if (!this.mediaType.isJson()) {
@@ -146,6 +197,32 @@ export class Body {
       },
     });
   }
+}
+
+/// A stream of `chunks` already pulled from `reader`, then whatever
+/// `reader` has left. Cancelling it cancels the underlying stream.
+function resumeStream(
+  chunks: Uint8Array[],
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  let i = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (i < chunks.length) {
+        controller.enqueue(chunks[i++]!);
+        return;
+      }
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      if (value) controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
 }
 
 export function utf8Decode(bytes: Uint8Array): string {

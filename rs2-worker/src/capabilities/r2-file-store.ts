@@ -36,10 +36,28 @@ class KeyedMutex {
   }
 }
 
-export class R2FileStore implements FileStore {
-  private readonly mutex = new KeyedMutex();
+/// The mutex is per **bucket**, not per store instance: a config PUT
+/// rebuilds the tenant's services while requests are in flight, so two
+/// `R2FileStore`s briefly address the same keys. Keying the mutex off the
+/// bucket binding keeps ordering across that swap (issue #2 item 7). The
+/// map is weak so a bucket that goes away takes its lock table with it.
+const bucketMutexes = new WeakMap<R2Bucket, KeyedMutex>();
 
-  constructor(private readonly bucket: R2Bucket) {}
+function mutexFor(bucket: R2Bucket): KeyedMutex {
+  let m = bucketMutexes.get(bucket);
+  if (!m) {
+    m = new KeyedMutex();
+    bucketMutexes.set(bucket, m);
+  }
+  return m;
+}
+
+export class R2FileStore implements FileStore {
+  private readonly mutex: KeyedMutex;
+
+  constructor(private readonly bucket: R2Bucket) {
+    this.mutex = mutexFor(bucket);
+  }
 
   /// `<tenant>/<path>` with the router's path safety re-applied (defense in
   /// depth: an adapter never trusts its caller with traversal).

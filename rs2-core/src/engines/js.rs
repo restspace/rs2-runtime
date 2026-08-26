@@ -194,6 +194,16 @@ pub fn prelude_snapshot_source_hash() -> u64 {
     h
 }
 
+/// Headroom granted to a near-heap-limit callback so the pending
+/// `terminate_execution` can unwind. V8 aborts the process if the callback
+/// returns anything at or below `current`, so refusing outright is not an
+/// option — but the previous `current * 2` compounded on every fire, and a
+/// bundle still allocating through the termination could walk the isolate's
+/// cap up geometrically until the process itself ran out (the suspected
+/// mechanism behind the silent deaths in issue #2 item 10). A fixed slice
+/// per fire keeps that growth linear and small.
+const OOM_HEADROOM: usize = 8 * 1024 * 1024;
+
 /// Per-invocation state, stored in the runtime's `OpState` and read by the
 /// host-bridge ops. `host_error` preserves a structured host error's identity
 /// across the JS boundary (an op records it before throwing).
@@ -465,7 +475,11 @@ fn message_from_request(
     let mut call = Message::request(method, url, tenant);
     call.source = Source::Internal;
     call.principal = principal;
-    call.depth = depth.saturating_add(1);
+    // Depth is *not* advanced here: `GrantedHost::request` advances it for
+    // every capability call, and this message goes straight there. Adding
+    // one on both sides charged a guest hop two levels and halved the
+    // effective `max_depth` for guest chains (issue #2 item 9).
+    call.depth = depth;
     if let Some(headers) = req.get("headers").and_then(|h| h.as_object()) {
         for (k, v) in headers {
             if let (Some(v), Ok(name)) =
@@ -968,7 +982,7 @@ impl JsEngine {
                 runtime.add_near_heap_limit_callback(move |current, _initial| {
                     oom.store(true, Ordering::SeqCst);
                     handle.terminate_execution();
-                    current * 2
+                    current + OOM_HEADROOM
                 });
             }
             let handle = runtime.v8_isolate().thread_safe_handle();
@@ -1485,7 +1499,7 @@ pub(crate) async fn build_runtime(
         runtime.add_near_heap_limit_callback(move |current, _initial| {
             oom.store(true, Ordering::SeqCst);
             handle.terminate_execution();
-            current * 2
+            current + OOM_HEADROOM
         });
     }
     runtime.op_state().borrow_mut().put(inv.clone());

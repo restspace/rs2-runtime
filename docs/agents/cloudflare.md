@@ -210,7 +210,7 @@ problem+json with `tenant: "-"`.
 | `PUT /admin/tenants/<name>` | `{"config": <tenant config>, "domains": ["api.acme.com"], "bootstrapAdmin": {"email","password"}?}` | Validates the name (`/`, `\`, `.` → 400 `invalid tenant name`), dry-builds the config (same errors as `PUT /raw`), writes it into the tenant DO, registers domains in the registry, seeds the admin **if absent** exactly as `seed_bootstrap_admin` (`{passwordHash, roles:"A", kind:"user"}` into `auth.userDataset`; requires `auth.jwtSecret` → 400 otherwise). 201 created / 200 replaced, `ETag` |
 | `GET /admin/tenants/<name>` | — | The raw config, redacted like `/services/raw` |
 | `DELETE /admin/tenants/<name>?confirm=<name>` | — | Removes registry entries and **deletes the DO's storage** (`storage.deleteAll()`); R2 objects under `<name>/` are **not** deleted (409 without `confirm`) |
-| `PUT /admin/domains/<host>` | `{"tenant"}` | Registry map entry (host lowercased) |
+| `PUT /admin/domains/<host>` | `{"tenant"}` | Registry map entry (host lowercased). The host must be a syntactically valid name (LDH labels ≤63, ≤253 overall) → 400 otherwise, and the same gate applies to the `domains` array of `PUT /admin/tenants/<name>`. With Cloudflare for SaaS configured the custom hostname is provisioned **before** the registry write, so a CF failure leaves routing untouched; a registry failure rolls back a hostname this request created |
 | `DELETE /admin/domains/<host>` | — | 204 |
 | `PUT /admin/infras` | the `infras.json` document | Stored in the registry; `POST /admin/reload-infras` re-snapshots it and purges every built tenant (each TenantObject drops its in-memory build on next request because the registry bumps an `infrasVersion` the DO compares) |
 
@@ -639,11 +639,14 @@ per invocation as `ctx.exports.Egress({props: {invocationId}})` and passed as
 not the DO; it forwards `{invocationId, request}` to `stub.guestFetch`), and
 the DO applies `GrantedHost.request("fetch", …)`. Sockets go through the
 `EgressSockets` subclass — the gateway dynamic workers actually get as
-`globalOutbound` — whose `connect(socket)` hook receives the dialed
-target in `socket.opened.localAddress` (raw TCP has no header channel):
-it consumes the one-shot approval the DO recorded when the shim's
-`socketCheck` allowed the target, bridges to the real backend, and
-closes unapproved sockets (decision 38/39).
+`globalOutbound` — whose `connect(socket)` hook sees only what was dialed,
+in `socket.opened.localAddress` (raw TCP has no header channel). The bridge
+is therefore a **nonce**: an allowed `socketCheck` mints a single-use
+approval in the DO and returns `<nonce>.rs2-socket.invalid` as the name the
+shim dials; the hook redeems the nonce for the real `host:port` (+ TLS,
+which terminates host-side against the real hostname) and bridges, and
+closes the socket when the nonce is missing, unknown, spent, or expired
+(decision 38/39).
 Guests therefore have no path to the network that bypasses grants, and
 `tails: []` keeps their `console` output inside the host log bridge
 (`console.*` in the guest is additionally routed to `env.RS2.log` by the shim).
@@ -1078,11 +1081,18 @@ Decisions 35–40 were made during the P4b build:
     guest's `cloudflare:sockets` connect to the `globalOutbound`'s JS
     `connect(socket)` handler with the dialed target in
     `socket.opened.localAddress` and no channel for an invocation id — so
-    an allowed `socketCheck` records a short-lived one-shot approval for
-    `<host>:<port>` in the tenant DO, and the hook consumes it and
-    bridges (an unapproved connect gets a closed socket, never egress;
-    the window is tenant-scoped, which is the attribution raw TCP
-    permits). And because I/O objects are request-scoped on Workers, a
+    an allowed `socketCheck` mints a single-use approval in the tenant DO
+    and answers with `<nonce>.rs2-socket.invalid`, the name the shim
+    dials; the hook takes the nonce off that name, redeems it for the
+    real `host:port` (+ TLS, applied host-side against the real
+    hostname — the guest could not validate a certificate for the
+    synthetic name), and bridges. An unapproved connect gets a closed
+    socket, never egress. The nonce, not the target, is what carries the
+    grant: keying approvals by `<host>:<port>` let a same-tenant bundle
+    that skipped `RS2Socket` race another mount to its approval (issue #2
+    item 11), and `.invalid` is reserved (RFC 2606), so a dial that ever
+    escapes the hook fails closed. And because I/O objects are
+    request-scoped on Workers, a
     socket pooled in module scope dies at the invocation boundary: the
     shim's `RS2Socket` stamps its owning invocation and throws
     deterministically on cross-invocation use (the raw attempt hangs
@@ -1108,3 +1118,24 @@ Decisions 35–40 were made during the P4b build:
     `include_str!` so one copy is held to the contract in-process and
     over HTTP; the Mongo bundles stay in `guest-adapters/` and are
     deployed from there by the suite.
+41. **A guest hop advances call depth once, on both hosts.** `GrantedHost`
+    (`.request`) is the single place depth advances; the message a guest
+    op builds (`messageFromRequest` / `js.rs::message_from_request`, and
+    the serialized-fetch path) carries the caller's depth unchanged.
+    Adding one on both sides charged every guest hop two levels and
+    halved the effective `maxDepth` for guest chains — the Rust host had
+    the same double-count, so this is a matched fix, not a divergence
+    (issue #2 item 9).
+42. **The wall clock covers a streamed response, not just the phase
+    before `beginStream`.** Once the guest begins streaming, `invoke`
+    returns the response and leaves the handler running; the engine's
+    timer keeps running with it and, on expiry, drops the invocation
+    record (every further op then answers "unknown invocation") and
+    aborts the sink writer, so the client's stream errors instead of
+    hanging. Rust's watchdog already bounded the whole handler run; this
+    matches it (issue #2 item 8). Related host-side hygiene from the same
+    pass: the R2 per-key mutex is keyed by **bucket**, so ordering
+    survives the store swap a config PUT causes (item 7), and idempotency
+    capture uses `Body.capture` — a response over the 1 MiB replay cap
+    comes back unconsumed (prefix + remainder) instead of cancelled, so
+    it is unrecorded but still delivered (item 4).

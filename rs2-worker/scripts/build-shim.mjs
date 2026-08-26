@@ -15,9 +15,14 @@ const here = dirname(fileURLToPath(import.meta.url));
 const dir = resolve(here, "..", "src", "engines");
 const out = resolve(dir, "guest-shim.bundled.ts");
 
+// Line endings are normalized to LF: a Windows checkout (core.autocrlf)
+// hands this script CRLF, and without normalizing, the generated module —
+// and its source hashes — would differ from the Linux build CI diffs
+// against (`git diff --exit-code` in .github/workflows/ci.yml).
+const lf = (s) => s.replace(/\r\n/g, "\n");
 const sources = {
-  shim: readFileSync(resolve(dir, "guest-shim.js"), "utf8"),
-  globals: readFileSync(resolve(dir, "guest-globals.js"), "utf8"),
+  shim: lf(readFileSync(resolve(dir, "guest-shim.js"), "utf8")),
+  globals: lf(readFileSync(resolve(dir, "guest-globals.js"), "utf8")),
 };
 
 // esbuild parse check (syntax errors fail the build); the shim ships

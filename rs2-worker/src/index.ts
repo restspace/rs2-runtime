@@ -3,7 +3,7 @@
 // `TenantObject`, and the cron fan-out. Every tenant request routes through
 // the DO — there is no Worker-side fast path.
 
-import { cfApiFromEnv, domainResponse } from "./domains";
+import { cfApiFromEnv, domainResponse, validHostname } from "./domains";
 import type { Env } from "./env";
 import { INFRAS_VERSION_HEADER, TENANT_HEADER, TRACE_HEADER } from "./env";
 import { RegistryObject } from "./registry-object";
@@ -165,6 +165,11 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
         if (!Array.isArray(domainsRaw) || !domainsRaw.every((d) => typeof d === "string")) {
           throw RsError.badRequest("'domains' must be an array of host names");
         }
+        // Same syntax gate as `PUT /admin/domains/<host>`: these land in the
+        // same registry map (issue #2 item 5).
+        for (const d of domainsRaw as string[]) {
+          if (!validHostname(d.toLowerCase())) throw RsError.badRequest(`'${d}' is not a valid host name`);
+        }
         const bootstrap = body.bootstrapAdmin;
         let admin: [string, string] | undefined;
         if (bootstrap !== undefined && bootstrap !== null) {
@@ -223,9 +228,21 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
         if (typeof body.tenant !== "string" || !validTenantName(body.tenant)) {
           throw RsError.badRequest("PUT /admin/domains/<host> requires a 'tenant' name");
         }
-        await registry(env).putDomain(host, body.tenant);
+        if (!validHostname(host)) throw RsError.badRequest(`'${host}' is not a valid host name`);
+        // Provision **before** the registry write (issue #2 item 5): a
+        // Cloudflare failure must leave routing exactly as it was, and a
+        // registry failure must not leave a custom hostname behind.
+        const existing = cf ? await cf.find(host) : undefined;
+        const provisioning = cf ? (existing ?? (await cf.ensure(host))) : undefined;
+        try {
+          await registry(env).putDomain(host, body.tenant);
+        } catch (e) {
+          // Roll back only a hostname this request created; one that was
+          // already there may still be serving an earlier mapping.
+          if (cf && !existing) await cf.remove(host).catch(() => undefined);
+          throw e;
+        }
         await invalidateSnapshot();
-        const provisioning = cf ? await cf.ensure(host) : undefined;
         return json(200, domainResponse(host, body.tenant, env, cf !== undefined, provisioning));
       }
       if (request.method === "GET") {

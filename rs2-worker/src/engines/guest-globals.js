@@ -133,12 +133,15 @@ class RS2Socket {
       e.status = 403;
       throw e;
     }
-    rethrow(await c.rs2.socketCheck(c.invocationId, String(host), port | 0, tls));
+    // The check mints a single-use approval and returns the name to dial:
+    // `<nonce>.rs2-socket.invalid`, which resolves nowhere. The egress
+    // `connect` hook redeems the nonce for the real target and does TLS
+    // there, against the real hostname — so this side always dials plain
+    // (a certificate for the synthetic name could never validate).
+    const check = rethrow(await c.rs2.socketCheck(c.invocationId, String(host), port | 0, tls));
+    const dial = check && typeof check === "object" && typeof check.dial === "string" ? check.dial : String(host);
     const { connect } = await import("cloudflare:sockets");
-    const socket = connect(
-      { hostname: String(host), port: port | 0 },
-      { secureTransport: tls ? "on" : "off", allowHalfOpen: false },
-    );
+    const socket = connect({ hostname: dial, port: port | 0 }, { secureTransport: "off", allowHalfOpen: false });
     return new RS2Socket(socket);
   }
   async write(data) {

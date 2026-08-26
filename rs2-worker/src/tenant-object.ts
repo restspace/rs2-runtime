@@ -425,15 +425,18 @@ export class TenantObject extends DurableObject<Env> {
     return guestBodyWriteOp(this.invocations, invocationId, data);
   }
 
-  async guestSocketCheck(invocationId: string, host: string, port: number): Promise<Json> {
-    return guestSocketCheckOp(this.invocations, this.socketApprovals, invocationId, host, port);
+  async guestSocketCheck(invocationId: string, host: string, port: number, tls: boolean): Promise<Json> {
+    return guestSocketCheckOp(this.invocations, this.socketApprovals, invocationId, host, port, tls);
   }
 
-  /// Consume a one-shot socket approval recorded by an allowed
+  /// Consume a single-use socket approval minted by an allowed
   /// `guestSocketCheck` — called by the `EgressSockets.connect` hook, which
-  /// has only the dialed target (raw TCP carries no invocation id).
-  async guestSocketConsume(host: string, port: number): Promise<boolean> {
-    return consumeSocketApproval(this.socketApprovals, host, port);
+  /// has only the nonce it was dialed with (raw TCP carries no invocation
+  /// id). Returns the real target, or null when the nonce is unknown,
+  /// spent, or expired.
+  async guestSocketConsume(nonce: string): Promise<{ host: string; port: number; tls: boolean } | null> {
+    const approval = consumeSocketApproval(this.socketApprovals, nonce);
+    return approval ? { host: approval.host, port: approval.port, tls: approval.tls } : null;
   }
 
   guestFetch(invocationId: string | null, req: SerializedRequest): Promise<SerializedResponse> {

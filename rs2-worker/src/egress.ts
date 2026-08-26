@@ -18,6 +18,7 @@
 import { connect as connectSocket } from "cloudflare:sockets";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Json } from "./runtime/error";
+import { SOCKET_DIAL_SUFFIX } from "./engines/dynamic-worker";
 import type { SerializedRequest, SerializedResponse } from "./engines/dynamic-worker";
 import type { Env } from "./env";
 
@@ -36,8 +37,8 @@ interface TenantGuestRpc {
   guestBodyRead(invocationId: string): Promise<Json | { data: Uint8Array }>;
   guestStreamBegin(invocationId: string, envelope: Json): Promise<Json>;
   guestBodyWrite(invocationId: string, data: Uint8Array): Promise<Json>;
-  guestSocketCheck(invocationId: string, host: string, port: number): Promise<Json>;
-  guestSocketConsume(host: string, port: number): Promise<boolean>;
+  guestSocketCheck(invocationId: string, host: string, port: number, tls: boolean): Promise<Json>;
+  guestSocketConsume(nonce: string): Promise<{ host: string; port: number; tls: boolean } | null>;
   guestFetch(invocationId: string | null, req: SerializedRequest): Promise<SerializedResponse>;
 }
 
@@ -88,8 +89,8 @@ export class HostApi extends WorkerEntrypoint<Env> {
     return stub(this.env, this.ctx as unknown as { props?: unknown }).guestBodyWrite(invocationId, data);
   }
 
-  socketCheck(invocationId: string, host: string, port: number, _tls: boolean): Promise<Json> {
-    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketCheck(invocationId, host, port);
+  socketCheck(invocationId: string, host: string, port: number, tls: boolean): Promise<Json> {
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketCheck(invocationId, host, port, !!tls);
   }
 
   /// The serialized-fetch path (spec §E.3 `fetchOut`) for callers that hold
@@ -139,37 +140,43 @@ export class Egress extends WorkerEntrypoint<Env> {
 /// invocation id reaches this hook). Enforcement therefore happens in two
 /// steps: the shim's `RS2Socket.connect` first calls `socketCheck` (full
 /// invocation attribution — the allowlist and the `capability_denied`
-/// identity live there), and an allowed check records a short-lived
-/// one-shot approval for `<host>:<port>` in the tenant DO; this hook
-/// consumes the approval and bridges to the real backend, and closes the
-/// inbound socket when no approval exists (a bundle bypassing `RS2Socket`
-/// straight to the platform `connect` gets a dead socket, never egress).
+/// identity live there), which mints a single-use approval in the tenant DO
+/// and hands back `<nonce>.rs2-socket.invalid` as the name to dial; this
+/// hook redeems that nonce for the real `host:port` (+ TLS) and bridges to
+/// the backend, closing the inbound socket when the nonce is missing,
+/// unknown, spent, or expired. A bundle bypassing `RS2Socket` straight to
+/// the platform `connect` gets a dead socket, never egress, and cannot
+/// piggyback on another mount's approval (issue #2 item 11).
 /// A subclass so the base `Egress` surface stays exactly `["fetch"]`
 /// (`test/egress-surface.test.ts` pins both).
 export class EgressSockets extends Egress {
   override async connect(socket: Socket): Promise<void> {
-    let host: string | undefined;
-    let port = NaN;
+    let nonce: string | undefined;
     try {
       const info = await socket.opened;
       const target = info.localAddress ?? "";
       const colon = target.lastIndexOf(":");
-      if (colon > 0) {
-        host = target.slice(0, colon);
-        port = Number(target.slice(colon + 1));
+      const name = (colon > 0 ? target.slice(0, colon) : target).toLowerCase();
+      if (name.endsWith(SOCKET_DIAL_SUFFIX) && name.length > SOCKET_DIAL_SUFFIX.length) {
+        nonce = name.slice(0, name.length - SOCKET_DIAL_SUFFIX.length);
       }
     } catch {
-      /* no target → treated as unapproved below */
+      /* nothing dialed → treated as unapproved below */
     }
-    const approved =
-      host !== undefined && Number.isInteger(port) && port > 0
-        ? await stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketConsume(host, port)
-        : false;
-    if (!approved) {
+    const approval = nonce
+      ? await stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketConsume(nonce)
+      : null;
+    if (!approval) {
       await socket.close().catch(() => undefined);
       return;
     }
-    const upstream = connectSocket({ hostname: host!, port }, { allowHalfOpen: false });
+    // TLS terminates here, against the **real** hostname: the guest dials
+    // the synthetic nonce name, so it could not validate a certificate for
+    // the target itself.
+    const upstream = connectSocket(
+      { hostname: approval.host, port: approval.port },
+      { allowHalfOpen: false, secureTransport: approval.tls ? "on" : "off" },
+    );
     const inbound = socket.readable.pipeTo(upstream.writable).catch(() => undefined);
     const outbound = upstream.readable.pipeTo(socket.writable).catch(() => undefined);
     this.ctx.waitUntil(Promise.all([inbound, outbound]).then(() => undefined));

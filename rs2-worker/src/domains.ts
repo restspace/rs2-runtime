@@ -144,6 +144,16 @@ export class CfSaasApi {
   }
 }
 
+/// Is `host` a syntactically valid hostname (already lowercased)? Labels of
+/// 1–63 LDH characters, no leading/trailing hyphen, no empty label, no
+/// trailing dot, 253 characters overall. Rejects the shapes that otherwise
+/// reach the registry and the Cloudflare API verbatim — a URL, a `host:port`,
+/// an empty string, a wildcard (issue #2 item 5).
+export function validHostname(host: string): boolean {
+  if (host.length === 0 || host.length > 253) return false;
+  return host.split(".").every((label) => label.length <= 63 && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/.test(label));
+}
+
 /// The vars/secrets the domains admin endpoints read.
 export interface DomainsEnv {
   CF_API_TOKEN?: string;

@@ -2,7 +2,7 @@
 // custom-hostnames client, run against mocked `fetch` responses — the real
 // CF API is never reachable from tests.
 import { describe, expect, it } from "vitest";
-import { CfSaasApi, REGISTRY_ONLY_NOTE, cfApiFromEnv, cnameTarget, domainResponse, mapDomainStatus, parseCustomHostname } from "../src/domains";
+import { CfSaasApi, REGISTRY_ONLY_NOTE, cfApiFromEnv, cnameTarget, domainResponse, mapDomainStatus, parseCustomHostname, validHostname } from "../src/domains";
 import type { Json, JsonObject } from "../src/runtime/error";
 import { RsError } from "../src/runtime/error";
 
@@ -165,5 +165,35 @@ describe("admin response shape", () => {
     // Secrets set but nothing provisioned yet: not the registry-only wording.
     const missing = domainResponse("app.acme.com", "acme", envBoth, true, undefined);
     expect(missing.note).toBe("no Cloudflare custom hostname exists for this host");
+  });
+});
+
+describe("hostname validation (issue #2 item 5)", () => {
+  it("accepts real host names", () => {
+    for (const h of ["app.acme.com", "a.b.c.d.example", "xn--80ak6aa92e.com", "t1.localhost", "localhost", "a-b.io"]) {
+      expect(validHostname(h), h).toBe(true);
+    }
+  });
+
+  it("rejects what would otherwise reach the registry and the CF API verbatim", () => {
+    for (const h of [
+      "",
+      " ",
+      "https://app.acme.com",
+      "app.acme.com/path",
+      "app.acme.com:8080",
+      "*.acme.com",
+      "app..acme.com",
+      "app.acme.com.",
+      ".acme.com",
+      "-acme.com",
+      "acme-.com",
+      "under_score.com",
+      "APP.ACME.COM", // the routes lowercase before validating
+      `${"a".repeat(64)}.com`,
+      `${"a.".repeat(130)}com`,
+    ]) {
+      expect(validHostname(h), h).toBe(false);
+    }
   });
 });

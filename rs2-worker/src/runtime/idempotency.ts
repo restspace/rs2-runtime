@@ -85,11 +85,14 @@ export async function captureResponse(
   if (resp.body) {
     const mt = resp.body.mediaType.toString();
     try {
-      const bytes = await resp.body.materialize(bodyCap);
+      // `capture`, not `materialize`: a body over the cap must still reach
+      // the client (issue #2 item 4) — it comes back unconsumed, only
+      // unrecorded, so a duplicate re-executes rather than replaying.
+      const bytes = await resp.body.capture(bodyCap);
+      if (bytes === undefined) return [resp, undefined];
       body = [bytes, mt];
     } catch (_e: unknown) {
-      // Too large (or unreadable) to record: skip storage so a duplicate
-      // re-executes rather than replaying wrongly.
+      // Unreadable: nothing to record and nothing to salvage.
       void (_e as RsError);
       return [resp, undefined];
     }

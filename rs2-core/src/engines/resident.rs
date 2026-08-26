@@ -125,7 +125,7 @@ async fn spawn_resident(
                     socket_allowlist,
                 );
                 let oom = Arc::new(AtomicBool::new(false));
-                let (mut runtime, default_export) =
+                let (mut runtime, mut default_export) =
                     match build_runtime(&source, inv.clone(), &limits, oom.clone()).await {
                         Ok((runtime, default_export, features)) => {
                             let _ = ready_tx.send(Ok(features));
@@ -149,7 +149,30 @@ async fn spawn_resident(
                         &oom,
                     )
                     .await;
+                    // Did this job trip the heap limit? `dispatch_once` clears
+                    // the flag on entry, so it answers for this job alone.
+                    let poisoned = oom.load(Ordering::SeqCst);
                     let _ = job.reply.send(out);
+                    if poisoned {
+                        // An isolate that hit `near_heap_limit` is running on a
+                        // raised cap with a terminated stack behind it: its
+                        // memory limit no longer means what it says, and the
+                        // next allocation spike can take the process down
+                        // instead of the job (issue #2 item 10). Rebuild it —
+                        // the adapter is stateless across jobs by contract, and
+                        // the old isolate (with its pooled sockets) drops here.
+                        oom.store(false, Ordering::SeqCst);
+                        match build_runtime(&source, inv.clone(), &limits, oom.clone()).await {
+                            Ok((fresh, export, _features)) => {
+                                runtime = fresh;
+                                default_export = export;
+                            }
+                            // No isolate to serve with: end the loop. Callers
+                            // see the closed channel as a failed adapter and
+                            // the next spawn rebuilds from scratch.
+                            Err(_) => return,
+                        }
+                    }
                 }
             });
         })

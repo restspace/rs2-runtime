@@ -151,7 +151,10 @@ export function messageFromRequest(
   const call = Message.request(method, url, tenant);
   call.source = "internal";
   call.principal = principal;
-  call.depth = Math.min(depth + 1, 0xffff);
+  // Not advanced here: `GrantedHost.request` advances depth for every
+  // capability call and this message goes straight there (issue #2 item 9,
+  // fixed on both hosts — `js.rs::message_from_request` matches).
+  call.depth = depth;
   const headers = req.headers;
   if (headers && typeof headers === "object" && !Array.isArray(headers)) {
     for (const [k, v] of Object.entries(headers)) {
@@ -326,50 +329,66 @@ export async function guestBodyWriteOp(invocations: Invocations, id: string, dat
   }
 }
 
-/// Short-lived one-shot approvals bridging `socketCheck` (which has the
-/// invocation identity) to the `EgressSockets.connect` hook (which has
-/// only the dialed target — raw TCP carries no header channel). One
-/// allowed check buys one platform `connect` to that exact target within
-/// the window; anything else the hook sees is closed unapproved.
-export type SocketApprovals = Map<string, { count: number; expires: number }>;
+/// Short-lived **single-use** approvals bridging `socketCheck` (which has
+/// the invocation identity) to the `EgressSockets.connect` hook (which sees
+/// only what was dialed — raw TCP carries no header channel).
+///
+/// The bridge is a nonce, not the target (issue #2 item 11): an allowed
+/// check mints one and the shim dials `<nonce>.rs2-socket.invalid`, a name
+/// that resolves nowhere and is never used on the wire — the hook is the
+/// dialer, and it looks the real `host:port` (and TLS) up from the
+/// approval. A same-tenant bundle that bypasses `RS2Socket` and calls the
+/// platform `connect` itself cannot guess a live nonce, so it can no longer
+/// consume another mount's approval by racing it to the same target, and
+/// the legitimate connect keeps the approval it was granted.
+export interface SocketApproval {
+  host: string;
+  port: number;
+  tls: boolean;
+  expires: number;
+}
+
+export type SocketApprovals = Map<string, SocketApproval>;
 
 const SOCKET_APPROVAL_MS = 30_000;
 
-export function recordSocketApproval(approvals: SocketApprovals, host: string, port: number): void {
-  const key = `${host}:${port}`;
-  const now = Date.now();
-  const entry = approvals.get(key);
-  if (entry && entry.expires >= now) {
-    entry.count += 1;
-    entry.expires = now + SOCKET_APPROVAL_MS;
-  } else {
-    approvals.set(key, { count: 1, expires: now + SOCKET_APPROVAL_MS });
-  }
+/// The synthetic dial suffix. `.invalid` is reserved (RFC 2606) and never
+/// resolvable, so a dial that escapes the hook fails closed.
+export const SOCKET_DIAL_SUFFIX = ".rs2-socket.invalid";
+
+/// Mint a single-use approval; returns the hostname the guest must dial.
+export function recordSocketApproval(approvals: SocketApprovals, host: string, port: number, tls: boolean): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const nonce = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  approvals.set(nonce, { host, port, tls, expires: Date.now() + SOCKET_APPROVAL_MS });
+  return `${nonce}${SOCKET_DIAL_SUFFIX}`;
 }
 
-export function consumeSocketApproval(approvals: SocketApprovals, host: string, port: number): boolean {
+/// Consume an approval by nonce: one connect, once, inside the window.
+export function consumeSocketApproval(approvals: SocketApprovals, nonce: string): SocketApproval | undefined {
   // Opportunistically drop expired entries so the map stays bounded.
   const now = Date.now();
   for (const [k, v] of approvals) {
     if (v.expires < now) approvals.delete(k);
   }
-  const key = `${host}:${port}`;
-  const entry = approvals.get(key);
-  if (!entry || entry.count <= 0) return false;
-  entry.count -= 1;
-  if (entry.count === 0) approvals.delete(key);
-  return true;
+  const entry = approvals.get(nonce);
+  if (!entry) return undefined;
+  approvals.delete(nonce);
+  return entry.expires >= now ? entry : undefined;
 }
 
 /// The `socket` grant allowlist check (spec §E.3: sockets stay in the
-/// guest; the host only gates the connect). An allowed check records the
-/// approval the `EgressSockets.connect` hook consumes.
+/// guest; the host only gates the connect). An allowed check mints the
+/// one-shot approval the `EgressSockets.connect` hook consumes and returns
+/// the hostname to dial.
 export function guestSocketCheckOp(
   invocations: Invocations,
   approvals: SocketApprovals,
   id: string,
   host: string,
   port: number,
+  tls: boolean,
 ): Json {
   const record = invocations.get(id);
   if (!record) return errorMarker(RsError.internal(`unknown invocation '${id}'`));
@@ -378,8 +397,7 @@ export function guestSocketCheckOp(
   if (!allowed) {
     return failGuest(record, RsError.capabilityDenied(`socket ${host}:${port}`));
   }
-  recordSocketApproval(approvals, host, port);
-  return null;
+  return { dial: recordSocketApproval(approvals, host, port, tls) };
 }
 
 /// The gateway fetch (`run_host_fetch` + §E.4): grant name fixed to
@@ -422,7 +440,7 @@ export async function guestFetchOp(
     const call = Message.request(req.method, req.url, record.tenant);
     call.source = "internal";
     call.principal = record.principal ? { ...record.principal } : undefined;
-    call.depth = Math.min(record.depth + 1, 0xffff);
+    call.depth = record.depth; // advanced once, in `GrantedHost.request`
     for (const [k, v] of req.headers) call.setHeader(k, v);
     if (req.body && req.body.byteLength > 0) {
       const ct = call.header("content-type");
@@ -680,6 +698,9 @@ export class DynamicWorkerEngine {
       timer = setTimeout(() => resolve({ kind: "timeout" }), args.wallClockMs);
     });
 
+    // Set once the guest has begun streaming: the invocation then outlives
+    // this call, so the wall-clock timer must outlive it too (below).
+    let streaming = false;
     try {
       const races: Promise<RaceOutcome>[] = [settled, timeout];
       if (beganPromise) races.push(beganPromise);
@@ -691,6 +712,26 @@ export class DynamicWorkerEngine {
         case "began": {
           // The guest began streaming; return the response over the stream
           // and leave the handler running, feeding it under backpressure.
+          // The wall clock keeps running over that phase (Rust's watchdog
+          // bounds the whole handler run, streaming included): a guest that
+          // begins and then idles forever would otherwise hold its
+          // invocation record and `TransformStream` until eviction — and
+          // hold the client's response stream open with them (issue #2
+          // item 8).
+          streaming = true;
+          void Promise.race([settled, timeout]).then((late) => {
+            if (timer !== undefined) clearTimeout(timer);
+            if (late.kind !== "timeout") return;
+            const err = RsError.limitExceeded("wall_clock_ms", args.wallClockMs, args.wallClockMs);
+            record.hostError = err;
+            // Dropping the record denies every further op from this
+            // invocation ("unknown invocation"), so the stalled handler
+            // unwinds; aborting the writer errors the client's stream
+            // rather than ending it cleanly on a truncated body.
+            invocations.delete(invocationId);
+            if (record.sink) void record.sink.writer.abort(err.detail).catch(() => undefined);
+            if (record.bodyReader) void record.bodyReader.cancel().catch(() => undefined);
+          });
           const env =
             outcome.envelope && typeof outcome.envelope === "object" && !Array.isArray(outcome.envelope)
               ? outcome.envelope
@@ -708,7 +749,9 @@ export class DynamicWorkerEngine {
       }
       throw RsError.internal("unreachable invoke outcome");
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      // While streaming the timer is the stream's deadline; its own
+      // continuation clears it.
+      if (timer !== undefined && !streaming) clearTimeout(timer);
     }
   }
 
