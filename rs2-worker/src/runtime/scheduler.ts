@@ -3,7 +3,7 @@
 // `rs2-core/src/scheduler.rs`; alarms wire it up in `tenant-object.ts`.
 
 import { RsError } from "./error";
-import type { Json } from "./error";
+import type { Json, JsonObject } from "./error";
 import { Message } from "./message";
 
 /// The synthetic request the scheduler fires at a mount.
@@ -147,4 +147,105 @@ export function parseCron(s: string): CronSchedule {
     parseField(f[3]!, 1, 12),
     parseDow(f[4]!),
   );
+}
+
+// ---- alarm arming (§B.6) -------------------------------------------------
+// The Rust scheduler polls; the Worker arms one DO alarm at the earliest due
+// time and, when it fires, derives the due occurrence statelessly — the
+// `schedule_claims` table is the only persisted cursor, so a retried or
+// duplicated alarm never double-fires an occurrence.
+
+/// One scheduled mount derived from the raw config.
+export interface ScheduledMount {
+  base: string;
+  schedule: Schedule;
+}
+
+/// Derive the scheduled mounts from a raw (unparsed) tenant config. Invalid
+/// schedules are skipped — they were already rejected at `PUT /raw`; this is
+/// the same defensive stance as `reconcile_schedules` in `runtime.rs`.
+export function scheduledMounts(config: JsonObject): ScheduledMount[] {
+  const out: ScheduledMount[] = [];
+  const mounts = Array.isArray(config.mounts) ? config.mounts : [];
+  for (const mount of mounts) {
+    if (!mount || typeof mount !== "object" || Array.isArray(mount)) continue;
+    const cfg = mount.config;
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg)) continue;
+    const sched = cfg.schedule;
+    if (sched === undefined) continue;
+    const base = typeof mount.path === "string" ? mount.path : "";
+    try {
+      out.push({ base, schedule: scheduleFromConfig(sched) });
+    } catch {
+      /* rejected at PUT /raw; defensive */
+    }
+  }
+  return out;
+}
+
+/// The next time (ms epoch) this schedule wants the alarm to fire, strictly
+/// after `nowMs`. Intervals fire at epoch-aligned bucket boundaries (the
+/// occurrence id doubles as the fire time); crons at the next matching UTC
+/// minute. `undefined` when a cron matches nothing within 366 days.
+export function nextDueMs(s: Schedule, nowMs: number): number | undefined {
+  if (s.kind === "interval") return (Math.floor(nowMs / s.everyMs) + 1) * s.everyMs;
+  return s.cron.nextOccurrenceAfter(new Date(nowMs))?.getTime();
+}
+
+/// The earliest `nextDueMs` across a mount set — what the alarm is armed to.
+export function earliestNextDueMs(mounts: ScheduledMount[], nowMs: number): number | undefined {
+  let earliest: number | undefined;
+  for (const m of mounts) {
+    const due = nextDueMs(m.schedule, nowMs);
+    if (due !== undefined && (earliest === undefined || due < earliest)) earliest = due;
+  }
+  return earliest;
+}
+
+/// How far back a firing alarm looks for the cron occurrence it was armed
+/// for (alarms deliver at-or-after their set time; retries can be late).
+export const CRON_GRACE_MS = 5 * 60_000;
+
+/// The occurrence (ms epoch) due when the alarm fires at `nowMs`, or
+/// `undefined` when nothing is due. Intervals: the current epoch-aligned
+/// bucket (the claim makes it fire-once). Crons: the most recent matching
+/// minute within the grace window — stateless, so a DO evicted and woken by
+/// its own alarm still fires the occurrence the alarm was armed for.
+export function dueOccurrenceMs(s: Schedule, nowMs: number, graceMs: number = CRON_GRACE_MS): number | undefined {
+  if (s.kind === "interval") return intervalBucketMs(nowMs, s.everyMs);
+  let t = Math.floor(nowMs / 60_000) * 60_000;
+  const floor = nowMs - graceMs;
+  while (t >= floor) {
+    if (s.cron.matches(new Date(t))) return t;
+    t -= 60_000;
+  }
+  return undefined;
+}
+
+/// How long a claim is remembered — a couple of periods, floored at 60s
+/// (`SchedEntry::claim_ttl` in `runtime.rs`).
+export function claimTtlMs(s: Schedule): number {
+  if (s.kind === "interval") return Math.max(s.everyMs * 2, 60_000);
+  return 120_000;
+}
+
+/// The subset of `SqlStorage` the claim needs (unit-testable without a DO).
+export interface ClaimSql {
+  exec(query: string, ...bindings: (string | number)[]): { rowsWritten: number };
+}
+
+/// Atomically claim the right to fire `key`'s occurrence (`ScheduleStore::
+/// claim` over the `schedule_claims` table, §C.3): `true` iff this caller
+/// won. Expired claims are swept on the way in so the keyspace stays bounded.
+export function claimOccurrence(sql: ClaimSql, key: string, occurrenceMs: number, ttlMs: number, nowMs: number): boolean {
+  sql.exec("DELETE FROM schedule_claims WHERE expires_ms < ?", nowMs);
+  const cur = sql.exec(
+    "INSERT OR IGNORE INTO schedule_claims (key, occurrence_ms, expires_ms) VALUES (?, ?, ?)",
+    key,
+    occurrenceMs,
+    nowMs + ttlMs,
+  );
+  // `rowsWritten` includes index writes (2 for a fresh insert); an ignored
+  // duplicate writes nothing.
+  return cur.rowsWritten > 0;
 }

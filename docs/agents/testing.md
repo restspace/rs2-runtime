@@ -13,6 +13,35 @@ Always run **both default and `--features js`** for any change touching the
 runtime, services, or contract — the JS path exercises the sandbox host bridge
 (including `HostApi::log`). `--features wasm` when you touch the engine/contract.
 
+When a change alters anything a client can observe (status, header, JSON
+shape), also run the HTTP conformance suite against **both hosts** — see below.
+
+## HTTP conformance (both hosts)
+
+`conformance/http/` is the black-box vitest suite that holds the Rust server
+and the Cloudflare Worker (`rs2-worker/`) to one contract
+(`docs/agents/cloudflare.md` §F; operator's card in `conformance/http/README.md`):
+
+```sh
+cd conformance/http && npm ci
+# Rust host (terminal 1 / background), then the suite:
+RS2_PORT=3100 RS2_SERVER_BIN=target/debug/rs2-server npm run host:rust
+RS2_HOST_KIND=rust RS2_PORT=3100 npx vitest run
+# Worker host (needs `npm ci` + `npm run build:shim` in rs2-worker/ first):
+RS2_PORT=8787 RS2_ADMIN_TOKEN=dev npm run host:cf
+RS2_HOST_KIND=cloudflare RS2_PORT=8787 RS2_ADMIN_TOKEN=dev npx vitest run
+```
+
+One host per port, one suite run per host (suites reshape the shared fixture
+tenant sequentially). The Worker additionally has its own unit tests:
+`cd rs2-worker && npm test && npm run typecheck`.
+
+CI runs all of this: `conformance-rust` and `conformance-cf` (both required
+from P2 on) plus `worker-unit` in `.github/workflows/ci.yml`. The only
+per-host allowances live in `conformance/http/src/divergences.ts`, and the
+memory-cap code test is skipped on local `wrangler dev` (no per-isolate heap
+cap in local workerd) unless `RS2_CF_REMOTE` is set.
+
 Wasm-component conformance needs a real guest (otherwise its e2e test is
 skipped on the `RS2_CONFORMANCE_COMPONENT` env var):
 

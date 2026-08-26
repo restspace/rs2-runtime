@@ -96,13 +96,31 @@ jobs:
         if: always()
         run: cat conformance/http/host.log
 
+  # The Worker host's own unit tests (@cloudflare/vitest-pool-workers) and
+  # typecheck (section F.4's worker-unit job).
+  worker-unit:
+    name: worker unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: rs2-worker/package-lock.json
+      - run: npm ci
+        working-directory: rs2-worker
+      - run: npm run build:shim
+        working-directory: rs2-worker
+      - run: npm run typecheck
+        working-directory: rs2-worker
+      - run: npm test
+        working-directory: rs2-worker
+
   conformance-cf:
     name: conformance (cloudflare host)
     runs-on: ubuntu-latest
-    # P1: the Worker host (rs2-worker/) is not built yet, so this job is
-    # advisory. When P2 lands, remove `continue-on-error` and make the job
-    # required for merge alongside conformance-rust (section F.4).
-    continue-on-error: true
+    # Required for merge alongside conformance-rust from P2 on (section F.4).
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

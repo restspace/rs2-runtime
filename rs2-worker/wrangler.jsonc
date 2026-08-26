@@ -19,7 +19,9 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TenantObject", "RegistryObject"] }],
   "r2_buckets": [{ "binding": "RS2_FILES", "bucket_name": "rs2-files" }],
   "worker_loaders": [{ "binding": "LOADER" }],
-  "triggers": { "crons": ["* * * * *"] },
+  // Safety net only (§B.6): tenant DOs self-arm alarms on config writes;
+  // this just re-arms a lost alarm for registry-tracked scheduled tenants.
+  "triggers": { "crons": ["*/5 * * * *"] },
   // The `workflows` binding (`TRANSFER` → `TransferWorkflow`) is added in P5.
   "observability": { "enabled": true }
 }

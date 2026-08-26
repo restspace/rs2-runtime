@@ -91,6 +91,12 @@ export class RegistryObject extends DurableObject<Env> {
     for (const [host, t] of Object.entries(map)) if (t === name) delete map[host];
     delete tenants[name];
     await this.ctx.storage.put({ tenants, domains: map });
+    await this.noteScheduled(name, false);
+  }
+
+  /// The tenant a host maps to, if registered.
+  async getDomain(host: string): Promise<string | undefined> {
+    return (await this.domains())[host.toLowerCase()];
   }
 
   async putDomain(host: string, tenant: string): Promise<void> {
@@ -112,6 +118,22 @@ export class RegistryObject extends DurableObject<Env> {
       tenants[owner].domains = tenants[owner].domains.filter((d) => d !== h);
     }
     await this.ctx.storage.put({ domains: map, tenants });
+  }
+
+  /// The tenants whose configs carry scheduled mounts (§B.6): the cron
+  /// safety net reconciles only these instead of fanning out over every
+  /// tenant. Each TenantObject reports its own flag on config writes.
+  async noteScheduled(name: string, scheduled: boolean): Promise<void> {
+    const set = (await this.ctx.storage.get<Record<string, true>>("scheduled")) ?? {};
+    if (scheduled === (set[name] === true)) return;
+    if (scheduled) set[name] = true;
+    else delete set[name];
+    await this.ctx.storage.put("scheduled", set);
+  }
+
+  async scheduledTenants(): Promise<string[]> {
+    const set = (await this.ctx.storage.get<Record<string, true>>("scheduled")) ?? {};
+    return Object.keys(set).sort();
   }
 
   /// Record a tenant's current config version (after `PUT /services/raw`).

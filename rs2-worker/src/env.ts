@@ -7,8 +7,8 @@ export interface Env {
   TENANTS: DurableObjectNamespace<TenantObject>;
   REGISTRY: DurableObjectNamespace<RegistryObject>;
   RS2_FILES: R2Bucket;
-  /// Dynamic Workers (P4); present in the config so its local emulation can
-  /// be verified, unused until the engine lands.
+  /// Dynamic Workers (§E): `code:`/`template` mounts. Optional so a
+  /// deployment without the binding degrades to 501, not a build error.
   LOADER?: WorkerLoader;
   RS2_DEFAULT_TENANT?: string;
   RS2_MAIN_DOMAIN?: string;
@@ -16,6 +16,14 @@ export interface Env {
   RS2_CATALOGUE_HOSTS?: string;
   /// Secret: gates `/admin/*`.
   RS2_ADMIN_TOKEN?: string;
+  /// Secrets: Cloudflare for SaaS custom hostnames (`/admin/domains/*`,
+  /// `src/domains.ts`). Both set → the endpoints provision/poll/remove a
+  /// custom hostname; either missing → registry-only mode.
+  CF_API_TOKEN?: string;
+  CF_ZONE_ID?: string;
+  /// Where customers point their domain's CNAME (falls back to
+  /// `RS2_MAIN_DOMAIN`; reported by the domains admin endpoints).
+  RS2_CNAME_TARGET?: string;
 }
 
 /// Headers the Worker stamps on the request it forwards to the tenant DO.

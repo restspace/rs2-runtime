@@ -226,10 +226,13 @@ mount as `tick_message` (`POST <base>`, `source = System`,
 `x-rs2-trigger: schedule`) through `handle`, with the same overlap guard (skip
 while a previous fire of that mount is running) and the claim table
 (`schedule_claims`, §C.3) so a retried alarm never double-fires an occurrence.
-The Worker cron trigger (`* * * * *`) is the reconcile cadence: `scheduled()`
-asks the registry for the tenant list and calls `stub.reconcileSchedules()`
-(an RPC method) on each, which re-arms an alarm that was lost (DO eviction,
-deploy). A tenant with no scheduled mount has no alarm and costs nothing.
+Alarms are **self-arming** (decision 15, as built): every config write and
+every `alarm()` firing re-arms the next due time, and DO alarms survive
+eviction and deploys, so the Worker cron trigger (`*/5 * * * *`) is only the
+safety net for the rare lost alarm (retries exhausted): `scheduled()` asks
+the registry for the tenants that carry scheduled mounts — never the whole
+tenant list — and calls `stub.reconcileSchedules()` (an RPC method) on each.
+A tenant with no scheduled mount has no alarm and costs nothing.
 
 ---
 
@@ -295,14 +298,14 @@ full R2 key wraps `write_cond`, `delete_cond`, `rename`).
   put; larger unknown-length uploads use `createMultipartUpload` with 8 MiB
   parts. Returns `created` = `head(key)` was null before the put (inside the
   per-key mutex).
-- `write_cond`: `IfMatch(list)` → `onlyIf: {etagMatches: <list>}` (R2 accepts
-  a comma list and `W/` is stripped first); `IfNoneMatchStar` → `onlyIf:
-  {etagDoesNotMatch: "*"}` — verify in P2 that R2 honours `*`; if not, fall
-  back to head-then-put **inside the mutex** (still atomic per tenant because
-  the DO serializes). A `put` that returns `null` is a 412 with the exact
-  Rust detail strings (`If-Match does not match the current ETag — re-read and
-  retry`, `If-Match given but the resource does not exist`, `If-None-Match: *
-  given but the resource already exists`). `conditional_write_atomic() = true`.
+- `write_cond`: implemented (P2 outcome) as head-then-put **inside the
+  per-key mutex** for both `IfMatch(list)` (`W/` stripped, comma list) and
+  `IfNoneMatchStar` — the DO serializes, so this is atomic per tenant and
+  sidesteps R2 `onlyIf` semantics questions entirely. A failed precondition
+  is a 412 with the exact Rust detail strings (`If-Match does not match the
+  current ETag — re-read and retry`, `If-Match given but the resource does
+  not exist`, `If-None-Match: * given but the resource already exists`).
+  `conditional_write_atomic() = true`.
 - `delete(path)`: 404 if absent (head first, in the mutex); `delete_cond`
   follows RFC 9110 order: a missing resource is the 404, not a 412.
 - `rename(from, to)`: copy via `get` + `put` streaming, then `delete`;
@@ -731,18 +734,20 @@ Both are required for merge from P2 on. `rs2-worker` also runs its own vitest
   "migrations": [ { "tag": "v1", "new_sqlite_classes": ["TenantObject", "RegistryObject"] } ],
   "r2_buckets": [ { "binding": "RS2_FILES", "bucket_name": "rs2-files" } ],
   "worker_loaders": [ { "binding": "LOADER" } ],
-  "triggers": { "crons": ["* * * * *"] },
+  "triggers": { "crons": ["*/5 * * * *"] },
   "workflows": [ { "name": "rs2-transfer", "binding": "TRANSFER", "class_name": "TransferWorkflow" } ],
   "observability": { "enabled": true }
 }
 ```
 
-Secrets (`wrangler secret put`): `RS2_ADMIN_TOKEN`. Local dev: `.dev.vars`
-with `RS2_ADMIN_TOKEN=dev`; `wrangler dev` provides local R2, SQLite DOs,
-alarms, cron (`--test-scheduled` + `curl /__scheduled`), and the loader
-(verify in P2 that the current wrangler runs `worker_loaders` locally; if it
-does not, `code:` tests run against `wrangler dev --remote` in CI and are
-tagged `@remote`).
+Secrets (`wrangler secret put`): `RS2_ADMIN_TOKEN`; optionally `CF_API_TOKEN`
++ `CF_ZONE_ID` for custom-hostname provisioning (decision 26). Local dev:
+`.dev.vars` with `RS2_ADMIN_TOKEN=dev`; `wrangler dev` provides local R2,
+SQLite DOs, alarms, cron (`--test-scheduled` + `curl /__scheduled`), and the
+loader (verified in P2: wrangler ≥ 4.126 runs `worker_loaders` locally). The
+one thing local workerd does not enforce is the per-isolate heap cap, so the
+memory-cap conformance case is skipped locally unless `RS2_CF_REMOTE` marks
+a real-platform run (decision 25).
 
 Package layout:
 
@@ -785,14 +790,14 @@ Versioning: the Worker's `RS2_VERSION` constant and `rs2-core`'s
 
 ## H. Phased delivery
 
-**P1 — conformance runner green against Rust.**
+**P1 — conformance runner green against Rust.** ✅ done.
 Deliver `conformance/http/` (§F) and the small both-hosts changes it needs:
 the `limits` object on `/.well-known/rs2/services`, `rs2-cli catalogue-dump`
 (or an equivalent way to emit `config_schema::catalogue()` as JSON), and the
 JS echo fixture. Accept: `conformance-rust` CI job green; every assertion in
 §F.3 present; suite runs in < 3 min.
 
-**P2 — Worker skeleton green on the store contract.**
+**P2 — Worker skeleton green on the store contract.** ✅ done.
 `index.ts`, both DOs, admin API, `runtime/*` (dispatch order, router, wrapper,
 error, message, media type, listing, logging, idempotency), `R2FileStore`,
 `SqliteDataStore`, `file`, `data`, `spec-store` (with validators stubbed to
@@ -804,7 +809,8 @@ identity for `query`/`pipeline` authoring), `discovery`, `services-config`
 `path-pattern`, `listing`, `router`, `wrapper`, `credential` (SigV4 vector)
 ported from the Rust `#[cfg(test)]` modules.
 
-**P3 — all services.**
+**P3 — all services.** ✅ done (WF2; the `rs2-ui`/`rs2` CLI manual checklist
+remains a follow-up — the HTTP surface it uses is conformance-covered).
 `auth` (hash-wasm; cross-host hash fixture), `query` + `query-template` +
 `reference-query-store`, `pipeline` (all of `pipeline/*`, jsonata), `wrapper`,
 `proxy`, `sms` (routes; adapters 400/501), `log` reader, `catalogue`,
@@ -815,7 +821,8 @@ and uploaded with `rs2 send` works against the Worker unchanged (manual
 checklist: browse files, edit data, author a pipeline, view logs); the `rs2`
 CLI's `login`, `send`, `service add`, `deploy` work against the Worker.
 
-**P4 — code mounts.**
+**P4 — code mounts.** ✅ done (WF2; the memory-cap case runs only against the
+real platform, `RS2_CF_REMOTE` — local workerd has no per-isolate heap cap).
 `engines/dynamic-worker.ts`, `guest-shim.js`, `Egress`/`HostApi`
 entrypoints, `services/code.ts` grants (`prefix`, `httpOut`, `store`),
 `x-rs2-body-ref`, request/response streaming, `compile_check` at deploy,
@@ -913,3 +920,50 @@ Accept: a 10 000-object mount copies across two `wrangler dev` tenants with
     the `guest-async` facet name (emitted only by the Worker), the
     `catalogue-dump` CLI command, and the `transfer` API (P5). The
     `rs2-skill` `references/*.md` are updated in the same pass for each.
+
+Decisions 24–31 were made during the P3/P4 build (WF2):
+
+24. **Alarms self-arm; the cron is a 5-minute safety net** (amends 15).
+    Every config write and every `alarm()` firing re-arms the next due time,
+    and DO alarms survive eviction and deploys, so `scheduled()` only
+    repairs the rare lost alarm — and pings just the tenants the registry
+    knows carry scheduled mounts (`scheduledTenants()`), never the whole
+    tenant list. Cron `*/5 * * * *`, not minutely.
+25. **The memory-cap conformance case is the `@remote` mechanism** (amends
+    §F/§H P4): local workerd enforces no per-isolate heap cap, so
+    `code.test.ts` skips it on `RS2_HOST_KIND=cloudflare` unless
+    `RS2_CF_REMOTE` marks a run against the real platform. No other case is
+    remote-only.
+26. **Custom domains can provision Cloudflare for SaaS** (extends §B.5):
+    with `CF_API_TOKEN` + `CF_ZONE_ID` secrets set, `PUT/GET/DELETE
+    /admin/domains/<host>` also manages a custom hostname
+    (`src/domains.ts`) and reports provisioning status plus the CNAME
+    target (`RS2_CNAME_TARGET`, falling back to `RS2_MAIN_DOMAIN`); without
+    them the endpoints manage the registry map only and the response says so.
+27. **Registry snapshot is cached in two layers** (extends §B.3 step 2): a
+    30 s isolate cache plus the colo-local Cache API under a synthetic URL,
+    so a cold isolate skips the DO round trip; registry writes drop both
+    layers in the writing isolate, other colos converge within the TTL. The
+    Worker stamps the snapshot's `infrasVersion` on every forward
+    (`x-rs2-infras-version`) so the tenant DO detects an infras reload
+    without its own registry RPC.
+28. **Conditional writes are head-then-put inside the per-key mutex**
+    (amends §C.2) — R2 `onlyIf` is not used for them; the DO's
+    serialization makes the check-and-put atomic per tenant, which is what
+    `conditional_write_atomic() = true` declares.
+29. **The Worker claims only its exact operator routes**
+    (`/admin/reload-infras`, `/admin/tenants[/…]`, `/admin/domains[/…]`,
+    `/admin/infras[/…]`, `/healthz`, `/readyz`) and forwards every other
+    path — including other `/admin/*` paths — to tenant routing, exactly as
+    the Rust server claims only its own ops endpoints. A tenant mount at
+    `/admin` works on both hosts.
+30. **The `file` service persists the media type the *stored path* implies**
+    (`MediaType.forPath(storePath)`), not the request's `Content-Type`:
+    Rust local-fs keeps no content-type metadata and always serves
+    `for_path`, and the difference is observable when a pinned
+    extension-less write carries another type (a `text/markdown` PUT to
+    `/page` pinned as `page.html` must serve as `text/html`).
+31. **The guest shim ships as a generated module**
+    (`engines/guest-shim.bundled.ts`, `npm run build:shim`) checked into the
+    tree; a unit test asserts the bundle is fresh against
+    `engines/guest-shim.js` so the two cannot drift.

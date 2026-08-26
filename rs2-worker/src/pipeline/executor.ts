@@ -10,7 +10,7 @@ import { Body } from "../runtime/body";
 import { sha256Hex } from "../runtime/crypto";
 import { RsError } from "../runtime/error";
 import type { Json, JsonObject } from "../runtime/error";
-import { Message, simpleUuid } from "../runtime/message";
+import { Message, MsgUrl, simpleUuid } from "../runtime/message";
 import type { Principal } from "../runtime/message";
 import { isExternalUrl, urlHost } from "../runtime/outbound";
 import type { ExternalDispatch } from "../runtime/outbound";
@@ -444,7 +444,9 @@ export class Executor {
 
   private async runCall(step: Step, call: CallSpec, msg: Message, vars: JsonObject, keyPath: string): Promise<Flow> {
     if (!isValidMethod(call.method)) throw RsError.badRequest(`invalid method '${call.method}'`);
-    const method = call.method.toUpperCase();
+    // Verbatim, not uppercased: Rust treats `get` as an extension method
+    // distinct from GET, and the target service's method match agrees.
+    const method = call.method;
     const effect = callEffectClass(call);
     const preserve = step.capture !== undefined;
 
@@ -543,7 +545,8 @@ export class Executor {
       let result: Message;
       try {
         result = await retryRequest(policy, effect, needsKey, async () => {
-          const req = Message.request(method, url, tenant);
+          // Not `Message.request` — that helper uppercases the method.
+          const req = new Message(method, MsgUrl.parse(url), tenant);
           req.source = "internal";
           req.depth = depthForCall;
           req.trace = trace.child();

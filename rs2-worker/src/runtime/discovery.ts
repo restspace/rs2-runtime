@@ -218,7 +218,10 @@ export function patternOf(mount: Mount): [string, string[]] {
       break;
     default:
       pattern = "api";
-      facets = [];
+      // Every `code:` mount declares the Worker-only guest contract
+      // difference: guest capabilities are Promises and timers are real
+      // (cloudflare.md §A, §E.2). Rust emits no facet here.
+      facets = mount.service.startsWith("code:") ? ["guest-async"] : [];
   }
   if (pattern.startsWith("store")) facets.push("conditional-write");
   return [pattern, facets];

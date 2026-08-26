@@ -221,7 +221,9 @@ rs2-core/       the runtime library: router, pipeline executor, services,
                 engines (native / wasm / js), capabilities, adapters
 rs2-server/     the server binary (HTTP listener, config loading, wiring)
 rs2-cli/        the `rs2` developer CLI
-conformance/    Wasm guest component for the engine conformance suite
+rs2-worker/     the Cloudflare Workers host (TypeScript) of the same HTTP API
+conformance/    Wasm guest component for the engine conformance suite,
+                plus conformance/http/ — the cross-host HTTP contract suite
 docs/manual/    the User Manual
 docs/agents/    working guides for AI-agent development on this repo
 deploy/         production install kit (installer, systemd unit, vhost)
@@ -244,6 +246,16 @@ measured benchmarks: [`docs/implementation-status.md`](docs/implementation-statu
 > **Status:** pre-1.0. The HTTP surface and config format are stable in
 > practice; the Rust embedding API is 0.x and unstable. Only the server
 > binary is supported.
+
+## Cloudflare host
+
+RS2 also runs natively on Cloudflare Workers: `rs2-worker/` is a TypeScript
+implementation of the same HTTP API (one Durable Object per tenant, R2 for
+files, DO SQLite for data/logs/idempotency, Dynamic Workers for sandboxed
+`code:` mounts). A client cannot tell the hosts apart except through the
+discovery surface — the black-box suite in `conformance/http/` holds both to
+one contract. Spec: [`docs/agents/cloudflare.md`](docs/agents/cloudflare.md);
+operator's card: [`rs2-worker/README.md`](rs2-worker/README.md).
 
 ## License
 

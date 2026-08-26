@@ -132,7 +132,8 @@ function enumField<T extends string>(obj: JsonObject, key: string, allowed: T[])
 
 function boolField(obj: JsonObject, key: string): boolean {
   const v = obj[key];
-  if (v === undefined || v === null) return false;
+  if (v === undefined) return false;
+  // serde: a plain `bool` field rejects an explicit null.
   if (typeof v !== "boolean") throw new SpecParseError(`invalid type for '${key}': expected a boolean`);
   return v;
 }
@@ -167,7 +168,8 @@ function parseStep(v: Json): Step {
   const step = emptyStep();
   step.condition = stringField(v, "if");
   if (v.call !== undefined && v.call !== null) step.call = parseCall(v.call);
-  if (v.transform !== undefined) step.transform = v.transform;
+  // serde: `Option<Value>` maps an explicit null to None, not Some(null).
+  if (v.transform !== undefined && v.transform !== null) step.transform = v.transform;
   if (v.pipeline !== undefined && v.pipeline !== null) step.pipeline = parseSpecValue(v.pipeline);
   step.split = enumField(v, "split", ["jsonSplit"]);
   step.tryMode = boolField(v, "try");
@@ -185,6 +187,8 @@ function parseStep(v: Json): Step {
 function parseSpecValue(v: Json): PipelineSpec {
   if (!isObject(v)) throw new SpecParseError("invalid type: expected a pipeline object");
   const spec = emptySpec();
+  // serde: `mode` is not an Option, so an explicit null is rejected.
+  if (v.mode === null) throw new SpecParseError("invalid type for 'mode': expected a string");
   spec.mode = enumField(v, "mode", MODES) ?? "serial";
   spec.onFail = enumField(v, "onFail", ACTIONS);
   spec.onSucceed = enumField(v, "onSucceed", ACTIONS);
@@ -196,7 +200,8 @@ function parseSpecValue(v: Json): PipelineSpec {
     spec.concurrency = c;
   }
   spec.join = enumField(v, "join", ["jsonObject"]);
-  if (v.steps !== undefined && v.steps !== null) {
+  if (v.steps !== undefined) {
+    // serde: `Vec<Step>` rejects an explicit null (the field may only be absent).
     if (!Array.isArray(v.steps)) throw new SpecParseError("invalid type for 'steps': expected an array");
     spec.steps = v.steps.map(parseStep);
   }

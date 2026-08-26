@@ -1,2 +1,10 @@
 # Copy to `.dev.vars` for `wrangler dev`. Gates `/admin/*` (cloudflare.md §B.5).
 RS2_ADMIN_TOKEN=dev
+
+# Optional: Cloudflare for SaaS custom hostnames (/admin/domains/*). Both
+# required for provisioning; leave unset for registry-only mode.
+# CF_API_TOKEN=
+# CF_ZONE_ID=
+# What the domains endpoints report as the customer CNAME target (falls back
+# to RS2_MAIN_DOMAIN).
+# RS2_CNAME_TARGET=

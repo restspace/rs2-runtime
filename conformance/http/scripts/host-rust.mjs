@@ -53,6 +53,14 @@ cpSync(resolve(pkg, "fixtures", "rust"), work, { recursive: true });
 const configPath = resolve(work, "serverConfig.json");
 const config = JSON.parse(readFileSync(configPath, "utf8"));
 config.listen = `127.0.0.1:${port}`;
+// Catalogue live path (spec F.3 catalogue row): RS2_CATALOGUE_HOSTS is a
+// comma list of operator-allowlisted hosts, the same env both host scripts
+// accept. Unset keeps the fixture's empty allowlist (the dormant half).
+if (process.env.RS2_CATALOGUE_HOSTS) {
+  config.catalogueHosts = process.env.RS2_CATALOGUE_HOSTS.split(",")
+    .map((h) => h.trim())
+    .filter(Boolean);
+}
 writeFileSync(configPath, JSON.stringify(config, null, 2));
 
 let cmd;
