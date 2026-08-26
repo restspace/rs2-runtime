@@ -326,9 +326,51 @@ export async function guestBodyWriteOp(invocations: Invocations, id: string, dat
   }
 }
 
+/// Short-lived one-shot approvals bridging `socketCheck` (which has the
+/// invocation identity) to the `EgressSockets.connect` hook (which has
+/// only the dialed target — raw TCP carries no header channel). One
+/// allowed check buys one platform `connect` to that exact target within
+/// the window; anything else the hook sees is closed unapproved.
+export type SocketApprovals = Map<string, { count: number; expires: number }>;
+
+const SOCKET_APPROVAL_MS = 30_000;
+
+export function recordSocketApproval(approvals: SocketApprovals, host: string, port: number): void {
+  const key = `${host}:${port}`;
+  const now = Date.now();
+  const entry = approvals.get(key);
+  if (entry && entry.expires >= now) {
+    entry.count += 1;
+    entry.expires = now + SOCKET_APPROVAL_MS;
+  } else {
+    approvals.set(key, { count: 1, expires: now + SOCKET_APPROVAL_MS });
+  }
+}
+
+export function consumeSocketApproval(approvals: SocketApprovals, host: string, port: number): boolean {
+  // Opportunistically drop expired entries so the map stays bounded.
+  const now = Date.now();
+  for (const [k, v] of approvals) {
+    if (v.expires < now) approvals.delete(k);
+  }
+  const key = `${host}:${port}`;
+  const entry = approvals.get(key);
+  if (!entry || entry.count <= 0) return false;
+  entry.count -= 1;
+  if (entry.count === 0) approvals.delete(key);
+  return true;
+}
+
 /// The `socket` grant allowlist check (spec §E.3: sockets stay in the
-/// guest; the host only gates the connect).
-export function guestSocketCheckOp(invocations: Invocations, id: string, host: string, port: number): Json {
+/// guest; the host only gates the connect). An allowed check records the
+/// approval the `EgressSockets.connect` hook consumes.
+export function guestSocketCheckOp(
+  invocations: Invocations,
+  approvals: SocketApprovals,
+  id: string,
+  host: string,
+  port: number,
+): Json {
   const record = invocations.get(id);
   if (!record) return errorMarker(RsError.internal(`unknown invocation '${id}'`));
   const target = `${host}:${port}`;
@@ -336,6 +378,7 @@ export function guestSocketCheckOp(invocations: Invocations, id: string, host: s
   if (!allowed) {
     return failGuest(record, RsError.capabilityDenied(`socket ${host}:${port}`));
   }
+  recordSocketApproval(approvals, host, port);
   return null;
 }
 

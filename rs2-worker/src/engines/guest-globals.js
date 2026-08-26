@@ -107,6 +107,22 @@ class RS2Socket {
     this._reader = socket.readable.getReader();
     this._writer = socket.writable.getWriter();
     this._leftover = null;
+    // I/O objects are request-scoped on this platform: a socket created in
+    // one invocation cannot be used from another (the attempt does not
+    // fail fast — it hangs until the runtime kills the worker). Record the
+    // owning invocation and fail deterministically instead, so an adapter
+    // pooling a socket in module scope can catch, reconnect, and retry —
+    // the documented host difference vs. Rust's resident isolates.
+    const c = current();
+    this._owner = c ? c.invocationId : null;
+  }
+  _assertOwned() {
+    const c = current();
+    if (this._owner !== null && (!c || c.invocationId !== this._owner)) {
+      throw new Error(
+        "RS2Socket belongs to a previous invocation (I/O objects are request-scoped on this host) — reconnect",
+      );
+    }
   }
   static async connect(host, port, opts) {
     const tls = !!(opts && opts.tls);
@@ -126,10 +142,12 @@ class RS2Socket {
     return new RS2Socket(socket);
   }
   async write(data) {
+    this._assertOwned();
     const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
     await this._writer.write(bytes);
   }
   async read(max) {
+    this._assertOwned();
     const n = (max | 0) || 65536;
     if (this._leftover && this._leftover.byteLength > 0) {
       const take = this._leftover.subarray(0, n);
@@ -145,6 +163,10 @@ class RS2Socket {
     return value;
   }
   async close() {
+    const c = current();
+    if (this._owner !== null && (!c || c.invocationId !== this._owner)) {
+      return; // another invocation's socket: nothing this context can do
+    }
     try {
       await this._socket.close();
     } catch {

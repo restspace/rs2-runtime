@@ -13,11 +13,12 @@ import {
   guestLogOp,
   guestRequestOp,
   guestSocketCheckOp,
+  consumeSocketApproval,
   guestStateGetOp,
   guestStatePutOp,
   guestStreamBeginOp,
 } from "./engines/dynamic-worker";
-import type { Invocations, SerializedRequest, SerializedResponse } from "./engines/dynamic-worker";
+import type { Invocations, SerializedRequest, SerializedResponse, SocketApprovals } from "./engines/dynamic-worker";
 import { R2FileStore } from "./capabilities/r2-file-store";
 import { DATA_SCHEMA_SQL, SqliteDataStore } from "./capabilities/sqlite-data-store";
 import {
@@ -95,6 +96,9 @@ export class TenantObject extends DurableObject<Env> {
   /// for the call's lifetime so the `HostApi`/`Egress` entrypoints can act
   /// with exactly that invocation's authority.
   private readonly invocations: Invocations = new Map();
+  /// One-shot socket approvals bridging `socketCheck` to the egress
+  /// gateway's `connect` hook (see `SocketApprovals`).
+  private readonly socketApprovals: SocketApprovals = new Map();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -182,7 +186,7 @@ export class TenantObject extends DurableObject<Env> {
       loader,
       invocations: this.invocations,
       hostApiStub: (t) => exports.HostApi!({ props: { tenant: t } }),
-      egressStub: (t) => exports.Egress!({ props: { tenant: t } }),
+      egressStub: (t) => exports.EgressSockets!({ props: { tenant: t } }),
       stateKv: {
         get: (key) => this.ctx.storage.get<string>(key),
         put: (key, value) => this.ctx.storage.put(key, value),
@@ -422,7 +426,14 @@ export class TenantObject extends DurableObject<Env> {
   }
 
   async guestSocketCheck(invocationId: string, host: string, port: number): Promise<Json> {
-    return guestSocketCheckOp(this.invocations, invocationId, host, port);
+    return guestSocketCheckOp(this.invocations, this.socketApprovals, invocationId, host, port);
+  }
+
+  /// Consume a one-shot socket approval recorded by an allowed
+  /// `guestSocketCheck` — called by the `EgressSockets.connect` hook, which
+  /// has only the dialed target (raw TCP carries no invocation id).
+  async guestSocketConsume(host: string, port: number): Promise<boolean> {
+    return consumeSocketApproval(this.socketApprovals, host, port);
   }
 
   guestFetch(invocationId: string | null, req: SerializedRequest): Promise<SerializedResponse> {
