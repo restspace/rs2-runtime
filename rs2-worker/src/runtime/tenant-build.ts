@@ -6,6 +6,7 @@
 import { BuiltinRegistry } from "../capabilities/builtin-registry";
 import { CredentialInjector } from "../capabilities/credential";
 import { PrefixedFileStore } from "../capabilities/prefixed";
+import { ReferenceQueryStore } from "../capabilities/reference-query-store";
 import { ScopedDataStore, ScopedFileStore, ScopedQueryStore } from "../capabilities/scoped";
 import type { ScopedSmsGateway } from "../capabilities/scoped";
 import type { DataStore, FileStore, HttpOut, QueryStore } from "../capabilities/types";
@@ -30,8 +31,13 @@ import { ServicesService } from "../services/services-config";
 import { SpecStore, storeRoot } from "../services/spec-store";
 import type { SpecValidator } from "../services/spec-store";
 import { PipelineService } from "../services/pipeline-service";
+import { QueryService } from "../services/query";
+import { ProxyService } from "../services/proxy";
+import { SmsService } from "../services/sms";
 import { NotYetService, SpecBackedStub } from "../services/stubs";
+import { TemplateService } from "../services/template";
 import { WrapperService } from "../services/wrapper-service";
+import type { DynamicWorkerEngine } from "../engines/dynamic-worker";
 import type { TenantConfig } from "./config-schema";
 import { RsError } from "./error";
 import type { Json, JsonObject } from "./error";
@@ -56,6 +62,9 @@ export interface Adapters {
   builtins: BuiltinRegistry;
   catalogue: CatalogueClient | undefined;
   infras: InfraSet;
+  /// The Dynamic Worker engine (P4); absent when the deployment has no
+  /// `worker_loaders` binding — `code:`/`template` mounts then answer 501.
+  engine: DynamicWorkerEngine | undefined;
 }
 
 /// Seed the built-in registry with the node's own built-ins: `mem`, `local`
@@ -72,7 +81,9 @@ export function seedBuiltins(
     const root = sanitizedStoreRoot(cfg);
     return root !== undefined ? new PrefixedFileStore(files, root) : files;
   });
-  if (queryFactory) builtins.registerQuery("reference", () => queryFactory(dataFactory("")));
+  // `reference` rebuilds the scanning query adapter over the default data store.
+  const refQuery = queryFactory ?? ((data: DataStore) => new ReferenceQueryStore(data));
+  builtins.registerQuery("reference", () => refQuery(dataFactory("")));
   return builtins;
 }
 
@@ -261,7 +272,9 @@ function queryCapability(mount: Mount, adapters: Adapters, name: string, infras:
   const [kind, store] = expandStore(mount, "query", name, infras);
   switch (kind.kind) {
     case "default":
-      return adapters.query ? new ScopedQueryStore(adapters.query, name) : undefined;
+      // The node default is the reference adapter over the default data
+      // store (Rust `Adapters::new` seeds `adapters.query` the same way).
+      return new ScopedQueryStore(adapters.query ?? new ReferenceQueryStore(adapters.data), name);
     case "builtin": {
       const inner = adapters.builtins.buildQuery(kind.name, store);
       if (!inner) throw unknownBuiltin("query", kind.name, adapters.builtins.queryNames());
@@ -354,13 +367,33 @@ export function buildTenant(
         break;
       }
       case "query": {
-        const store = specStoreFor(mount, adapters, name, limits, infras, QUERY_PREFIX, QUERY_SUBTREE, config.operatorRoles);
-        service = new SpecBackedStub("query", store);
+        const store = specStoreFor(
+          mount,
+          adapters,
+          name,
+          limits,
+          infras,
+          QUERY_PREFIX,
+          QUERY_SUBTREE,
+          config.operatorRoles,
+          QueryService.validator(),
+        );
+        service = QueryService.fromConfig(mount.config, store);
         break;
       }
       case "template": {
-        const store = specStoreFor(mount, adapters, name, limits, infras, TEMPLATE_PREFIX, TEMPLATE_SUBTREE, config.operatorRoles);
-        service = new SpecBackedStub("template", store);
+        const store = specStoreFor(
+          mount,
+          adapters,
+          name,
+          limits,
+          infras,
+          TEMPLATE_PREFIX,
+          TEMPLATE_SUBTREE,
+          config.operatorRoles,
+          TemplateService.validator(),
+        );
+        service = TemplateService.fromConfig(mount.config, store, adapters.engine);
         break;
       }
       case "wrapper": {
@@ -378,20 +411,20 @@ export function buildTenant(
         service = AuthService.fromConfig(mount.config, config.auth);
         break;
       case "services":
-        service = new ServicesService();
+        service = new ServicesService(adapters.engine);
         break;
       case "log":
         service = new LogReaderService();
         break;
       case "sms":
-        service = new NotYetService("sms");
+        service = new SmsService();
         break;
       case "proxy":
-        service = new NotYetService("proxy");
+        service = new ProxyService();
         break;
       default:
         if (mount.service.startsWith("code:")) {
-          service = CodeService.fromRef(mount.service);
+          service = CodeService.fromRef(mount.service, adapters.engine);
           break;
         }
         throw RsError.badRequest(

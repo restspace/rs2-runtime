@@ -42,6 +42,11 @@ const args = [
   "--var",
   `RS2_ADMIN_TOKEN:${adminToken}`,
 ];
+// Catalogue live path (spec F.3 catalogue row): same env as host:rust — a
+// comma list the Worker reads as the operator allowlist var.
+if (process.env.RS2_CATALOGUE_HOSTS) {
+  args.push("--var", `RS2_CATALOGUE_HOSTS:${process.env.RS2_CATALOGUE_HOSTS}`);
+}
 console.log(`[host:cf] port ${port}, state ${persist}`);
 console.log(`[host:cf] npx ${args.join(" ")}`);
 const child = spawn("npx", args, {

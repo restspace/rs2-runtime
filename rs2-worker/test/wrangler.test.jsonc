@@ -9,5 +9,6 @@
     { "name": "TENANTS", "class_name": "TenantObject" },
     { "name": "REGISTRY", "class_name": "RegistryObject" } ] },
   "migrations": [ { "tag": "v1", "new_sqlite_classes": ["TenantObject", "RegistryObject"] } ],
-  "r2_buckets": [ { "binding": "RS2_FILES", "bucket_name": "rs2-files" } ]
+  "r2_buckets": [ { "binding": "RS2_FILES", "bucket_name": "rs2-files" } ],
+  "worker_loaders": [ { "binding": "LOADER" } ]
 }

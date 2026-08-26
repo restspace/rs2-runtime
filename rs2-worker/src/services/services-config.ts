@@ -14,6 +14,7 @@ import { MediaType } from "../runtime/media-type";
 import type { Message } from "../runtime/message";
 import { urlHost } from "../runtime/outbound";
 import { CODE_PREFIX, versionOf } from "./code";
+import type { DynamicWorkerEngine } from "../engines/dynamic-worker";
 import { pagination } from "./context";
 import type { Service, ServiceContext, TenantControl } from "./context";
 
@@ -95,6 +96,8 @@ function mounted(config: JsonObject, name: string): Array<[string, string]> {
 }
 
 export class ServicesService implements Service {
+  constructor(private readonly engine: DynamicWorkerEngine | undefined = undefined) {}
+
   private async handleCodeStore(
     msg: Message,
     ctx: ServiceContext,
@@ -234,19 +237,29 @@ export class ServicesService implements Service {
   }
 
   /// Materialize and smoke-test an uploaded bundle: `[bytes, isJs, validated]`.
-  /// The Dynamic Worker compile check arrives in P4, so `validated` is false.
   private async validateBundle(msg: Message, ctx: ServiceContext): Promise<[Uint8Array, boolean, boolean]> {
     const isJs = msg.body?.mediaType.essence().includes("javascript") ?? false;
     if (!msg.body) throw RsError.badRequest("deploying requires a bundle body");
     const bytes = await msg.body.materialize(ctx.limits.materializedBodyBytes);
-    if (isJs) {
-      try {
-        new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
-      } catch {
-        throw RsError.badRequest("JS bundle is not valid UTF-8");
-      }
+    const validated = await this.compileCheckBytes(bytes, isJs);
+    return [bytes, isJs, validated];
+  }
+
+  /// Engine compile smoke test for bundle bytes; returns whether validation
+  /// actually ran (`compile_check_bytes` in Rust — false when the matching
+  /// engine is absent: always for `.wasm` here, and for JS without a
+  /// `worker_loaders` binding). Module evaluation errors → 502.
+  private async compileCheckBytes(bytes: Uint8Array, isJs: boolean): Promise<boolean> {
+    if (!isJs) return false; // no wasm engine on this host (§A)
+    let source: string;
+    try {
+      source = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes);
+    } catch {
+      throw RsError.badRequest("JS bundle is not valid UTF-8");
     }
-    return [bytes, isJs, false];
+    if (!this.engine) return false;
+    await this.engine.compileCheck(source, await versionOf(bytes));
+    return true;
   }
 
   private static async storeBundle(
@@ -384,10 +397,11 @@ export class ServicesService implements Service {
     const isJs = item.engine === "js";
     if (!ctx.files) throw RsError.internal("services service has no file capability");
     const files = ctx.files.prefixed(CODE_PREFIX);
+    const validated = await this.compileCheckBytes(bytes, isJs);
     const [version] = await ServicesService.storeBundle(files, item.name, bytes, isJs);
     return msg.response(
       201,
-      Body.fromJson({ name: item.name, version, ref: `code:${item.name}@${version}`, validated: false }),
+      Body.fromJson({ name: item.name, version, ref: `code:${item.name}@${version}`, validated }),
     );
   }
 

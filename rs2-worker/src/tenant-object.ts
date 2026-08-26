@@ -5,6 +5,19 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { FetchHttpOut } from "./capabilities/fetch-http-out";
+import {
+  DynamicWorkerEngine,
+  guestBodyReadOp,
+  guestBodyWriteOp,
+  guestFetchOp,
+  guestLogOp,
+  guestRequestOp,
+  guestSocketCheckOp,
+  guestStateGetOp,
+  guestStatePutOp,
+  guestStreamBeginOp,
+} from "./engines/dynamic-worker";
+import type { Invocations, SerializedRequest, SerializedResponse } from "./engines/dynamic-worker";
 import { R2FileStore } from "./capabilities/r2-file-store";
 import { DATA_SCHEMA_SQL, SqliteDataStore } from "./capabilities/sqlite-data-store";
 import { IDEMPOTENCY_SCHEMA_SQL, SqliteIdempotencyStore } from "./capabilities/sqlite-idempotency";
@@ -22,6 +35,7 @@ import { NullLogStore, parseSeverity } from "./runtime/logging";
 import type { LogStore } from "./runtime/logging";
 import { MediaType } from "./runtime/media-type";
 import { Message, TraceContext } from "./runtime/message";
+import { claimOccurrence, claimTtlMs, dueOccurrenceMs, earliestNextDueMs, scheduledMounts, tickMessage } from "./runtime/scheduler";
 import { buildTenant, seedBuiltins } from "./runtime/tenant-build";
 import type { Adapters } from "./runtime/tenant-build";
 import { defaultLimits } from "./runtime/wrapper";
@@ -55,6 +69,12 @@ export class TenantObject extends DurableObject<Env> {
   private builtInfrasVersion: string | undefined;
   private infras: InfraSet = new InfraSet();
   private logStore: LogStore = new NullLogStore();
+  /// Overlap guard (§B.6): mounts whose previous scheduled fire is running.
+  private readonly schedInFlight = new Set<string>();
+  /// Live guest invocations (§E.3): id → grants/budget/trace/streams, held
+  /// for the call's lifetime so the `HostApi`/`Egress` entrypoints can act
+  /// with exactly that invocation's authority.
+  private readonly invocations: Invocations = new Map();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -84,6 +104,15 @@ export class TenantObject extends DurableObject<Env> {
     const text = JSON.stringify(config, null, 2);
     const version = await configVersionOf(text);
     await this.ctx.storage.put({ config: text, "config.version": version });
+    // Rust parity: a config write rebuilds every service instance, which
+    // resets guest `ctx.state` (`GrantedHost.state` lives on the instance).
+    // The KV-backed state still survives DO eviction/restarts between
+    // config writes — the durable half of cloudflare.md decision 12.
+    const stale = await this.ctx.storage.list({ prefix: "state:" });
+    const keys = [...stale.keys()];
+    for (let i = 0; i < keys.length; i += 128) {
+      await this.ctx.storage.delete(keys.slice(i, i + 128));
+    }
     return version;
   }
 
@@ -117,7 +146,27 @@ export class TenantObject extends DurableObject<Env> {
       builtins: seedBuiltins(files, dataFactory, undefined),
       catalogue: catalogueHosts.length ? new HttpCatalogueClient(http, catalogueHosts) : undefined,
       infras: this.infras,
+      engine: this.buildEngine(tenant),
     };
+  }
+
+  /// The Dynamic Worker engine (§E): absent without a `worker_loaders`
+  /// binding, in which case `code:`/`template` mounts answer 501.
+  private buildEngine(tenant: string): DynamicWorkerEngine | undefined {
+    const loader = this.env.LOADER;
+    if (!loader) return undefined;
+    void tenant;
+    const exports = (this.ctx as unknown as { exports: Record<string, (opts: { props: Json }) => Fetcher> }).exports;
+    return new DynamicWorkerEngine({
+      loader,
+      invocations: this.invocations,
+      hostApiStub: (t) => exports.HostApi!({ props: { tenant: t } }),
+      egressStub: (t) => exports.Egress!({ props: { tenant: t } }),
+      stateKv: {
+        get: (key) => this.ctx.storage.get<string>(key),
+        put: (key, value) => this.ctx.storage.put(key, value),
+      },
+    });
   }
 
   private async runtimeFor(tenant: string): Promise<Runtime> {
@@ -136,6 +185,19 @@ export class TenantObject extends DurableObject<Env> {
         // The log sink knob lives in the config, so re-evaluate it.
         this.logStore = new SqliteLogStore(this.ctx.storage.sql, tenant, loggingEnabled(config));
         adapters.log = this.logStore;
+        // Self-arm (§B.6): a config carrying `schedule` mounts arms this
+        // DO's alarm right here — the tenant name is persisted so alarm()
+        // can rebuild after eviction, and the registry learns whether this
+        // tenant needs the cron safety net (best-effort; the alarm is the
+        // real trigger).
+        await this.ctx.storage.put("tenant.name", tenant);
+        const count = await this.armSchedules(config, true);
+        try {
+          const registry = this.env.REGISTRY.get(this.env.REGISTRY.idFromName("registry"));
+          await registry.noteScheduled(tenant, count > 0);
+        } catch {
+          /* the safety net misses this tenant until the next config write */
+        }
         return version;
       },
     });
@@ -225,17 +287,103 @@ export class TenantObject extends DurableObject<Env> {
     buildTenant(tenant, parsed, this.buildAdapters(tenant, config), defaultLimits(), undefined, undefined);
   }
 
-  /// Cron reconcile (§B.6): re-arm alarms for scheduled mounts. P3 wires the
-  /// alarm; for now this only reports whether the tenant has schedules.
+  /// Cron reconcile (§B.6): re-arm an alarm that was lost. Alarms survive
+  /// eviction and deploys, so this is only the safety net for the rare loss
+  /// (alarm retries exhausted); the DO self-arms on every config write.
   async reconcileSchedules(): Promise<number> {
     const raw = await this.loadRaw();
-    if (!raw) return 0;
-    const mounts = Array.isArray(raw[0].mounts) ? raw[0].mounts : [];
-    return mounts.filter((m) => m && typeof m === "object" && !Array.isArray(m) && m.config && typeof m.config === "object" && !Array.isArray(m.config) && (m.config as JsonObject).schedule !== undefined).length;
+    return this.armSchedules(raw?.[0], false);
   }
 
+  /// Derive the scheduled mounts and arm the alarm at the earliest due time.
+  /// `force` (config writes) always moves the alarm to the new schedule; the
+  /// safety net only arms a missing alarm or pulls one earlier, so it can
+  /// never postpone an imminent fire.
+  private async armSchedules(config: JsonObject | undefined, force: boolean): Promise<number> {
+    const mounts = config ? scheduledMounts(config) : [];
+    if (mounts.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+      return 0;
+    }
+    const next = earliestNextDueMs(mounts, Date.now());
+    if (next === undefined) return mounts.length; // no cron occurrence within 366 days
+    const current = await this.ctx.storage.getAlarm();
+    if (force || current === null || next < current) await this.ctx.storage.setAlarm(next);
+    return mounts.length;
+  }
+
+  /// §B.6: fire every due mount as `tick_message` through `handle`, with the
+  /// overlap guard and the `schedule_claims` fire-once claim, then re-arm.
   override async alarm(): Promise<void> {
-    // Scheduled mounts fire here in P3 (`tick_message` through `handle`).
+    const raw = await this.loadRaw();
+    if (!raw) return; // tenant deleted; the alarm dies with it
+    const tenant =
+      this.tenantName ?? (await this.ctx.storage.get<string>("tenant.name")) ?? this.env.RS2_DEFAULT_TENANT ?? "main";
+    const mounts = scheduledMounts(raw[0]);
+    const nowMs = Date.now();
+    const fires: Array<Promise<void>> = [];
+    for (const m of mounts) {
+      const occ = dueOccurrenceMs(m.schedule, nowMs);
+      if (occ === undefined) continue;
+      // Overlap guard: skip while this mount's previous fire is running.
+      if (this.schedInFlight.has(m.base)) continue;
+      // Fire-once: a retried alarm loses the claim for an occurrence that
+      // already fired and skips it.
+      if (!claimOccurrence(this.ctx.storage.sql, `${tenant}|${m.base}`, occ, claimTtlMs(m.schedule), nowMs)) continue;
+      this.schedInFlight.add(m.base);
+      fires.push(this.fireTick(tenant, m.base).finally(() => this.schedInFlight.delete(m.base)));
+    }
+    // Re-arm before awaiting the fires so a crash mid-fire leaves the chain
+    // armed (the claims make the retried occurrence a no-op).
+    const next = earliestNextDueMs(mounts, nowMs);
+    if (next !== undefined) await this.ctx.storage.setAlarm(next);
+    await Promise.allSettled(fires);
+  }
+
+  /// Dispatch the synthetic internal tick (`fire_tick` in `runtime.rs`);
+  /// errors surface as the tick's problem response and are logged there.
+  private async fireTick(tenant: string, base: string): Promise<void> {
+    const runtime = await this.runtimeFor(tenant);
+    const resp = await runtime.handle(tickMessage(tenant, base));
+    if (resp.body) await resp.body.intoStream().cancel().catch(() => undefined);
+  }
+
+  // ---- guest RPC surface (§E.3): called by the HostApi/Egress entrypoints --
+
+  guestRequest(invocationId: string, capability: string, req: Json): Promise<Json> {
+    return guestRequestOp(this.invocations, invocationId, capability, req);
+  }
+
+  async guestLog(invocationId: string, level: string, text: string): Promise<void> {
+    guestLogOp(this.invocations, invocationId, level, text);
+  }
+
+  guestStateGet(invocationId: string, key: string): Promise<Json> {
+    return guestStateGetOp(this.invocations, invocationId, key);
+  }
+
+  guestStatePut(invocationId: string, key: string, value: string): Promise<Json> {
+    return guestStatePutOp(this.invocations, invocationId, key, value);
+  }
+
+  guestBodyRead(invocationId: string): Promise<Json | { data: Uint8Array }> {
+    return guestBodyReadOp(this.invocations, invocationId);
+  }
+
+  async guestStreamBegin(invocationId: string, envelope: Json): Promise<Json> {
+    return guestStreamBeginOp(this.invocations, invocationId, envelope);
+  }
+
+  guestBodyWrite(invocationId: string, data: Uint8Array): Promise<Json> {
+    return guestBodyWriteOp(this.invocations, invocationId, data);
+  }
+
+  async guestSocketCheck(invocationId: string, host: string, port: number): Promise<Json> {
+    return guestSocketCheckOp(this.invocations, invocationId, host, port);
+  }
+
+  guestFetch(invocationId: string | null, req: SerializedRequest): Promise<SerializedResponse> {
+    return guestFetchOp(this.invocations, invocationId, req);
   }
 }
 

@@ -46,10 +46,10 @@ export class PipelineService implements Service {
       const specValue = doc.pipeline;
       if (specValue === undefined) throw RsError.badRequest("pipeline envelope requires a 'pipeline'");
       const spec = specFromValue(specValue, convertDsl);
-      if (doc.retry !== undefined) {
-        if (doc.retry !== null && !retryFromConfig(doc.retry)) {
-          throw RsError.badRequest("invalid 'retry' policy: expected a retry policy object");
-        }
+      // Rust deserializes the envelope's `retry` directly (not via
+      // `from_config`), so an explicit null is invalid here too.
+      if (doc.retry !== undefined && !retryFromConfig(doc.retry)) {
+        throw RsError.badRequest("invalid 'retry' policy: expected a retry policy object");
       }
       if (doc.access !== undefined) validateAccessShape(doc.access);
       const canonical: JsonObject = { ...doc, pipeline: specToJson(spec) };

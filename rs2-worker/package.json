@@ -9,6 +9,7 @@
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "build:shim": "node scripts/build-shim.mjs",
     "vendor:hash-wasm": "node scripts/vendor-hash-wasm.mjs"
   },
   "devDependencies": {

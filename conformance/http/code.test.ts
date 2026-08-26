@@ -295,15 +295,24 @@ describe("code mounts", () => {
 
   // ---- conformance.rs: limits ----------------------------------------------
 
-  test("unbounded allocation hits the memory cap → 503 limit_exceeded (memory_bytes)", async () => {
-    const res = await anon.get("/hog/x");
-    status(res, 503, "[hog] memory cap");
-    const p = res.problem();
-    expect(p.code, "[hog] code").toBe("limit_exceeded");
-    expect(p.limit, "[hog] which limit").toBe("memory_bytes");
-    expect(p.retryable, "[hog] retryable").toBe(true);
-    expect(p.retryAfterMs, "[hog] retryAfterMs").toBe(2000);
-  });
+  // Cloudflare: the 128 MiB isolate heap cap is a production platform
+  // limit; `wrangler dev`'s local workerd applies no per-isolate cap to
+  // loader workers, so an allocation bomb OOMs (and can crash) the local
+  // process instead of the guest. The spec's `@remote` provision (§G)
+  // applies: this case runs against the Rust host always and against
+  // Cloudflare only when `RS2_CF_REMOTE` marks a real-platform run.
+  test.skipIf(env().hostKind === "cloudflare" && !process.env.RS2_CF_REMOTE)(
+    "unbounded allocation hits the memory cap → 503 limit_exceeded (memory_bytes)",
+    async () => {
+      const res = await anon.get("/hog/x");
+      status(res, 503, "[hog] memory cap");
+      const p = res.problem();
+      expect(p.code, "[hog] code").toBe("limit_exceeded");
+      expect(p.limit, "[hog] which limit").toBe("memory_bytes");
+      expect(p.retryable, "[hog] retryable").toBe(true);
+      expect(p.retryAfterMs, "[hog] retryAfterMs").toBe(2000);
+    },
+  );
 
   test(
     "a guest that outlives the wall clock is killed → 503 limit_exceeded (wall_clock_ms), retryable",

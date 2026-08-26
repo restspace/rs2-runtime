@@ -191,10 +191,7 @@ describe("idempotency (g6)", () => {
 
   // Spec F.3: "in-flight 409 via a pipeline with a slow step (GET on a
   // `code:` echo that sleeps 2 s) fired twice concurrently".
-  // Skipped on the Worker until P4: the slow step is a `code:` mount (the
-  // JS echo guest), which answers 501 `engine_unavailable` before the
-  // Dynamic Worker engine lands (cloudflare.md §H).
-  test.skipIf(env().hostKind === "cloudflare")("a duplicate that arrives mid-flight is a retryable 409", async () => {
+  test("a duplicate that arrives mid-flight is a retryable 409", async () => {
     const k = key("inflight");
     const headers = { "idempotency-key": k };
     const first = anon.post("/pipes", { json: {}, headers });
@@ -290,10 +287,7 @@ describe("idempotency (g6)", () => {
   // `g6_segment_retry_dedupes_keyed_effects`: the segment retries as a unit,
   // the keyed call re-runs on every attempt under the SAME derived key, and
   // therefore takes effect exactly once.
-  // Skipped on the Worker until P4 for the same reason: `/notify` is a
-  // `code:` mount (the flaky guest); the pipeline/retry machinery it drives
-  // is exercised on the Worker by the materialized-payload case above.
-  test.skipIf(env().hostKind === "cloudflare")("a keyed effect inside a retried segment executes once", async () => {
+  test("a keyed effect inside a retried segment executes once", async () => {
     await anon.get("/notify?reset=1");
     const run = await anon.post("/seg", { json: { amount: 10 } });
     // Every attempt's notify fails transiently (503 is in the default retry

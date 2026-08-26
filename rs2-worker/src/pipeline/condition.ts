@@ -100,8 +100,17 @@ function evalExpr(expr: Expr, msg: Message, vars: JsonObject): Json {
   }
 }
 
+/// serde `Value == Value`: deep equality, object key order insignificant.
 function jsonEqual(a: Json, b: Json): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => jsonEqual(v, b[i]!));
+  }
+  if (a && b && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b)) {
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((k) => k in b && jsonEqual(a[k]!, b[k]!));
+  }
+  return false;
 }
 
 function compare(l: Json, op: CmpOp, r: Json): boolean {

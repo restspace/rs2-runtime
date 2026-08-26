@@ -11,7 +11,7 @@
       "mintedBy": "cloudflare",
       "algorithm": "argon2id",
       "password": "cross-host-pw",
-      "passwordHash": null
+      "passwordHash": "$argon2id$v=19$m=19456,t=2,p=1$CbQzqGHt6ltG3sU5BDqqRQ$y9xPlhHUNflJ2Isbqi2Q8uL2gMH/BTWBqSu8l/VWgHQ"
     },
     {
       "mintedBy": "reference-vector",

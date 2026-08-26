@@ -16,6 +16,14 @@ export interface Env {
   RS2_CATALOGUE_HOSTS?: string;
   /// Secret: gates `/admin/*`.
   RS2_ADMIN_TOKEN?: string;
+  /// Secrets: Cloudflare for SaaS custom hostnames (`/admin/domains/*`,
+  /// `src/domains.ts`). Both set → the endpoints provision/poll/remove a
+  /// custom hostname; either missing → registry-only mode.
+  CF_API_TOKEN?: string;
+  CF_ZONE_ID?: string;
+  /// Where customers point their domain's CNAME (falls back to
+  /// `RS2_MAIN_DOMAIN`; reported by the domains admin endpoints).
+  RS2_CNAME_TARGET?: string;
 }
 
 /// Headers the Worker stamps on the request it forwards to the tenant DO.
