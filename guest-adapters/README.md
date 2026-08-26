@@ -20,6 +20,16 @@ no build step: each bundle is self-contained, which is why the BSON/OP_MSG
 wire section is duplicated between the two files — the marked sections must be
 kept in sync by hand.
 
+Both run on **both hosts** (P4b): every socket call is awaited (RS2Socket
+is synchronous on the Rust host, async on the Worker — awaiting a plain
+value is a no-op), a module-level lock serializes wire exchanges, and each
+command exchange reconnects-and-retries once if the pooled socket died.
+On Rust the resident isolate pools one connection for the mount's
+lifetime and the retry path never runs; on the Worker I/O objects are
+request-scoped, so the adapter reconnects per invocation (and
+`store.maxRuntimes`/`idleMs`/`idleSeconds` are accepted but ignored
+there — see `docs/agents/cloudflare.md` §A).
+
 ## Native listing pushdown (`features` export)
 
 A data-adapter bundle may export `const features = ["list-records"]` alongside

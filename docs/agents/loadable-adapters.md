@@ -234,6 +234,21 @@ collation deviation documented in `guest-adapters/README.md`). Proof:
 non-advertising Redis mount (fallback) and the Mongo bundle against a mock
 mongod that sorts server-side, plus the `listProjection` catalogue signal.
 
+## On the Worker host
+
+The Cloudflare host ships the same guest-backed stores (P4b,
+`rs2-worker/src/capabilities/guest-stores.ts` + `invokeAdapter` in
+`engines/dynamic-worker.ts`): the mapping, error identities, `features`
+handshake, and listing pushdown are this document's design, ported. What
+differs is the runtime substrate — one Dynamic Worker isolate per mount
+instead of the N-pool (`maxRuntimes`/`idleMs`/`idleSeconds` accepted and
+ignored; the platform owns eviction), and I/O objects are request-scoped
+there, so a bundle's module-scope socket dies at the invocation boundary
+and portable adapters reconnect-and-retry (the shipped bundles and the
+conformance fixtures do; the retry path is dormant on this host). See
+`cloudflare.md` §A, §C.1, §D and decisions 35–40; the cross-host proof is
+`conformance/http/guest-adapter.test.ts`.
+
 **Remaining:** a **`GuestActor`** model for long-lived server-push connections
 (Discord gateway / Slack socket-mode — needs a continuously driven runtime, real
 wall-clock timers, and an inbound-event egress path: a sibling to the resident

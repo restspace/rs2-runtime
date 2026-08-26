@@ -41,6 +41,8 @@ prelude's virtual timers). Wasm components on the Worker.
 | Timers inside guests are real, not virtual | same facet |
 | Opaque validators (`ETag` values, config version) are different strings | none — they are opaque by contract; clients round-trip them |
 | `conditional-write` is atomic on the Worker (DO-serialized), best-effort on Rust local-fs | already a declared facet strength (`FileStore::conditional_write_atomic`) |
+| Guest (`code:`) store adapters: `store.maxRuntimes` / `store.idleMs` / `store.idleSeconds` are accepted and **ignored** (one Dynamic Worker isolate per mount; the platform owns eviction) | documented here + §I decision 36; surfaced the same way `limits.cpuMs` is (a Worker-only knob the other host ignores) |
+| Guest adapters cannot pool a backend connection across requests: I/O objects are request-scoped on the Workers platform, so a socket pooled in a bundle's module scope dies at the invocation boundary and the adapter reconnects per invocation (on Rust the resident isolate pools it for the mount's lifetime) | `guestAdapterPooling` in `src/divergences.ts` (`"pooled"` \| `"perInvocation"`); §I decision 38 |
 | `DELETE` of a directory that never existed: Rust local-fs → 404; R2 has no directories → **204** | runner accepts `204|404` for this one case (§F); documented, not declared |
 | Dot segments in the request target (`/files/../x`, `/files/%2e%2e/x`) | The Workers platform canonicalizes them before the Worker runs (`request.url` already reads `/x`), so the router's 400 `path_unsafe` is unreachable and the request routes on the normalized path (404 for an unmounted target); `%00`, `\`, control characters and drive letters still reach the router and are 400 | runner accepts `400|404` for the two dot-segment cases (`dotSegmentTraversal` in `src/divergences.ts`); documented, not declared |
 | `Content-Range` on 206 | Rust omits it (a known gap, `services/file.rs`); the Worker **also omits it** — fixing it is a both-hosts change, out of scope |
@@ -260,7 +262,7 @@ A tenant with no scheduled mount has no alarm and costs nothing.
 | `InfraLoader` (`infras.json`) | `RegistryObject` KV `infras` | §B.5 |
 | `CatalogueClient` (`HttpCatalogueClient`) | `fetch()` bounded by `RS2_CATALOGUE_HOSTS` (var, comma list) | 64 MiB cap kept |
 | JS engine (`engines/js.rs`, prelude) | Dynamic Workers (`env.LOADER`) + guest shim | §E |
-| Resident adapters (`engines/resident.rs`: `code:` store/sms adapters) | **dropped in P3/P4** → 501 `engine_unavailable` at build (same wording as the no-JS build) | P4b candidate: Dynamic Worker with `globalOutbound` gateway; state = warm isolate only |
+| Resident adapters (`engines/resident.rs`: `code:` store/sms adapters) | **P4b: `capabilities/guest-stores.ts`** — `GuestDataStore`/`GuestQueryStore`/`GuestFileStore`/`GuestSmsGateway` over a Dynamic Worker per mount (id `<tenant>:<mount base>:adapter:<name>@<version>`), `env {RS2}` + the `EgressSockets` gateway; 501 `engine_unavailable` only when the deployment has no `worker_loaders` binding | pool knobs ignored (§A); sockets reconnect per invocation (§A); §I decisions 35–40 |
 | `template` service (JS isolate, `deny_all`) | Dynamic Worker, `globalOutbound: null`, `env: {}` | §D |
 | Wasm engine (`engines/wasm.rs`) | **dropped** → 501 | declared (§A) |
 | `NativeEngine` | dropped (test-only reference binding) | — |
@@ -455,7 +457,7 @@ what is *easy to lose*.
 | `engines/mod.rs`, `engines/native.rs` | — | dropped | — |
 | `engines/wasm.rs` | — | dropped | 501 at load (`… is a wasm component but this build has no wasm engine`). |
 | `engines/js.rs` + `engines/js_prelude.js` | `engines/dynamic-worker.ts` + `engines/guest-shim.js` | adapter | §E. |
-| `engines/resident.rs` | — | dropped (P4b) | see §C.1. |
+| `engines/resident.rs` | `capabilities/guest-stores.ts` | port | `ResidentAdapter` (ref parsing + bundle load + `features` handshake + the call helper) wrapped by `GuestDataStore`/`GuestQueryStore`/`GuestFileStore`/`GuestSmsGateway`. Traps: the error wordings are byte-for-byte Rust's (`"data adapter bundle 'code:<n>@<v>' not found — deploy it via PUT /code/<n>"`, `store_error`'s status mapping incl. the literal `data adapter returned <status>` fallback for every kind, the 400 ref-parse wordings); `$select`/`$sort` are **never** forwarded to a bundle that hasn't advertised `list-records` (the flag reads `false` until the first call's `features` RPC — same as Rust's lazy spawn); file contents cross base64-encoded, Ranges slice host-side, conditional writes are the interface defaults (best-effort, `conditionalWriteAtomic() = false`); `quote` is the scalar default. The engine side is `invokeAdapter`/`adapterFeatures` in `engines/dynamic-worker.ts` (deny-all `GrantedHost`, an invocation record per call for socket/log attribution, guest `ctx.state` durable in DO KV under the `<name>@<version>` identity). |
 | `services/mod.rs` | `services/context.ts` | port | `ServiceContext`; `if_none_match_hits`; `write_precondition` (`If-None-Match: *` wins over `If-Match`); `pagination` (`$take` default 1000 max 10 000, `$skip` 0, unparseable → default). |
 | `services/file.rs` | `services/file.ts` | port | `serve_file`: 200/206, `Accept-Ranges: bytes`, `ETag` from provenance, `Last-Modified` in **RFC 2822** (`toUTCString()` is IMF-fixdate; the Rust emits RFC 2822 — they differ only in the day/month punctuation; **match Rust**: use the `time` crate's RFC 2822 layout `Ddd, DD Mon YYYY HH:MM:SS +0000`), 304 on `If-None-Match`, no `Content-Range`. `parse_range` single range only, inclusive end. `MOVE` (`Destination` header, 201/200, `Location`). Directory GET decision order: forced listing (`Accept: application/vnd.rs2.dir+json` exactly, q>0) → `defaultResource` (+ SPA root fallback) → `listings:false` 404 unless operator → `$sort` meta-sort over the whole dir → `{path, entries, total}` + `X-Total-Count` + `Vary: accept` (+ `Cache-Control: no-store`, `Vary: authorization, cookie` when operator-only). File GET: serve → dir-without-slash **301** with query preserved → friendly URL (`Content-Location`) → SPA fallback. HEAD: `Content-Length`, `Accept-Ranges`, `Content-Type` by path, `Content-Location` only when resolved differs, **no ETag**. Keyless POST child = 32-hex uuid + `extension_for` (the *small* table). PUT/POST child: pinned extension-less writes (`extensionPriority[0]`, 400 without), 201/200, `ETag`, `Location` + `Content-Location` on pins, no body. DELETE dir: preconditions → 400; `?confirm=<leaf>` recursive; file: `delete_cond` then friendly resolution. Other → 405 `code: bad_request`. |
 | `services/data.rs` | `services/data.ts` | port | ETag = `"<sha256(JSON.stringify(value))[0..16]>"` computed over the **unredacted** value (opaque; differs from Rust's SipHash). Root GET `{path:"/", entries:[{name:"<ds>/", dir:true}], total}`; `.schemas` GET; dataset GET plain (appends `{name:".schema.json", dir:false, fixed:true}` **outside** the page/total when a schema exists) vs `$select` projected (`fields`, no schema entry; `$sort` without `$select` → 400); POST keyless 201 + body + `Location` + `ETag` + `Content-Type: application/json; schema="…"`; dataset DELETE requires `?confirm=<dataset>` else **409** (unconditional); record GET 200 with `Link: <…/.schema.json>; rel="describedby"`, 304 on `If-None-Match` with `ETag`; PUT (no body) / POST (echo) 201/200 with `ETag`, preconditions evaluated in the service against the content ETag; PATCH = RFC 7386 merge, **ignores conditionals, no ETag on response**, 200 with body; schema PUT 200 (never 201), compile-checked, operator-gated under `fieldLevelAuthz`; field rules top-level `x-rs-read`/`x-rs-write` (`redact_fields`, `enforce_write_rules` 403 wording); 422 `errors: [{path, message}]` from ajv (`instancePath` → `path`, ajv `message`). Ajv: `new Ajv2020({allErrors:true, strict:false})`, and a draft-07 instance when `$schema` matches `draft-07`; `jsonschema` 0.33 auto-detects the same way. |
@@ -472,7 +474,7 @@ what is *easy to lose*.
 | `services/template.rs` | `services/template.ts` | adapter | Envelope `{source, contentType}`; the compiled bundle runs as a Dynamic Worker (`LOADER.get("tpl:" + sha256(source)[0..16], …)`, `globalOutbound: null`, `env: {}`, `limits: {cpuMs: 1000}`), invoked with the resident envelope `{method:"POST", url:"/", body: props, mediaType:"application/json"}`; non-string body → 502; guest headers discarded. |
 | `services/auth.rs` | `services/auth.ts` | port | Settings merge (tenant `auth` + mount config minus `access`; empty `jwtSecret` → 400). JWT **HS512**, header bytes literally `{"alg":"HS512","typ":"JWT"}`, base64url no padding, claims `sub, roles (space string), kind, iat, exp, extra (omitted when empty)`, verify error wordings and order, no skew. Token from `Authorization: Bearer ` (case-sensitive prefix) else cookie `rs-auth`. Endpoints `POST login|refresh|logout`, `GET user`, else 404 wording. Cookie matrix (`SameSite=Strict` / `SameSite=None; Secure` for trusted origins / none otherwise), `logout` 204 with `Max-Age=0`. Lockout: 5 attempts / 10 min, map bound 10 000, DO memory. Login-origin allowlist. **Hashes** (`hash-wasm`): produce `argon2id({password, salt: 16 random bytes, parallelism: 1, iterations: 2, memorySize: 19456, hashLength: 32, outputType: "encoded"})` → `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`; verify with `argon2Verify({password, hash})` for `$argon2*` (parameters come from the hash — Rust `Argon2::default()` verifies any PHC params), `bcryptVerify` for `$2*`, else false. Cross-host test: a hash minted by each host verifies on the other (P3 acceptance). |
 | `services/proxy.rs` | `services/proxy.ts` | port | `target` required; strip `host, authorization, cookie, connection, transfer-encoding, proxy-authorization`; injector under key `proxy`; no allowlist. |
-| `services/sms.rs` | `services/sms.ts` | port | Routes and wordings; every `store.adapter` form except an embedder default is 400/501 on this host until P4b. |
+| `services/sms.rs` | `services/sms.ts` | port | Routes and wordings; `code:` provider adapters run via `GuestSmsGateway` (P4b); `builtin:` stays a 400 (no first-party providers), no embedder default on this host. |
 | `services/wrapper_service.rs` | `services/wrapper-service.ts` | port | Inline spec, `inputSchema` enforced on PUT/POST/PATCH (422 `errors: [{path, message}]`), `outputSchema` compile-only, `rest` byte-exact. |
 | `services/services_config.rs` | `services/services-config.ts` | port | Every endpoint in the Rust table: `catalogue`, `catalogues`, `catalogue/available`, `catalogue/install` (hash pin, compile check via the Dynamic Worker loader's `get` with a throwaway id → `validated`), `services`, `infras`, `raw` GET/PUT (`<secret>` masking/restore, **409** on `If-Match`), the `/code/` subtree (content-addressed `version_of` = sha256[0..8] hex; POST keyless 201 `{name, version, ref, validated}` + `Location`; PUT must match the hash else 409; `mountedAt`; DELETE refuses mounted versions; `X-RS2-Manifest` sidecar; `Cache-Control: private, max-age=31536000, immutable` + `ETag: "<version>"` on reads). |
 | `services/catalogue.rs` | `services/catalogue.ts` | port | `CatalogueItem` fields; host allowlist checked before I/O (400 no host / 403 `capability_denied` `catalogue fetch to '<host>'`); 502 `Catalogue Fetch Failed`; 64 MiB cap. |
@@ -635,8 +637,13 @@ per invocation as `ctx.exports.Egress({props: {invocationId}})` and passed as
 `globalOutbound`. Its `fetch(request)` looks up the invocation in the DO
 (via an RPC back to the tenant stub — the gateway runs in the Worker isolate,
 not the DO; it forwards `{invocationId, request}` to `stub.guestFetch`), and
-the DO applies `GrantedHost.request("fetch", …)`. Its `connect(address,
-options)` applies the socket allowlist and then returns the platform socket.
+the DO applies `GrantedHost.request("fetch", …)`. Sockets go through the
+`EgressSockets` subclass — the gateway dynamic workers actually get as
+`globalOutbound` — whose `connect(socket)` hook receives the dialed
+target in `socket.opened.localAddress` (raw TCP has no header channel):
+it consumes the one-shot approval the DO recorded when the shim's
+`socketCheck` allowed the target, bridges to the real backend, and
+closes unapproved sockets (decision 38/39).
 Guests therefore have no path to the network that bypasses grants, and
 `tails: []` keeps their `console` output inside the host log bridge
 (`console.*` in the guest is additionally routed to `env.RS2.log` by the shim).
@@ -722,10 +729,12 @@ directories with `?confirm`).
 | `logging.test.ts` | `logging.rs` (runtime half) | boundary records (`timeUnixNano` string, `severityText`, `rs2.tenant`, `error.type`, status number, `rs2.source`), trace-scoped read, `severity=warn` filter with a failed login (`rs2.source: service`, `rs2.service: auth`), info floor, NDJSON via `Accept: text/plain`, `X-Total-Count` |
 | `discovery-limits.test.ts` | new | the `limits` object exists and `host` names the expected kind |
 | `catalogue.test.ts` | `catalogue.rs` | only the dormant path (`enabled:false`, install → 501) unless `RS2_CATALOGUE_URL` points at a fixture server the runner starts (`fixtures/catalogue-server.mjs`) and the host was started with that host allowlisted |
+| `guest-adapter.test.ts` | `guest_adapter.rs` (HTTP-visible subset, P4b) | guest (`code:`) store adapters over in-process mock Redis (RESP) + Mongo (OP_MSG/BSON) TCP backends the suite starts itself: data/file store contract, schema facet, missing-bundle 404 wording, socket denial identity, stored query over Redis, Mongo data + aggregation adapters, listing fallback vs native pushdown + catalogue `listProjection`, int64/date/ObjectId wire round-trips, the pooling observation (`guestAdapterPooling` divergence). Pool growth / idle eviction stay Rust-only in-process tests |
 
 Allowed divergences are a single table in `src/divergences.ts` keyed by
-`RS2_HOST_KIND`; today it has two entries (absent-directory DELETE 204|404,
-dot-segment traversal 400|404).
+`RS2_HOST_KIND`; today it has three entries (absent-directory DELETE
+204|404, dot-segment traversal 400|404, and `guestAdapterPooling` —
+pooled backend connections on Rust vs. per-invocation on the Worker).
 
 ### F.4 CI
 
@@ -857,9 +866,25 @@ entrypoints, `services/code.ts` grants (`prefix`, `httpOut`, `store`),
 `guest-async` facet. Accept: `code.test.ts` green on both hosts; every
 `corpus/bundles/*.js` loads and answers a mocked call (a Worker unit test
 with `globalOutbound` pointed at a stub); `conformance/http` `@remote` tag
-empty or documented. **P4b (optional, after P4)**: resident `code:` store/sms
-adapters over Dynamic Workers with socket grants — the `guest-adapters`
-Redis/Mongo bundles pass `tests/guest_adapter.rs`'s scenarios over HTTP.
+empty or documented.
+
+**P4b — resident `code:` store adapters.** ✅ done.
+`capabilities/guest-stores.ts` (the `resident.rs` port), the
+`invokeAdapter`/`adapterFeatures` engine path, the `EgressSockets`
+gateway with the §E.4 connect hook, the `features` RPC on `Rs2Guest`, and
+the `tenant-build.ts` wiring for `code:` data/file/query/sms adapters
+(and `code:` spec-store backends). Proof: `conformance/http/
+guest-adapter.test.ts` (14 tests — the HTTP-observable scenarios of
+`rs2-core/tests/guest_adapter.rs` over in-process mock Redis/Mongo TCP
+backends) green on BOTH hosts, with the full suite green alongside
+(rust: 204 passed / 7 skipped; cloudflare: 203 passed / 8 skipped — the
+extra skip is the `@remote` memory-cap case); `rs2-core --features js`
+`guest_adapter` (10 tests) green on the extracted fixture bundles;
+`rs2-worker` unit tests cover the capability mapping, error identities,
+the features handshake, and the resident engine path. Pool-growth and
+idle-eviction stay Rust-only internals (knobs ignored here, §A); the
+pooling observation itself is conformance-covered with the
+`guestAdapterPooling` divergence.
 
 **P5 — `transfer` (follow-on).**
 A Cloudflare Workflow (`TransferWorkflow`) that copies one store mount's
@@ -919,8 +944,14 @@ Accept: a 10 000-object mount copies across two `wrangler dev` tenants with
 11. **Egress gateway runs in the Worker isolate and defers to the DO** for
     grant decisions; sockets are enforced in the gateway's `connect()`.
 12. **Guest `ctx.state` is durable** (DO KV) rather than per-instance memory.
-13. **Resident (`code:`) store/sms adapters are 501 until P4b**; `builtin:mem`
-    is SQLite-backed (durable), `builtin:reference` is the only query adapter.
+13. **Resident (`code:`) store/sms adapters shipped in P4b** (revised —
+    they were 501 until then): a `store.adapter` of `code:<name>@<version>`
+    on a data/file/query/sms mount (and on a `specStore` block) is backed
+    by the deployed bundle via `capabilities/guest-stores.ts`; the 501
+    `engine_unavailable` (unchanged wording) remains only when the
+    deployment has no `worker_loaders` binding. `builtin:mem` is
+    SQLite-backed (durable), `builtin:reference` is the only *built-in*
+    query adapter.
 14. **Logs: SQLite table, 50 000-row cap per tenant**, trimmed every 256
     inserts; `emit` is synchronous (DO SQLite writes do not block on I/O);
     optional tenant `logging.sink: "none"`.
@@ -1011,3 +1042,69 @@ Decisions 24–31 were made during the P3/P4 build (WF2):
     `./globals.js` before `./bundle.js`): a bundle's module scope sees
     `Buffer`/`process`/`global`/`RS2Socket` and captures the wrapped
     `fetch`, matching the Rust prelude's install-then-evaluate order.
+
+Decisions 35–40 were made during the P4b build:
+
+35. **One adapter isolate per mount, platform-owned lifecycle** (extends
+    33): a guest store adapter runs as the Dynamic Worker
+    `<tenant>:<mount base>:adapter:<name>@<version>` — mount-addressed so
+    two mounts of one bundle (or a mount's primary store and its
+    spec-store backend, if they ever shared a ref) never share module
+    state, and distinct from any `code:` *service* worker of the same
+    bundle. There is no N-pool and no idle sweeper: `store.maxRuntimes`,
+    `store.idleMs`, `store.idleSeconds` are accepted and ignored (§A) —
+    the platform decides when the isolate is evicted, exactly as it does
+    for code-mount workers.
+36. **The `features` handshake is an RPC method on `Rs2Guest`**
+    (`features()`, returning the bundle's `export const features`), read
+    once per adapter object before its first call. `listProjection`
+    reports `"fallback"` until then and `$select`/`$sort` are never
+    forwarded unadvertised — the same observable laziness as Rust's
+    read-at-spawn. No method was added to `HostApi`/`Egress` for this.
+37. **Adapter invocations run under a deny-all `GrantedHost`** with an
+    invocation record per call (grants: none; sockets via the store
+    config's `{"type":"socket"}` grants only; `fetch` denied — as Rust's
+    `GrantedHost::deny_all`), so `RS2Socket.connect` → `socketCheck`
+    keeps the `capability_denied` identity and console/log attribution
+    uses the same AsyncLocalStorage path as code mounts. Guest
+    `ctx.state` is durable DO KV under the `<name>@<version>` identity
+    (consistent with decision 12; Rust's resident state is in-memory).
+    Error identity is Rust's byte-for-byte: bundle throw → 502
+    `contract_violation`, denied socket → 403, non-2xx envelopes → the
+    `store_error` status mapping, missing bundle → the `data adapter
+    bundle … not found — deploy it via PUT /code/<name>` 404.
+38. **Sockets bridge through `EgressSockets.connect`, and pooling is
+    per-invocation** (the platform decided both): workerd dispatches a
+    guest's `cloudflare:sockets` connect to the `globalOutbound`'s JS
+    `connect(socket)` handler with the dialed target in
+    `socket.opened.localAddress` and no channel for an invocation id — so
+    an allowed `socketCheck` records a short-lived one-shot approval for
+    `<host>:<port>` in the tenant DO, and the hook consumes it and
+    bridges (an unapproved connect gets a closed socket, never egress;
+    the window is tenant-scoped, which is the attribution raw TCP
+    permits). And because I/O objects are request-scoped on Workers, a
+    socket pooled in module scope dies at the invocation boundary: the
+    shim's `RS2Socket` stamps its owning invocation and throws
+    deterministically on cross-invocation use (the raw attempt hangs
+    until the runtime kills the worker), and the shipped/fixture bundles
+    catch, reconnect, and retry the exchange once — dormant on Rust,
+    where the in-process pooling assertions still hold at exactly one
+    connection. Declared as the `guestAdapterPooling` divergence (§A).
+39. **`EgressSockets` is a subclass, not a widened `Egress`**: the base
+    gateway stays pinned to exactly `["fetch"]`
+    (`test/egress-surface.test.ts`), and the subclass adds only the §E.4
+    `connect` hook — a platform event handler, not a guest-callable op.
+    Dynamic workers get `EgressSockets` as `globalOutbound`; code-mount
+    guests keep their existing behavior (mount-level `socket` grants are
+    still a config-time 400, as on Rust).
+40. **The conformance mock backends are in-process Node TCP servers
+    started by the suite itself** (`fixtures/mock-redis.mjs`,
+    `mock-mongo.mjs`, ephemeral ports written into the mount config), so
+    the CI conformance jobs run the guest-adapter suite on both hosts
+    with no extra services or workflow changes; local `wrangler dev`
+    workerd reaches 127.0.0.1 backends directly. The Redis/file adapter
+    bundles live in `conformance/http/fixtures/` (test scaffolding, not
+    first-party adapters) and `guest_adapter.rs` embeds them via
+    `include_str!` so one copy is held to the contract in-process and
+    over HTTP; the Mongo bundles stay in `guest-adapters/` and are
+    deployed from there by the suite.
