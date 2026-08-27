@@ -59,7 +59,8 @@ import { Message, TraceContext } from "./runtime/message";
 import { claimOccurrence, claimTtlMs, dueOccurrenceMs, earliestNextDueMs, scheduledMounts, tickMessage } from "./runtime/scheduler";
 import { buildTenant, seedBuiltins } from "./runtime/tenant-build";
 import type { Adapters } from "./runtime/tenant-build";
-import { defaultLimits } from "./runtime/wrapper";
+import { limitsFromJson } from "./runtime/wrapper";
+import type { LimitTable } from "./runtime/wrapper";
 import { HttpCatalogueClient } from "./services/catalogue";
 import { hashPassword } from "./services/auth";
 
@@ -99,6 +100,9 @@ export class TenantObject extends DurableObject<Env> {
   /// One-shot socket approvals bridging `socketCheck` to the egress
   /// gateway's `connect` hook (see `SocketApprovals`).
   private readonly socketApprovals: SocketApprovals = new Map();
+  /// The host limit table: defaults with the operator's `RS2_LIMITS`
+  /// overrides applied. Parsed once per object, not per request.
+  private limitTable: LimitTable | undefined;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -108,6 +112,13 @@ export class TenantObject extends DurableObject<Env> {
       }
       migrateIdempotencySchema(ctx.storage.sql);
     });
+  }
+
+  /// Host limits (PRD §9.3) as this deployment configures them; what
+  /// `/.well-known/rs2/services` advertises and what the wrapper enforces.
+  private limits(): LimitTable {
+    if (this.limitTable === undefined) this.limitTable = limitsFromJson(this.env.RS2_LIMITS);
+    return this.limitTable;
   }
 
   // ---- config storage (§B.4) ---------------------------------------------
@@ -203,7 +214,7 @@ export class TenantObject extends DurableObject<Env> {
     const adapters = this.buildAdapters(tenant, raw?.[0]);
     this.runtime = new Runtime({
       adapters,
-      limits: defaultLimits(),
+      limits: this.limits(),
       idempotency: new SqliteIdempotencyStore(this.ctx.storage),
       loadRaw: () => this.loadRaw(),
       saveRaw: async (_t, config, expected) => {
@@ -328,7 +339,7 @@ export class TenantObject extends DurableObject<Env> {
     if (this.builtInfrasVersion === undefined) await this.refreshInfras();
     const config = JSON.parse(configText) as JsonObject;
     const parsed = parseTenantConfig(config);
-    buildTenant(tenant, parsed, this.buildAdapters(tenant, config), defaultLimits(), undefined, undefined);
+    buildTenant(tenant, parsed, this.buildAdapters(tenant, config), this.limits(), undefined, undefined);
   }
 
   /// Cron reconcile (§B.6): re-arm an alarm that was lost. Alarms survive

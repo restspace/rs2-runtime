@@ -111,8 +111,11 @@ cp tenants/main.example.json tenants/main.json
 cargo run -p rs2-server --features wasm,js -- serverConfig.json
 ```
 
-`serverConfig.json` sets the listener, tenancy mode, and data root; tenant
-configs live in `tenants/<name>.json`, starting from the copy above. Your
+`serverConfig.json` sets the listener, tenancy mode, and data root — and,
+optionally, a `limits` block overriding any host limit under the name
+`/.well-known/rs2/services` reports it (`outboundCalls`, `maxDepth`,
+`wallClockServiceMs`, …; an unknown key fails startup). Tenant configs live
+in `tenants/<name>.json`, starting from the copy above. Your
 `tenants/main.json` is gitignored: once you enable auth it holds a real
 `auth.jwtSecret`, which does not belong in version control. Build with
 `--features wasm,js` from the start — without them, mounts backed by custom

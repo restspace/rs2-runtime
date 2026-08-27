@@ -9,6 +9,13 @@
     "RS2_MAIN_DOMAIN": "",
     "RS2_LOG_LEVEL": "info",
     "RS2_CATALOGUE_HOSTS": ""
+    // "RS2_LIMITS": "{\"outboundCalls\": 45}"
+    //   Host limit overrides, named as `/.well-known/rs2/services` reports
+    //   them (runtime/wrapper.ts `limitsFromJson`). Unset = the PRD §9.3
+    //   defaults, which assume Workers Paid. On Workers **Free** the
+    //   platform caps subrequests at 50 — below the default 64-call
+    //   outbound budget — so lower `outboundCalls` to keep RS2's limit the
+    //   one that binds (README "Deploy"; cloudflare.md decision 44).
   },
   "durable_objects": {
     "bindings": [

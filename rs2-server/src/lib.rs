@@ -15,6 +15,8 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
+use std::time::Duration;
+
 use tokio::net::TcpListener;
 
 use rs2_core::message::{Body, MediaType, Message, Provenance};
@@ -63,6 +65,82 @@ struct ServerConfig {
     /// this; with neither set the admin endpoint is disabled (503).
     #[serde(default)]
     admin_token: Option<String>,
+    /// Host limit ceilings (PRD §9.3). Absent fields keep their defaults; the
+    /// resulting table is what `/.well-known/rs2/services` advertises.
+    #[serde(default)]
+    limits: LimitsConfig,
+}
+
+/// Operator overrides for the host limit table. Every field is optional and
+/// named as discovery reports it, so what an operator writes here is what
+/// clients read back. A deployment whose platform enforces a lower ceiling
+/// than RS2's own sets the matching field, so RS2's limit is the one that
+/// binds and the breach arrives as a `limit_exceeded` naming it (the
+/// Cloudflare host's `outboundCalls` vs. the Workers plan's subrequest cap is
+/// the case that prompted this — cloudflare.md decision 44).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LimitsConfig {
+    wall_clock_service_ms: Option<u64>,
+    wall_clock_pipeline_ms: Option<u64>,
+    memory_bytes: Option<u64>,
+    materialized_body_bytes: Option<u64>,
+    tenant_concurrency: Option<usize>,
+    outbound_calls: Option<u32>,
+    max_depth: Option<u16>,
+    breaker_threshold: Option<u32>,
+    breaker_window_ms: Option<u64>,
+    breaker_cooldown_ms: Option<u64>,
+}
+
+impl LimitsConfig {
+    /// The default table with this config's overrides applied. A zero is
+    /// rejected rather than silently taken: a limit of 0 admits nothing.
+    fn table(&self) -> Result<LimitTable, String> {
+        let mut t = LimitTable::default();
+        fn positive<T: PartialEq + Default + std::fmt::Debug>(
+            name: &str,
+            v: Option<T>,
+        ) -> Result<Option<T>, String> {
+            match v {
+                Some(x) if x == T::default() => {
+                    Err(format!("serverConfig limits.{name} must be > 0"))
+                }
+                other => Ok(other),
+            }
+        }
+        if let Some(ms) = positive("wallClockServiceMs", self.wall_clock_service_ms)? {
+            t.wall_clock_service = Duration::from_millis(ms);
+        }
+        if let Some(ms) = positive("wallClockPipelineMs", self.wall_clock_pipeline_ms)? {
+            t.wall_clock_pipeline = Duration::from_millis(ms);
+        }
+        if let Some(v) = positive("memoryBytes", self.memory_bytes)? {
+            t.memory_bytes = v;
+        }
+        if let Some(v) = positive("materializedBodyBytes", self.materialized_body_bytes)? {
+            t.materialized_body_bytes = v;
+        }
+        if let Some(v) = positive("tenantConcurrency", self.tenant_concurrency)? {
+            t.tenant_concurrency = v;
+        }
+        if let Some(v) = positive("outboundCalls", self.outbound_calls)? {
+            t.outbound_calls = v;
+        }
+        if let Some(v) = positive("maxDepth", self.max_depth)? {
+            t.max_depth = v;
+        }
+        if let Some(v) = positive("breakerThreshold", self.breaker_threshold)? {
+            t.breaker_threshold = v;
+        }
+        if let Some(ms) = positive("breakerWindowMs", self.breaker_window_ms)? {
+            t.breaker_window = Duration::from_millis(ms);
+        }
+        if let Some(ms) = positive("breakerCooldownMs", self.breaker_cooldown_ms)? {
+            t.breaker_cooldown = Duration::from_millis(ms);
+        }
+        Ok(t)
+    }
 }
 
 /// Bootstrap admin credentials (PRD §10.5). Env vars
@@ -733,7 +811,7 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let runtime = Runtime::new(tenancy, adapters, loader, LimitTable::default());
+    let runtime = Runtime::new(tenancy, adapters, loader, config.limits.table()?);
 
     // Admin token for node ops endpoints (`POST /admin/reload-infras`): env
     // first (preferred — never at rest in the config file), then config. `None`
@@ -779,6 +857,10 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use rs2_core::wrapper::LimitTable;
+
     use super::{constant_time_eq, ServerConfig, TenancyConfig};
 
     /// The documented multi-tenant config shape (manual 10.2, deploy runbook)
@@ -811,6 +893,48 @@ mod tests {
             }
             other => panic!("expected multi tenancy, got {other:?}"),
         }
+    }
+
+    /// `limits` is the operator's ceiling knob: absent fields keep the PRD
+    /// defaults, present ones land, a typo is a startup error (rather than a
+    /// silently ignored key that leaves the default in force), and a zero is
+    /// refused because a limit of 0 admits nothing.
+    #[test]
+    fn limits_override_defaults_and_reject_nonsense() {
+        let config: ServerConfig = serde_json::from_str(
+            r#"{ "tenancy": { "mode": "single", "tenant": "main" },
+                 "limits": { "outboundCalls": 45, "wallClockServiceMs": 10000 } }"#,
+        )
+        .unwrap();
+        let table = config.limits.table().unwrap();
+        assert_eq!(table.outbound_calls, 45);
+        assert_eq!(table.wall_clock_service, Duration::from_millis(10_000));
+        // Untouched fields keep their defaults.
+        assert_eq!(table.max_depth, LimitTable::default().max_depth);
+        assert_eq!(
+            table.materialized_body_bytes,
+            LimitTable::default().materialized_body_bytes
+        );
+
+        let empty: ServerConfig =
+            serde_json::from_str(r#"{ "tenancy": { "mode": "single", "tenant": "main" } }"#)
+                .unwrap();
+        let defaults = empty.limits.table().unwrap();
+        assert_eq!(
+            defaults.outbound_calls,
+            LimitTable::default().outbound_calls
+        );
+
+        let zero: ServerConfig = serde_json::from_str(
+            r#"{ "tenancy": { "mode": "single", "tenant": "main" }, "limits": { "outboundCalls": 0 } }"#,
+        )
+        .unwrap();
+        assert!(zero.limits.table().unwrap_err().contains("outboundCalls"));
+
+        let typo = serde_json::from_str::<ServerConfig>(
+            r#"{ "tenancy": { "mode": "single", "tenant": "main" }, "limits": { "outboundCallz": 45 } }"#,
+        );
+        assert!(typo.is_err(), "an unknown limit name must fail startup");
     }
 
     #[test]

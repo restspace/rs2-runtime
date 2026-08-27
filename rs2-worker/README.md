@@ -94,11 +94,28 @@ npx wrangler secret put RS2_ADMIN_TOKEN  # gates /admin/* (required for the admi
 npm run deploy                           # wrangler deploy
 ```
 
-**Workers Paid is the intended plan.** Everything deploys on Free, but its
-50-subrequest-per-invocation cap sits below the advertised `outboundCalls`
-budget of 64: a guest that overruns is killed by the platform (502
-`contract_violation`) instead of by RS2 (503 `limit_exceeded`). Paid raises
-the cap to 1 000, and RS2's own budget is the one that binds.
+**On Workers Free, lower the outbound budget.** The platform caps
+subrequests at 50 per invocation, below the default `outboundCalls` of 64,
+and whichever ceiling is lower is the one a guest hits — so on Free set
+`RS2_LIMITS` and RS2's own budget stays the binding limit (a platform kill
+arrives as a 502 `contract_violation`; RS2's own limit is the 503
+`limit_exceeded` naming `outbound_calls` that clients are told to expect):
+
+```sh
+npx wrangler deploy --var 'RS2_LIMITS:{"outboundCalls": 45}'
+```
+
+`RS2_LIMITS` is a JSON object overriding any field of the host limit table,
+named as `/.well-known/rs2/services` reports it — `wallClockServiceMs`,
+`wallClockPipelineMs`, `materializedBodyBytes`, `tenantConcurrency`,
+`outboundCalls`, `maxDepth`, `breakerThreshold`, `breakerWindowMs`,
+`breakerCooldownMs`. Absent fields keep the PRD §9.3 defaults, and a bad
+value is warned about and ignored rather than failing the Worker.
+`memoryBytes` is refused: the platform fixes it at 128 MiB. (The Rust host
+takes the same overrides as `serverConfig.limits`, where an unknown key is
+a startup error.) Paid raises the subrequest cap to 1 000, where the
+default 64 needs no override. Put the var in `wrangler.jsonc` if you don't
+want to pass it on every deploy.
 
 To hold a deployed instance to the contract, point the conformance runner at
 it (`conformance/http/README.md`):

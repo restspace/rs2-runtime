@@ -14,6 +14,11 @@ export interface Env {
   RS2_MAIN_DOMAIN?: string;
   RS2_LOG_LEVEL?: string;
   RS2_CATALOGUE_HOSTS?: string;
+  /// Host limit overrides as a JSON object, named as
+  /// `/.well-known/rs2/services` reports them — e.g.
+  /// `{"outboundCalls": 45}` on a Workers plan whose subrequest cap sits
+  /// below RS2's default budget (`runtime/wrapper.ts` `limitsFromJson`).
+  RS2_LIMITS?: string;
   /// Secret: gates `/admin/*`.
   RS2_ADMIN_TOKEN?: string;
   /// Secrets: Cloudflare for SaaS custom hostnames (`/admin/domains/*`,

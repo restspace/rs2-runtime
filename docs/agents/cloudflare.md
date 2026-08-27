@@ -1168,3 +1168,26 @@ Decisions 35–40 were made during the P4b build:
     excluded — its mock backends are `127.0.0.1` TCP servers a deployed
     Worker cannot dial): **190 passed, 7 skipped, 1 failed** (the subrequest
     cap above). The `@remote` memory-cap case passes, as designed.
+44. **Host limits are operator-configurable, and the platform must never be
+    the limit that binds.** Two halves, both from the first deploy:
+    - The guest loader was given `limits: {subRequests: outboundBudget}`,
+      which made workerd — not RS2 — reject the call one past the budget.
+      The breach then reached the client as a 502 `contract_violation`
+      quoting "Too many subrequests by single Worker invocation" instead of
+      the 503 `limit_exceeded` naming `outbound_calls` that the contract
+      (and Rust) promises. Local workerd does not enforce that loader
+      limit, so only a deployed run showed it. The cap is gone: RS2 counts
+      every guest egress itself, and the platform's ceiling sits behind it
+      as a backstop. **Any** platform ceiling below an RS2 limit destroys
+      the error's identity this way — that is the rule the fix encodes.
+    - Which leaves the ceiling itself an operator concern, because it
+      varies by plan (Workers Free 50 subrequests per invocation, Paid
+      1 000) and the default budget is 64. So the limit table is now
+      configurable on both hosts, under the names discovery reports:
+      `serverConfig.limits` (Rust, unknown key ⇒ startup error) and the
+      `RS2_LIMITS` JSON var (Worker, bad value ⇒ warn and keep the
+      default — a var must not be able to take the Worker down).
+      `memoryBytes` is refused on the Worker: the platform fixes it, and
+      advertising a number nothing enforces would be a lie. A Free-plan
+      deployment sets `{"outboundCalls": 45}` and the whole remote suite
+      passes (191 passed, 7 skipped, 0 failed).

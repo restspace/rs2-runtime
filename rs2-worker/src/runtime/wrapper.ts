@@ -37,6 +37,54 @@ export function defaultLimits(): LimitTable {
   };
 }
 
+/// `memoryBytes` is the platform's per-isolate cap here, not ours to set:
+/// an override would only make discovery advertise a number nothing
+/// enforces (cloudflare.md §A).
+const PLATFORM_FIXED = new Set(["memoryBytes"]);
+
+/// The default table with an operator's `RS2_LIMITS` overrides applied.
+/// Keys are the `LimitTable` field names — the same names discovery reports,
+/// so what an operator writes is what clients read back.
+///
+/// The motivating case (cloudflare.md decision 44): a Workers plan whose
+/// subrequest ceiling sits below RS2's default `outboundCalls` kills the
+/// guest with a platform error before RS2's own budget answers, so an
+/// operator sets `{"outboundCalls": 45}` on Free and RS2's limit is the one
+/// that binds. Rubbish in a var must not take the Worker down: a bad value
+/// is warned about and ignored, leaving the default.
+export function limitsFromJson(raw: string | undefined): LimitTable {
+  const limits = defaultLimits();
+  if (raw === undefined || raw.trim() === "") return limits;
+  let parsed: Json;
+  try {
+    parsed = JSON.parse(raw) as Json;
+  } catch (e) {
+    console.warn(`RS2_LIMITS is not JSON, using defaults: ${e instanceof Error ? e.message : String(e)}`);
+    return limits;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.warn("RS2_LIMITS must be a JSON object, using defaults");
+    return limits;
+  }
+  const table = limits as unknown as Record<string, number>;
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!(key in limits)) {
+      console.warn(`RS2_LIMITS: unknown limit '${key}' ignored`);
+      continue;
+    }
+    if (PLATFORM_FIXED.has(key)) {
+      console.warn(`RS2_LIMITS: '${key}' is fixed by the platform on this host, ignored`);
+      continue;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      console.warn(`RS2_LIMITS: '${key}' must be a number > 0, ignored`);
+      continue;
+    }
+    table[key] = Math.floor(value);
+  }
+  return limits;
+}
+
 /// Per-invocation limits (PRD §9.3), the slice handed to services/engines.
 export interface InvocationLimits {
   wallClockMs: number;

@@ -670,7 +670,15 @@ export class DynamicWorkerEngine {
       ...guestCodeBase(args.source),
       env: { RS2: this.hostEnv.hostApiStub(tenant) },
       globalOutbound: this.hostEnv.egressStub(tenant),
-      limits: { cpuMs: args.cpuMs, subRequests: args.outboundBudget },
+      // CPU only — deliberately **no** `subRequests` cap. Setting it to the
+      // outbound budget made the platform the binding limit: the call that
+      // RS2 must answer with 503 `limit_exceeded` (`outbound_calls`) was
+      // killed on its way out instead, and the breach reached the client as
+      // a 502 `contract_violation` quoting workerd. RS2 counts every guest
+      // egress itself (`GrantedHost.request`, gateway included), so the
+      // platform's own per-invocation ceiling stays a backstop behind it —
+      // which is also how Rust behaves.
+      limits: { cpuMs: args.cpuMs },
     }));
     const ep = worker.getEntrypoint("Rs2Guest") as unknown as {
       invoke(msg: Json, config: Json, invocationId: string): Promise<Json>;
