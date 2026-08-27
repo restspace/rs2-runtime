@@ -198,11 +198,21 @@ describe("runtime services", () => {
     for (const target of ["/files/../secret", "/files/%2e%2e/secret"]) {
       const { status: code, body } = await rawRequest(anon, "GET", target);
       expectDivergent("dotSegmentTraversal", code, `path ${target} must be rejected: ${body.slice(0, 200)}`);
-      if (code === 400) expect(JSON.parse(body).code, `path ${target} problem code`).toBe("path_unsafe");
+      // Behind an edge the rejection can come from the intermediary rather
+      // than the host (a plaintext request to an HTTPS listener is refused
+      // at the port); only a body that is actually RS2's carries the code.
+      if (code === 400 && body.trimStart().startsWith("{")) {
+        expect(JSON.parse(body).code, `path ${target} problem code`).toBe("path_unsafe");
+      }
     }
     const res = await anon.get("/files/a%00.txt");
     status(res, 400, "path /files/a%00.txt must be rejected");
-    expect(res.problem().code).toBe("path_unsafe");
+    // Same again: Cloudflare rejects a NUL byte in the path at the edge with
+    // its own 400 page, so the request never reaches the host. Rejected is
+    // rejected; the wording is only assertable when RS2 answered.
+    if (res.contentType() === "application/problem+json") {
+      expect(res.problem().code).toBe("path_unsafe");
+    }
   });
 
   test("data: CRUD, schema validation, PATCH, keyless POST, confirm delete", async () => {

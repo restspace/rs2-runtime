@@ -128,9 +128,23 @@ export class Rs2Response {
     return this.headers.get(name);
   }
 
-  /** The `ETag` header verbatim (quoted), or `null`. */
+  /**
+   * The `ETag` header (quoted), or `null` — **canonicalized to the strong
+   * form**: a `W/` prefix is stripped.
+   *
+   * Not a host difference to assert on. An RS2 host always emits the strong
+   * tag, but an intermediary that recompresses the response rewrites it to
+   * `W/"v"` — Cloudflare does exactly that whenever it compresses, so a
+   * deployed Worker's ETags reach a gzip-accepting client weakened while the
+   * same host behind `wrangler dev` hands them over strong. The version
+   * inside is identical either way, and it is the version every assertion
+   * here is about. That a host must *accept* the weak form back in
+   * `If-Match` is a contract statement, and it has its own test
+   * (m3-surface: "config If-Match accepts the weak form of the version").
+   */
   etag(): string | null {
-    return this.headers.get("etag");
+    const raw = this.headers.get("etag");
+    return raw === null ? null : raw.replace(/^W\//, "");
   }
 
   /** `Content-Type` essence (lowercased, parameters stripped). */

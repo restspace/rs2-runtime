@@ -7,6 +7,7 @@ import { cfApiFromEnv, domainResponse, validHostname } from "./domains";
 import type { Env } from "./env";
 import { INFRAS_VERSION_HEADER, TENANT_HEADER, TRACE_HEADER } from "./env";
 import { RegistryObject } from "./registry-object";
+import { etagVersion } from "./services/context";
 import type { RegistrySnapshot } from "./registry-object";
 import { constantTimeEqual } from "./runtime/crypto";
 import { RsError, toRsError } from "./runtime/error";
@@ -194,7 +195,7 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
           admin = [bootstrap.email, bootstrap.password];
         }
         const ifMatchRaw = request.headers.get("if-match");
-        const ifMatch = ifMatchRaw !== null ? ifMatchRaw.trim().replace(/^"+|"+$/g, "") : undefined;
+        const ifMatch = ifMatchRaw !== null ? etagVersion(ifMatchRaw) : undefined;
         const { version, created } = await stub.putConfig(name, JSON.stringify(config), ifMatch);
         await registry(env).upsertTenant(name, domainsRaw as string[], version);
         await invalidateSnapshot();

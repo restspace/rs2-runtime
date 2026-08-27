@@ -807,7 +807,7 @@ impl Service for ServicesService {
                 restore_secrets(&mut body, &current)?;
                 let if_match = msg
                     .header("if-match")
-                    .map(|v| v.trim().trim_matches('"').to_string());
+                    .map(|v| super::etag_version(v).to_string());
                 let version = control
                     .put_config(&msg.tenant, body, if_match.as_deref())
                     .await?;

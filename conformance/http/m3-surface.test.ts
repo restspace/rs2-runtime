@@ -381,6 +381,22 @@ describe("m3 surface", () => {
     }
   });
 
+  // A config `If-Match` may name its version weakly. Any intermediary that
+  // recompresses a response rewrites the strong ETag it was given to `W/"v"`
+  // — Cloudflare does this whenever it compresses, so a gzip-accepting
+  // client never even sees the strong form — and the client echoes back what
+  // it received. The version named is the same one, so the write applies.
+  test("config If-Match accepts the weak form of the version", async () => {
+    const { config, etag } = await seed!.currentConfig();
+    const version = etag.replace(/^W\//, "").replace(/^"+|"+$/g, "");
+    const res = await seed!.tryPutConfig(config, `W/"${version}"`);
+    status(res, 204, "[weak if-match] PUT /services/raw with W/ prefixed version");
+    // …and a genuinely stale version is still refused, weak or not.
+    const stale = await seed!.tryPutConfig(config, 'W/"0000000000000000"');
+    status(stale, 409, "[weak if-match] a stale weak version is still a conflict");
+    await seed!.currentConfig();
+  });
+
   // -------------------------------------------------------------------------
   // schema + media-type self-containment (discovery == enforcement)
   // -------------------------------------------------------------------------
@@ -544,12 +560,16 @@ describe("m3 surface", () => {
     expect(entryNamed(root, "echo")?.dir, JSON.stringify(root)).toBe(true);
     res = await admin.get("/services/code/echo/");
     status(res, 200, "[code] container listing");
-    expect(res.header("x-total-count")).toBe("1");
+    // The bundle just deployed is listed under its container, named by its
+    // hash. Not "the container holds exactly one": a persistent instance (a
+    // deployed Worker, as opposed to a host started fresh per run) keeps
+    // every version an earlier suite deployed.
     let listing = res.listing();
-    const entry = listing.entries[0];
-    const childName = entry.name;
-    expect(childName.startsWith(version), JSON.stringify(listing)).toBe(true);
-    expect(entry.mountedAt, "nothing mounts it yet").toBeUndefined();
+    expect(Number(res.header("x-total-count")), JSON.stringify(listing)).toBeGreaterThanOrEqual(1);
+    const entry = listing.entries.find((e) => e.name.startsWith(version));
+    expect(entry, `no entry for ${version}: ${JSON.stringify(listing)}`).toBeDefined();
+    const childName = entry!.name;
+    expect(entry!.mountedAt, "nothing mounts it yet").toBeUndefined();
 
     // Read back via the listing's child name AND the bare version.
     for (const path of [`/services/code/echo/${childName}`, `/services/code/echo/${version}`]) {

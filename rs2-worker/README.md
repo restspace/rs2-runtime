@@ -86,10 +86,38 @@ test/                     unit tests ported from the rs2-core #[cfg(test)] modul
 ## Deploy
 
 ```sh
+# once per account: enable R2 in the dashboard (it needs a payment method),
+# then re-run `wrangler login` so the token carries the r2 scope
+npx wrangler r2 bucket create rs2-files  # the RS2_FILES binding's bucket
 npm run build:shim                       # regenerate the guest shim bundle
 npx wrangler secret put RS2_ADMIN_TOKEN  # gates /admin/* (required for the admin API)
 npm run deploy                           # wrangler deploy
 ```
+
+**Workers Paid is the intended plan.** Everything deploys on Free, but its
+50-subrequest-per-invocation cap sits below the advertised `outboundCalls`
+budget of 64: a guest that overruns is killed by the platform (502
+`contract_violation`) instead of by RS2 (503 `limit_exceeded`). Paid raises
+the cap to 1 000, and RS2's own budget is the one that binds.
+
+To hold a deployed instance to the contract, point the conformance runner at
+it (`conformance/http/README.md`):
+
+```sh
+export RS2_HOST_KIND=cloudflare
+export RS2_BASE_URL=https://<worker>.workers.dev
+export RS2_TENANT=<the tenant RS2_DEFAULT_TENANT names>
+export RS2_ADMIN_TOKEN=…
+export RS2_CF_REMOTE=1
+npx vitest run --exclude '**/guest-adapter.test.ts'
+```
+
+`RS2_CF_REMOTE` turns on the memory-cap case (no per-isolate heap cap in
+local workerd); `guest-adapter.test.ts` is excluded because its mock Redis
+and Mongo backends are `127.0.0.1` TCP servers a deployed Worker cannot
+dial. Note that the Cloudflare edge rewrites a strong `ETag` to `W/"v"`
+whenever it compresses a response — the version inside is unchanged, and
+both hosts accept the weak form back in `If-Match`.
 
 `wrangler.jsonc` declares everything the Worker needs: the two DO classes
 (SQLite-backed), the `RS2_FILES` R2 bucket, the `LOADER` worker-loader

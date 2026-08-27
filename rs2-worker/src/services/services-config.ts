@@ -15,7 +15,7 @@ import type { Message } from "../runtime/message";
 import { urlHost } from "../runtime/outbound";
 import { CODE_PREFIX, versionOf } from "./code";
 import type { DynamicWorkerEngine } from "../engines/dynamic-worker";
-import { pagination } from "./context";
+import { etagVersion, pagination } from "./context";
 import type { Service, ServiceContext, TenantControl } from "./context";
 
 /// The placeholder secrets read back as. A PUT carrying it means "keep the stored value".
@@ -464,7 +464,7 @@ export class ServicesService implements Service {
       // does in Rust (`invalid tenant config: …`).
       const restored = incoming ? restoreSecrets(incoming, current) : undefined;
       const ifMatchRaw = msg.header("if-match");
-      const ifMatch = ifMatchRaw !== undefined ? ifMatchRaw.trim().replace(/^"+|"+$/g, "") : undefined;
+      const ifMatch = ifMatchRaw !== undefined ? etagVersion(ifMatchRaw) : undefined;
       if (!restored) throw RsError.badRequest("invalid tenant config: expected an object");
       const version = await control.putConfig(msg.tenant, restored, ifMatch);
       const resp = msg.noContent();

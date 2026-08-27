@@ -70,6 +70,16 @@ export function ifNoneMatchHits(ifNoneMatch: string | undefined, etag: string): 
     .some((c) => c === "*" || c.replace(/^W\//, "") === etag);
 }
 
+/// The bare version inside an entity tag: optional weak prefix, optional
+/// quotes. Config `If-Match` names an opaque version, and an intermediary
+/// that recompresses a response rewrites the strong `"v"` it was given to
+/// `W/"v"` — Cloudflare does exactly that whenever it compresses, so every
+/// gzip-accepting client sees the weak form; echoing it back still names
+/// that same version.
+export function etagVersion(raw: string): string {
+  return raw.trim().replace(/^W\//, "").replace(/^"+|"+$/g, "");
+}
+
 /// Parse a store write's conditional headers into a `WritePrecondition`.
 /// `If-None-Match: *` (create-only) takes precedence over `If-Match`.
 export function writePrecondition(msg: Message): WritePrecondition {

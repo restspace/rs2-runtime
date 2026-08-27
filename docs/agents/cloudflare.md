@@ -1139,3 +1139,32 @@ Decisions 35–40 were made during the P4b build:
     capture uses `Body.capture` — a response over the 1 MiB replay cap
     comes back unconsumed (prefix + remainder) instead of cancelled, so
     it is unrecorded but still delivered (item 4).
+43. **What the first real deploy changed** (2026-08-27, `rs2-worker.r-s.workers.dev`,
+    account `jamesej@outlook.com`). Three things only a deployed Worker
+    shows, none of them visible under `wrangler dev`:
+    - **Cloudflare weakens ETags when it compresses.** The edge answers a
+      gzip-accepting client with `W/"v"` where the host emitted `"v"` (zstd
+      in practice; `curl` without `Accept-Encoding` still sees the strong
+      form, which is why local runs never caught it). A client that echoes
+      what it received then sends `If-Match: W/"v"` — and the config path
+      compared quoted-but-not-weak-stripped, so **every** read-modify-write
+      of `/services/raw` from a browser or SDK failed with 409. Fixed on
+      both hosts (`services::etag_version` / `etagVersion`, used by
+      `PUT /services/raw` and `PUT /admin/tenants/<name>`); the store paths
+      already stripped `W/`. Conformance pins it (m3-surface: "config
+      If-Match accepts the weak form of the version"), and the runner
+      canonicalizes response ETags rather than asserting the edge's form.
+    - **Workers Free caps subrequests at 50 per invocation**, below the
+      advertised `outboundCalls: 64`, so the platform kills the guest
+      (502 `contract_violation`, "Too many subrequests by single Worker
+      invocation") before RS2's own budget answers 503. The remote
+      conformance run fails exactly that one case on a Free-plan account;
+      on Workers Paid (1 000) RS2's budget is the one that binds.
+    - **The edge rejects some requests before the host sees them** — a NUL
+      byte in the path is Cloudflare's own 400 (text/html), and a plaintext
+      raw-socket probe never reaches a TLS listener. The traversal case
+      therefore asserts the RS2 wording only when RS2 answered.
+    Remote run (`RS2_BASE_URL` + `RS2_CF_REMOTE=1`, `guest-adapter.test.ts`
+    excluded — its mock backends are `127.0.0.1` TCP servers a deployed
+    Worker cannot dial): **190 passed, 7 skipped, 1 failed** (the subrequest
+    cap above). The `@remote` memory-cap case passes, as designed.

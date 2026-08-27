@@ -129,6 +129,16 @@ pub(crate) fn if_none_match_hits(if_none_match: Option<&str>, etag: &str) -> boo
         .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == etag)
 }
 
+/// The bare version inside an entity tag: optional weak prefix, optional
+/// quotes. Config `If-Match` names an opaque version, and an intermediary
+/// that recompresses a response rewrites the strong `"v"` it was given to
+/// `W/"v"` (Cloudflare does this whenever it compresses, so every
+/// gzip-accepting client sees it); the client echoes back what it received
+/// and still means that same version.
+pub(crate) fn etag_version(raw: &str) -> &str {
+    raw.trim().trim_start_matches("W/").trim_matches('"')
+}
+
 /// Parse a store write's conditional headers into a [`WritePrecondition`].
 /// `If-None-Match: *` (create-only) takes precedence over `If-Match`.
 pub(crate) fn write_precondition(msg: &Message) -> WritePrecondition {
