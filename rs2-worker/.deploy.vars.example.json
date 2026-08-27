@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy to .deploy.vars.json (gitignored). Each entry becomes a `wrangler deploy --var NAME:value`, which is per-deploy — so anything this deployment needs belongs here rather than in a one-off command line.",
+  "RS2_LIMITS": "{\"outboundCalls\": 45}"
+}

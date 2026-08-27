@@ -89,10 +89,31 @@ test/                     unit tests ported from the rs2-core #[cfg(test)] modul
 # once per account: enable R2 in the dashboard (it needs a payment method),
 # then re-run `wrangler login` so the token carries the r2 scope
 npx wrangler r2 bucket create rs2-files  # the RS2_FILES binding's bucket
-npm run build:shim                       # regenerate the guest shim bundle
 npx wrangler secret put RS2_ADMIN_TOKEN  # gates /admin/* (required for the admin API)
-npm run deploy                           # wrangler deploy
+npm run deploy                           # build shim → deploy → smoke-check
 ```
+
+`npm run deploy` is `scripts/deploy.mjs`: it rebuilds the guest shim, deploys,
+waits for the new version to answer `/readyz`, and checks the discovery
+document reports this host and the limits the deployment asked for — an
+upload is not a deployment that works. Add `--verify` to follow it with the
+whole conformance suite against the live URL:
+
+```sh
+RS2_TENANT=main RS2_ADMIN_TOKEN=… npm run deploy:verify
+npm run deploy -- --dry-run              # build and bundle only, no upload
+npm run deploy -- -- --keep-vars         # anything after a bare `--` goes to wrangler
+```
+
+`--verify` **rewrites the named tenant** (the suite reshapes its config and
+writes files and records), so point it at a test tenant, never at real data.
+
+Per-deployment `--var` values go in `.deploy.vars.json` (gitignored, copy
+`.deploy.vars.example.json`). Wrangler's `--var` is per-deploy, so a var this
+deployment needs — `RS2_LIMITS` on a Free-plan account — would be silently
+lost by the next plain `wrangler deploy`; keeping it in that file means every
+deploy carries it, and the script fails if what the live host advertises
+disagrees with what the file asked for.
 
 **On Workers Free, lower the outbound budget.** The platform caps
 subrequests at 50 per invocation, below the default `outboundCalls` of 64,

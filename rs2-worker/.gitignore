@@ -2,3 +2,5 @@ node_modules/
 .wrangler/
 .dev.vars
 *.log
+# Per-deployment `wrangler deploy --var` values (scripts/deploy.mjs).
+.deploy.vars.json
