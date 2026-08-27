@@ -53,6 +53,10 @@ cpSync(resolve(pkg, "fixtures", "rust"), work, { recursive: true });
 const configPath = resolve(work, "serverConfig.json");
 const config = JSON.parse(readFileSync(configPath, "utf8"));
 config.listen = `127.0.0.1:${port}`;
+// The operator endpoints (`/admin/*`) are gated by a token and disabled
+// without one, so the fixture carries the same default as `host:cf` — the
+// suites that exercise them read it from `RS2_ADMIN_TOKEN`.
+config.adminToken = process.env.RS2_ADMIN_TOKEN || "dev";
 // Catalogue live path (spec F.3 catalogue row): RS2_CATALOGUE_HOSTS is a
 // comma list of operator-allowlisted hosts, the same env both host scripts
 // accept. Unset keeps the fixture's empty allowlist (the dormant half).

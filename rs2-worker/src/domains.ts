@@ -1,10 +1,18 @@
-// Custom domains (cloudflare.md §B.5): the Cloudflare for SaaS side of
-// `PUT/GET/DELETE /admin/domains/<host>`. The registry map is the routing
-// truth; this module only provisions/polls/removes the CF custom hostname
-// (`/client/v4/zones/<zone>/custom_hostnames`, ssl method `http`) when both
-// `CF_API_TOKEN` and `CF_ZONE_ID` are configured — without them the admin
-// endpoints are registry-only and say so. Pure functions + an injectable
-// `fetch` so the status mapping and response parsing are unit-testable.
+// Custom domains (cloudflare.md §B.5): attaching a customer's own hostname
+// to a tenant, behind `PUT/GET/DELETE /admin/domains/<host>`.
+//
+// Two halves, and the split is the point. The **provider layer** at the
+// bottom of this file is host-neutral — an attachment is `pending` until
+// control of the DNS is proven, then `active`, and the response says which
+// DNS records to publish and what to do next. The **Cloudflare for SaaS
+// client** above it (`/client/v4/zones/<zone>/custom_hostnames`, ssl method
+// `http`) is one provider; the self-check `ManualProvider` is the other, and
+// is what a deployment without `CF_API_TOKEN`/`CF_ZONE_ID` runs.
+//
+// The registry map remains the routing truth, and nothing reaches it until a
+// provider reports `active` — so a tenant cannot claim a hostname it does not
+// control. Pure functions + an injectable `fetch` throughout, so every path
+// is unit-testable and the real CF API is never reachable from tests.
 
 import { RsError } from "./runtime/error";
 import type { Json, JsonObject } from "./runtime/error";
@@ -175,33 +183,198 @@ export function cnameTarget(env: DomainsEnv): string | null {
   return env.RS2_CNAME_TARGET || env.RS2_MAIN_DOMAIN || null;
 }
 
-export const REGISTRY_ONLY_NOTE =
-  "registry-only: CF_API_TOKEN/CF_ZONE_ID not configured, no Cloudflare custom hostname was provisioned";
+// ---------------------------------------------------------------------------
+// The provider layer
+// ---------------------------------------------------------------------------
+//
+// Cloudflare for SaaS is *an* implementation of attaching a domain, not the
+// shape of the feature. What every host shares is a resource with a lifecycle
+// — `pending` until control of the DNS is proven, then `active` — plus the DNS
+// records the customer has to publish. That much is portable; the verifier and
+// the certificate are not. So clients read `status`/`dnsRecords`/`nextStep`
+// and never parse a provider's own vocabulary, which stays under
+// `provider.detail` for an operator debugging a stuck domain.
 
-/// The admin response body for `PUT`/`GET /admin/domains/<host>`.
-/// `cfConfigured` distinguishes "no secrets" (registry-only, said explicitly)
-/// from "secrets set but no custom hostname exists yet".
-export function domainResponse(
-  host: string,
-  tenant: string,
-  env: DomainsEnv,
-  cfConfigured: boolean,
-  provisioning: CustomHostname | undefined,
-): JsonObject {
-  const body: JsonObject = { host, tenant, cnameTarget: cnameTarget(env) };
-  if (provisioning !== undefined) {
-    body.status = provisioning.status;
-    const ov = provisioning.ownershipVerification;
-    body.provisioning = {
-      id: provisioning.id,
-      cfStatus: provisioning.cfStatus,
-      cfSslStatus: provisioning.cfSslStatus,
-      ownershipVerification: ov ? { type: ov.type, name: ov.name, value: ov.value } : null,
+/// Where an attachment is in its lifecycle. Two states, deliberately: a
+/// client's only question is "can I send traffic here yet?".
+export type AttachmentStatus = "pending" | "active";
+
+/// One record the customer publishes at their own DNS provider.
+export interface DnsRecord {
+  type: string;
+  name: string;
+  value: string;
+  /// `false` for a record that only speeds things up rather than gates the
+  /// attachment (Cloudflare's pre-validation TXT).
+  required: boolean;
+  purpose: string;
+}
+
+export interface Attachment {
+  status: AttachmentStatus;
+  dnsRecords: DnsRecord[];
+  /// Provider-specific diagnosis, for humans only. Never routing input.
+  detail: JsonObject | null;
+}
+
+/// Attaching a domain, abstracted over who verifies it and who issues the
+/// certificate. `token` is the challenge a provider may prove control with;
+/// providers that verify some other way ignore it.
+export interface DomainProvider {
+  readonly name: string;
+  /// Idempotent: begin (or re-read) the attachment for `host`.
+  ensure(host: string, token: string): Promise<Attachment>;
+  /// Poll it. Returning `active` is what promotes the host into the routing
+  /// map, so this is the gate — never a client's assertion.
+  check(host: string, token: string): Promise<Attachment>;
+  /// Best-effort teardown of whatever `ensure` created.
+  remove(host: string): Promise<void>;
+}
+
+/// The CNAME every provider asks for: the customer's host, pointed here.
+function cnameRecord(host: string, target: string | null): DnsRecord[] {
+  if (target === null) return [];
+  return [
+    {
+      type: "CNAME",
+      name: host,
+      value: target,
+      required: true,
+      purpose: "routes the domain to this deployment",
+    },
+  ];
+}
+
+/// Cloudflare for SaaS: CF validates the domain over HTTP and issues the
+/// certificate, so the customer publishes one CNAME and nothing else.
+export class CloudflareSaasProvider implements DomainProvider {
+  readonly name = "cloudflare-saas";
+
+  constructor(
+    private readonly api: CfSaasApi,
+    private readonly target: string | null,
+  ) {}
+
+  private attachment(host: string, ch: CustomHostname): Attachment {
+    const records = cnameRecord(host, this.target);
+    const ov = ch.ownershipVerification;
+    // Only worth showing while it would still change anything: publishing it
+    // lets a customer validate *before* switching a live domain over.
+    if (ov && ch.status !== "active") {
+      records.push({
+        type: ov.type.toUpperCase(),
+        name: ov.name,
+        value: ov.value,
+        required: false,
+        purpose: "optional: pre-validates the domain before you move the CNAME",
+      });
+    }
+    return {
+      status: ch.status === "active" ? "active" : "pending",
+      dnsRecords: records,
+      detail: { stage: ch.status, cfStatus: ch.cfStatus, cfSslStatus: ch.cfSslStatus, id: ch.id },
     };
-  } else {
-    body.status = null;
-    body.provisioning = null;
-    body.note = cfConfigured ? "no Cloudflare custom hostname exists for this host" : REGISTRY_ONLY_NOTE;
   }
-  return body;
+
+  async ensure(host: string): Promise<Attachment> {
+    return this.attachment(host, await this.api.ensure(host));
+  }
+
+  async check(host: string): Promise<Attachment> {
+    const ch = await this.api.find(host);
+    if (ch) return this.attachment(host, ch);
+    // The hostname went away underneath us (deleted in the dashboard): still
+    // pending, and the detail says why rather than pretending it is new.
+    return { status: "pending", dnsRecords: cnameRecord(host, this.target), detail: { stage: "absent" } };
+  }
+
+  async remove(host: string): Promise<void> {
+    await this.api.remove(host);
+  }
+}
+
+/// The path where a pending host is asked for its token.
+export const CHALLENGE_PREFIX = "/.well-known/rs2/domain-challenge/";
+
+/// No provider API at all — control of the DNS is proven by asking the
+/// hostname for a token only this deployment can serve. That is ACME's
+/// HTTP-01 in miniature, it needs no external service, and it is what a host
+/// without Cloudflare for SaaS uses (including the Rust host, the day it
+/// gains a writable domain map). The certificate is then someone else's job:
+/// a reverse proxy's, or the platform's.
+export class ManualProvider implements DomainProvider {
+  readonly name = "manual";
+
+  constructor(
+    private readonly target: string | null,
+    private readonly fetchFn: typeof fetch = fetch,
+  ) {}
+
+  async ensure(host: string, token: string): Promise<Attachment> {
+    // A re-attach of a host whose DNS already points here is active at once.
+    return this.check(host, token);
+  }
+
+  async check(host: string, token: string): Promise<Attachment> {
+    const records = cnameRecord(host, this.target);
+    // Plain HTTP, following redirects: the point is to reach *this*
+    // deployment, and a host mid-setup may have no certificate yet.
+    const url = `http://${host}${CHALLENGE_PREFIX}${encodeURIComponent(token)}`;
+    let detail: JsonObject;
+    try {
+      const resp = await this.fetchFn(url, { redirect: "follow" });
+      const body = (await resp.text()).trim();
+      if (resp.ok && body === token) {
+        return { status: "active", dnsRecords: records, detail: { check: "ok" } };
+      }
+      detail = { check: `${url} answered ${resp.status}${resp.ok ? " with the wrong token" : ""}` };
+    } catch (e) {
+      detail = { check: `${url} unreachable: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    return { status: "pending", dnsRecords: records, detail };
+  }
+
+  async remove(): Promise<void> {
+    /* nothing was provisioned */
+  }
+}
+
+/// The provider this deployment runs: Cloudflare for SaaS when both secrets
+/// are set, otherwise the self-check. Never nothing — an unconfigured
+/// deployment used to accept a domain and provision precisely nothing, which
+/// looked like success and wasn't.
+export function providerFromEnv(env: DomainsEnv, fetchFn: typeof fetch = fetch): DomainProvider {
+  const api = cfApiFromEnv(env, fetchFn);
+  const target = cnameTarget(env);
+  return api ? new CloudflareSaasProvider(api, target) : new ManualProvider(target, fetchFn);
+}
+
+/// What a customer does next, in one sentence. Clients render this rather
+/// than deriving their own from `status`, so the wording stays one thing.
+export function nextStep(host: string, tenant: string, a: Attachment): string {
+  if (a.status === "active") return `nothing to do: ${host} is live and serving tenant '${tenant}'`;
+  const required = a.dnsRecords.filter((r) => r.required);
+  if (required.length === 0) {
+    return `waiting on DNS for ${host}: this deployment has no CNAME target configured (set RS2_CNAME_TARGET), so point ${host} at it and it goes live automatically`;
+  }
+  return `publish the required DNS record${required.length === 1 ? "" : "s"} above at ${host}'s DNS provider; the domain goes live on its own once we can see it, usually within minutes`;
+}
+
+/// The admin response body for `PUT`/`GET /admin/domains/<host>`, identical
+/// on every host and every provider.
+export function attachmentResponse(host: string, tenant: string, providerName: string, a: Attachment): JsonObject {
+  return {
+    host,
+    tenant,
+    status: a.status,
+    dnsRecords: a.dnsRecords as unknown as Json,
+    nextStep: nextStep(host, tenant, a),
+    provider: { name: providerName, detail: a.detail },
+  };
+}
+
+/// A host already in the routing map: active by definition, whatever the
+/// provider would say. The read path on both hosts answers with this.
+export function liveAttachment(): Attachment {
+  return { status: "active", dnsRecords: [], detail: null };
 }

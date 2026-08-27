@@ -43,6 +43,7 @@ prelude's virtual timers). Wasm components on the Worker.
 | `conditional-write` is atomic on the Worker (DO-serialized), best-effort on Rust local-fs | already a declared facet strength (`FileStore::conditional_write_atomic`) |
 | Guest (`code:`) store adapters: `store.maxRuntimes` / `store.idleMs` / `store.idleSeconds` are accepted and **ignored** (one Dynamic Worker isolate per mount; the platform owns eviction) | documented here + §I decision 36; surfaced the same way `limits.cpuMs` is (a Worker-only knob the other host ignores) |
 | Guest adapters cannot pool a backend connection across requests: I/O objects are request-scoped on the Workers platform, so a socket pooled in a bundle's module scope dies at the invocation boundary and the adapter reconnects per invocation (on Rust the resident isolate pools it for the mount's lifetime) | `guestAdapterPooling` in `src/divergences.ts` (`"pooled"` \| `"perInvocation"`); §I decision 38 |
+| Attaching a domain: the Worker attaches over HTTP behind the proof-of-control gate (§B.5); the Rust host's tenancy map is static config read at startup and its TLS belongs to a reverse proxy, so it answers the **read** side identically (`provider: "static"`) and refuses `PUT`/`DELETE` with 501 `provider_unavailable` naming `serverConfig.tenancy.domainMap` | `domainAttachment` in `src/divergences.ts` (`"api"` \| `"config"`); §B.5 |
 | `DELETE` of a directory that never existed: Rust local-fs → 404; R2 has no directories → **204** | runner accepts `204|404` for this one case (§F); documented, not declared |
 | Dot segments in the request target (`/files/../x`, `/files/%2e%2e/x`) | The Workers platform canonicalizes them before the Worker runs (`request.url` already reads `/x`), so the router's 400 `path_unsafe` is unreachable and the request routes on the normalized path (404 for an unmounted target); `%00`, `\`, control characters and drive letters still reach the router and are 400 | runner accepts `400|404` for the two dot-segment cases (`dotSegmentTraversal` in `src/divergences.ts`); documented, not declared |
 | `Content-Range` on 206 | Rust omits it (a known gap, `services/file.rs`); the Worker **also omits it** — fixing it is a both-hosts change, out of scope |
@@ -210,13 +211,56 @@ problem+json with `tenant: "-"`.
 | `PUT /admin/tenants/<name>` | `{"config": <tenant config>, "domains": ["api.acme.com"], "bootstrapAdmin": {"email","password"}?}` | Validates the name (`/`, `\`, `.` → 400 `invalid tenant name`), dry-builds the config (same errors as `PUT /raw`), writes it into the tenant DO, registers domains in the registry, seeds the admin **if absent** exactly as `seed_bootstrap_admin` (`{passwordHash, roles:"A", kind:"user"}` into `auth.userDataset`; requires `auth.jwtSecret` → 400 otherwise). 201 created / 200 replaced, `ETag` |
 | `GET /admin/tenants/<name>` | — | The raw config, redacted like `/services/raw` |
 | `DELETE /admin/tenants/<name>?confirm=<name>` | — | Removes registry entries and **deletes the DO's storage** (`storage.deleteAll()`); R2 objects under `<name>/` are **not** deleted (409 without `confirm`) |
-| `PUT /admin/domains/<host>` | `{"tenant"}` | Registry map entry (host lowercased). The host must be a syntactically valid name (LDH labels ≤63, ≤253 overall) → 400 otherwise, and the same gate applies to the `domains` array of `PUT /admin/tenants/<name>`. With Cloudflare for SaaS configured the custom hostname is provisioned **before** the registry write, so a CF failure leaves routing untouched; a registry failure rolls back a hostname this request created |
-| `DELETE /admin/domains/<host>` | — | 204 |
+| `GET /admin/domains` | — | `{"domains":[{"host","tenant","status":"active"|"pending"}]}`, sorted. Live mappings and unproven claims side by side |
+| `PUT /admin/domains/<host>` | `{"tenant"}` | **Claims** the host for the tenant (lowercased; must be a syntactically valid name — LDH labels ≤63, ≤253 overall → 400 otherwise, the same gate as the `domains` array of `PUT /admin/tenants/<name>`). The provider is asked to attach it **before** any registry write, so a provider failure leaves routing untouched. Already proven ⇒ **200** and the host routes; not yet ⇒ **202** and it does not. Claimed by another tenant, or already routing to one, ⇒ 409. Body: the attachment shape below |
+| `GET /admin/domains/<host>` | — | The attachment. A live host reads `active`; a pending one is re-polled through the provider, and a host that has since been proven is **promoted here** (200 either way). Unknown host → 404 |
+| `DELETE /admin/domains/<host>` | — | 204. Drops the mapping **and** any unproven claim, and asks the provider to remove what it provisioned |
 | `PUT /admin/infras` | the `infras.json` document | Stored in the registry; `POST /admin/reload-infras` re-snapshots it and purges every built tenant (each TenantObject drops its in-memory build on next request because the registry bumps an `infrasVersion` the DO compares) |
 
 The `services` mount's `GET /infras` and `infra:` expansion read the registry
 snapshot the DO fetched at build time (`InfraSet` semantics from `infra.rs`
 unchanged, secrets never leave the DO).
+
+**Domain attachment is gated on proof of control** (`src/domains.ts`). The
+registry map is the routing truth and nothing reaches it on a caller's say-so:
+a `PUT` records a *claim*, and only a provider reporting the host verified
+promotes that claim into the map. So two tenants may both ask for
+`app.acme.com` — first claim wins the claim, and only DNS wins the mapping.
+A claim is released by `DELETE` or by deleting its tenant; the `*/5` cron
+re-polls every pending claim, so a customer who publishes the record and never
+comes back is promoted anyway.
+
+The response shape is **host-neutral** — no client parses a provider's
+vocabulary:
+
+```json
+{ "host": "app.acme.com", "tenant": "acme", "status": "pending",
+  "dnsRecords": [ { "type": "CNAME", "name": "app.acme.com",
+                    "value": "saas.rs2.example", "required": true,
+                    "purpose": "routes the domain to this deployment" } ],
+  "nextStep": "publish the required DNS record above at …",
+  "provider": { "name": "cloudflare-saas", "detail": { "cfStatus": "pending" } } }
+```
+
+`status` is two-valued (`pending` | `active`) because a client's only question
+is whether it can send traffic yet; everything a provider knows beyond that is
+diagnosis and lives in `provider.detail`. Two providers ship:
+
+- **`cloudflare-saas`** — both `CF_API_TOKEN` and `CF_ZONE_ID` set. Cloudflare
+  validates the hostname over HTTP and issues the certificate, so the
+  customer's whole side of it is one CNAME to `RS2_CNAME_TARGET`. The
+  optional pre-validation TXT is offered while it would still help (before
+  the CNAME moves) and dropped once the hostname is active. A single `*/*`
+  Worker route on the SaaS zone covers every custom hostname — there is no
+  per-domain route to create (`scripts/saas-setup.mjs` does the one-time
+  zone wiring; `scripts/domain.mjs` is the per-customer command).
+- **`manual`** — the fallback, and the portable one: RS2 mints a token per
+  claim and fetches `http://<host>/.well-known/rs2/domain-challenge/<token>`,
+  which only this deployment can answer. ACME's HTTP-01 in miniature, no
+  external service, certificate someone else's problem. The Worker answers
+  that path **before tenant routing** (a host being verified is by definition
+  not routing yet) and binds the token to the asking `Host`, so proving
+  control of one domain never proves control of another.
 
 ### B.6 Scheduler
 
@@ -1191,3 +1235,28 @@ Decisions 35–40 were made during the P4b build:
       advertising a number nothing enforces would be a lie. A Free-plan
       deployment sets `{"outboundCalls": 45}` and the whole remote suite
       passes (191 passed, 7 skipped, 0 failed).
+
+45. **A domain attaches only once its DNS proves it, and the contract is the
+    lifecycle — not Cloudflare's API.** `PUT /admin/domains/<host>` used to
+    write the routing map immediately, which made the endpoint a squatting
+    tool: any caller could point a hostname it did not own at its own tenant
+    and wait for the real owner's DNS to arrive. The write is now a *claim*,
+    and a provider reporting the host verified is what promotes it (§B.5).
+    Cloudflare's own domain validation is that proof where Cloudflare for SaaS
+    is configured; where it is not, a self-check challenge
+    (`/.well-known/rs2/domain-challenge/<token>`, bound to the asking `Host`)
+    is — so no separate claim protocol had to be invented, and the
+    provider-less "registry-only" mode, which accepted a domain and
+    provisioned precisely nothing while reading as success, is gone.
+    Two providers exist from the start deliberately: with one, the interface
+    would have been Cloudflare's API with a coat of paint. What clients see is
+    `status` (`pending`|`active`), `dnsRecords`, `nextStep` — portable — with
+    every provider-specific string quarantined under `provider.detail`. The
+    Rust host answers the read half of that contract from its static tenancy
+    map and refuses the write half with 501 `provider_unavailable` (a new code
+    in `error.rs`: the host understands the request and has nothing configured
+    that could carry it out), naming `serverConfig.tenancy.domainMap` as the
+    place to make the change. Giving Rust a writable map is a much larger
+    change — mutable tenancy plus inbound TLS it does not own — and this
+    leaves the door open for it: `ManualProvider` is exactly what it would
+    use.

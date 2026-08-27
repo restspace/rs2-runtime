@@ -8,6 +8,8 @@
     "dev": "wrangler dev",
     "deploy": "node scripts/deploy.mjs",
     "deploy:verify": "node scripts/deploy.mjs --verify",
+    "domain": "node scripts/domain.mjs",
+    "saas:setup": "node scripts/saas-setup.mjs",
     "ui:up": "node scripts/ui-fixture.mjs up",
     "ui:down": "node scripts/ui-fixture.mjs down",
     "test": "vitest run",

@@ -82,6 +82,7 @@ jobs:
         working-directory: conformance/http
         env:
           RS2_PORT: "3100"
+          RS2_ADMIN_TOKEN: ci
           RS2_SERVER_BIN: ${{ github.workspace }}/target/debug/rs2-server
         run: |
           node scripts/host-rust.mjs > host.log 2>&1 &
@@ -95,6 +96,7 @@ jobs:
         env:
           RS2_PORT: "3100"
           RS2_HOST_KIND: rust
+          RS2_ADMIN_TOKEN: ci
       - name: Host log
         if: always()
         run: cat conformance/http/host.log

@@ -192,13 +192,50 @@ multi-tenant production), `RS2_MAIN_DOMAIN` (`<sub>.<mainDomain>` tenancy),
 `RS2_LOG_LEVEL`, `RS2_CATALOGUE_HOSTS` (comma allowlist for live catalogue
 fetches).
 
-Optional secrets for custom domains (`/admin/domains/<host>` — Cloudflare
-for SaaS): `CF_API_TOKEN` (a token with Zone → SSL and Custom Hostnames
-edit) and `CF_ZONE_ID`. With both set, `PUT /admin/domains/<host>` also
-provisions the custom hostname and the response carries the provisioning
-status + DNS instructions (`RS2_CNAME_TARGET` or `RS2_MAIN_DOMAIN` is the
-CNAME target it reports); without them the endpoints manage the registry
-map only.
+## Customer domains
+
+A tenant can be reached at a domain its owner controls — `app.acme.com` —
+and the customer's whole side of that is **one CNAME**. Cloudflare validates
+the hostname and issues the certificate; a single `*/*` Worker route on your
+zone covers every custom hostname, so there is nothing per-domain to
+configure on the Cloudflare side.
+
+Once, for the whole deployment:
+
+```sh
+# creates the originless AAAA 100:: record, sets it as the zone's fallback
+# origin, adds the */* route, and writes CF_ZONE_ID + RS2_CNAME_TARGET into
+# .deploy.vars.json. Idempotent; --check reports drift without changing
+# anything. Needs a token with Zone:Read, DNS:Edit, SSL and
+# Certificates:Edit, Workers Routes:Edit on that zone.
+CF_API_TOKEN=… npm run saas:setup -- --zone rs2.example --origin saas.rs2.example
+npx wrangler secret put CF_API_TOKEN   # SSL and Certificates:Edit is enough here
+npm run deploy
+```
+
+Then per customer:
+
+```sh
+RS2_BASE_URL=… RS2_ADMIN_TOKEN=… npm run domain -- add app.acme.com --tenant acme
+#   prints:  CNAME  app.acme.com  saas.rs2.example
+#   add --wait to poll until it is live and prove the domain serves RS2
+RS2_BASE_URL=… RS2_ADMIN_TOKEN=… npm run domain -- list
+```
+
+**A claim is not a mapping.** `PUT /admin/domains/<host>` records that a
+tenant wants the host and answers **202**; the host does not route until a
+provider reports the DNS proven, at which point it is promoted (by the next
+status read, or by the minutely cron). So two tenants may both ask for the
+same host and only the one that can make the DNS resolve gets it. `DELETE`
+releases both the mapping and an unproven claim.
+
+Without `CF_API_TOKEN`/`CF_ZONE_ID` the same endpoints run the `manual`
+provider instead: RS2 mints a token per claim and proves control by fetching
+`http://<host>/.well-known/rs2/domain-challenge/<token>`, which only this
+deployment can answer. No certificate is issued in that mode — something in
+front of the Worker has to own TLS — but the gate and the API are identical.
+`RS2_CNAME_TARGET` (falling back to `RS2_MAIN_DOMAIN`) is the target the
+records tell customers to point at.
 
 ## Limits and differences from the Rust host
 

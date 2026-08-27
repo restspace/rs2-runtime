@@ -172,6 +172,36 @@ impl Runtime {
         self.tenancy.resolve(host)
     }
 
+    /// Every host explicitly mapped to a tenant, sorted. The read side of the
+    /// domains admin API (PRD §9.1): on this host the map is static config,
+    /// so it is complete and every entry is live by definition. Subdomains of
+    /// `main_domain` are not enumerable and so are not listed.
+    pub fn mapped_domains(&self) -> Vec<(String, String)> {
+        match &self.tenancy {
+            Tenancy::Single { .. } => Vec::new(),
+            Tenancy::Multi { domain_map, .. } => {
+                let mut out: Vec<(String, String)> = domain_map
+                    .iter()
+                    .map(|(host, tenant)| (host.clone(), tenant.clone()))
+                    .collect();
+                out.sort();
+                out
+            }
+        }
+    }
+
+    /// The tenant a host is explicitly mapped to, ignoring the subdomain rule
+    /// and the single-tenant fallback — "is this domain attached?", not
+    /// "who serves this request?".
+    pub fn mapped_domain(&self, host: &str) -> Option<String> {
+        match &self.tenancy {
+            Tenancy::Single { .. } => None,
+            Tenancy::Multi { domain_map, .. } => {
+                domain_map.get(&host.to_ascii_lowercase()).cloned()
+            }
+        }
+    }
+
     async fn tenant(&self, name: &str) -> Result<Arc<Tenant>, RsError> {
         if let Some(t) = self.tenants.read().await.get(name) {
             return Ok(t.clone());

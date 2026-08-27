@@ -20,6 +20,12 @@ pub mod codes {
     pub const CAPABILITY_DENIED: &str = "capability_denied";
     pub const CONTRACT_VIOLATION: &str = "contract_violation";
     pub const ENGINE_UNAVAILABLE: &str = "engine_unavailable";
+    /// The host understands the request but has nothing configured that could
+    /// carry it out — a domain attachment on a host whose tenancy is static
+    /// config, say. Distinct from `not_found` (the resource is absent) and
+    /// from `capability_denied` (permission): nothing the caller sends will
+    /// make it work, an operator has to configure the host.
+    pub const PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
     pub const PATH_UNSAFE: &str = "path_unsafe";
     pub const INTERNAL: &str = "internal";
 }
@@ -145,6 +151,15 @@ impl RsError {
 
     pub fn engine_unavailable(detail: impl Into<String>) -> Self {
         Self::new(501, codes::ENGINE_UNAVAILABLE, "Engine Unavailable", detail)
+    }
+
+    pub fn provider_unavailable(detail: impl Into<String>) -> Self {
+        Self::new(
+            501,
+            codes::PROVIDER_UNAVAILABLE,
+            "Provider Unavailable",
+            detail,
+        )
     }
 
     pub fn internal(detail: impl Into<String>) -> Self {

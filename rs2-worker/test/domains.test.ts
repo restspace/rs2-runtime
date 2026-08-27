@@ -2,7 +2,21 @@
 // custom-hostnames client, run against mocked `fetch` responses — the real
 // CF API is never reachable from tests.
 import { describe, expect, it } from "vitest";
-import { CfSaasApi, REGISTRY_ONLY_NOTE, cfApiFromEnv, cnameTarget, domainResponse, mapDomainStatus, parseCustomHostname, validHostname } from "../src/domains";
+import {
+  CfSaasApi,
+  CloudflareSaasProvider,
+  ManualProvider,
+  attachmentResponse,
+  cfApiFromEnv,
+  cnameTarget,
+  liveAttachment,
+  mapDomainStatus,
+  nextStep,
+  parseCustomHostname,
+  providerFromEnv,
+  validHostname,
+} from "../src/domains";
+import type { Attachment } from "../src/domains";
 import type { Json, JsonObject } from "../src/runtime/error";
 import { RsError } from "../src/runtime/error";
 
@@ -126,7 +140,7 @@ describe("CfSaasApi", () => {
   });
 });
 
-describe("admin response shape", () => {
+describe("provider selection and response shape", () => {
   const envBoth = { CF_API_TOKEN: "t", CF_ZONE_ID: "z", RS2_MAIN_DOMAIN: "rs2.example" };
 
   it("requires both secrets for the CF client", () => {
@@ -142,29 +156,126 @@ describe("admin response shape", () => {
     expect(cnameTarget({})).toBeNull();
   });
 
-  it("registry-only mode says so explicitly", () => {
-    const body = domainResponse("app.acme.com", "acme", {}, false, undefined);
-    expect(body.status).toBeNull();
-    expect(body.provisioning).toBeNull();
-    expect(body.note).toBe(REGISTRY_ONLY_NOTE);
+  it("both secrets pick Cloudflare for SaaS, neither picks the self-check", () => {
+    expect(providerFromEnv(envBoth).name).toBe("cloudflare-saas");
+    // Never *no* provider: an unconfigured deployment used to accept a
+    // domain and provision nothing, which read as success.
+    expect(providerFromEnv({}).name).toBe("manual");
+    expect(providerFromEnv({ CF_API_TOKEN: "t" }).name).toBe("manual");
   });
 
-  it("provisioned mode reports the status and the ownership record", () => {
-    const view = parseCustomHostname(cfResult("active", "pending_deployment"));
-    const body = domainResponse("app.acme.com", "acme", envBoth, true, view) as {
-      status: string;
-      cnameTarget: string;
-      provisioning: { id: string; ownershipVerification: typeof OWNERSHIP };
-      note?: string;
+  it("the response is host-neutral: no CF vocabulary outside provider.detail", () => {
+    const a: Attachment = { status: "pending", dnsRecords: [], detail: { cfStatus: "pending" } };
+    const body = attachmentResponse("app.acme.com", "acme", "cloudflare-saas", a);
+    expect(Object.keys(body).sort()).toEqual(["dnsRecords", "host", "nextStep", "provider", "status", "tenant"]);
+    expect(body.status).toBe("pending");
+    expect(JSON.stringify(body.provider)).toContain("cfStatus");
+  });
+
+  it("a live host reads active with nothing left to do", () => {
+    const body = attachmentResponse("app.acme.com", "acme", "manual", liveAttachment());
+    expect(body.status).toBe("active");
+    expect(body.dnsRecords).toEqual([]);
+    expect(String(body.nextStep)).toContain("nothing to do");
+  });
+
+  it("nextStep names the records when there are required ones, the config when there are not", () => {
+    const withCname: Attachment = {
+      status: "pending",
+      dnsRecords: [{ type: "CNAME", name: "app.acme.com", value: "saas.rs2.example", required: true, purpose: "" }],
+      detail: null,
     };
-    expect(body.status).toBe("pending_certificate");
-    expect(body.cnameTarget).toBe("rs2.example");
-    expect(body.provisioning.id).toBe("chid-1");
-    expect(body.provisioning.ownershipVerification).toEqual(OWNERSHIP);
-    expect(body.note).toBeUndefined();
-    // Secrets set but nothing provisioned yet: not the registry-only wording.
-    const missing = domainResponse("app.acme.com", "acme", envBoth, true, undefined);
-    expect(missing.note).toBe("no Cloudflare custom hostname exists for this host");
+    expect(nextStep("app.acme.com", "acme", withCname)).toContain("publish the required DNS record");
+    // Only the optional pre-validation TXT: the deployment has no target
+    // configured, so telling the customer to "publish the record above"
+    // would be telling them to publish nothing.
+    const optionalOnly: Attachment = {
+      status: "pending",
+      dnsRecords: [{ type: "TXT", name: "_x.app.acme.com", value: "v", required: false, purpose: "" }],
+      detail: null,
+    };
+    expect(nextStep("app.acme.com", "acme", optionalOnly)).toContain("RS2_CNAME_TARGET");
+  });
+});
+
+describe("CloudflareSaasProvider", () => {
+  const target = "saas.rs2.example";
+
+  function provider(handler: Parameters<typeof mockFetch>[0]) {
+    const { fetchFn, calls } = mockFetch(handler);
+    return { p: new CloudflareSaasProvider(new CfSaasApi("t", "z", fetchFn), target), calls };
+  }
+
+  it("maps a half-provisioned hostname to pending, with the CNAME and the optional TXT", async () => {
+    const { p } = provider(() => ok([cfResult("pending", "initializing")]));
+    const a = await p.check("app.acme.com");
+    expect(a.status).toBe("pending");
+    expect(a.dnsRecords.map((r) => [r.type, r.required])).toEqual([
+      ["CNAME", true],
+      ["TXT", false],
+    ]);
+    expect(a.dnsRecords[0]!.value).toBe(target);
+    expect(a.detail).toMatchObject({ cfStatus: "pending", cfSslStatus: "initializing" });
+  });
+
+  it("only both-active is active, and then the TXT is no longer offered", async () => {
+    const { p } = provider(() => ok([cfResult("active", "active")]));
+    const a = await p.check("app.acme.com");
+    expect(a.status).toBe("active");
+    expect(a.dnsRecords.map((r) => r.type)).toEqual(["CNAME"]);
+    // The certificate still pending is *not* live: the domain would 525.
+    const half = provider(() => ok([cfResult("active", "pending_validation")]));
+    expect((await half.p.check("app.acme.com")).status).toBe("pending");
+  });
+
+  it("a hostname deleted underneath us stays pending and says so", async () => {
+    const { p } = provider(() => ok([]));
+    const a = await p.check("app.acme.com");
+    expect(a.status).toBe("pending");
+    expect(a.detail).toEqual({ stage: "absent" });
+  });
+});
+
+describe("ManualProvider (the self-check gate)", () => {
+  const target = "rs2.example";
+
+  /// A `fetch` standing in for the customer's host once DNS resolves here.
+  function hostServing(body: string | null, status = 200) {
+    const seen: string[] = [];
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      seen.push(String(input));
+      if (body === null) throw new TypeError("getaddrinfo ENOTFOUND");
+      return new Response(body, { status });
+    }) as typeof fetch;
+    return { fetchFn, seen };
+  }
+
+  it("active only when the host echoes the exact token", async () => {
+    const { fetchFn, seen } = hostServing("tok-123");
+    const a = await new ManualProvider(target, fetchFn).check("app.acme.com", "tok-123");
+    expect(a.status).toBe("active");
+    expect(seen[0]).toBe("http://app.acme.com/.well-known/rs2/domain-challenge/tok-123");
+  });
+
+  it("a host that answers with someone else's token is not proof", async () => {
+    const { fetchFn } = hostServing("tok-999");
+    const a = await new ManualProvider(target, fetchFn).check("app.acme.com", "tok-123");
+    expect(a.status).toBe("pending");
+    expect(String((a.detail as { check: string }).check)).toContain("wrong token");
+  });
+
+  it("a 404, or a host that does not resolve at all, is pending with a reason", async () => {
+    const missing = await new ManualProvider(target, hostServing("nope", 404).fetchFn).check("app.acme.com", "t");
+    expect(missing.status).toBe("pending");
+    expect(String((missing.detail as { check: string }).check)).toContain("answered 404");
+    const unreachable = await new ManualProvider(target, hostServing(null).fetchFn).check("app.acme.com", "t");
+    expect(unreachable.status).toBe("pending");
+    expect(String((unreachable.detail as { check: string }).check)).toContain("unreachable");
+  });
+
+  it("ensure is check: a host already pointed here attaches in one call", async () => {
+    const { fetchFn } = hostServing("tok-123");
+    expect((await new ManualProvider(target, fetchFn).ensure("app.acme.com", "tok-123")).status).toBe("active");
   });
 });
 

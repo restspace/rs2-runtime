@@ -3,7 +3,7 @@
 // `TenantObject`, and the cron fan-out. Every tenant request routes through
 // the DO — there is no Worker-side fast path.
 
-import { cfApiFromEnv, domainResponse, validHostname } from "./domains";
+import { CHALLENGE_PREFIX, attachmentResponse, liveAttachment, providerFromEnv, validHostname } from "./domains";
 import type { Env } from "./env";
 import { INFRAS_VERSION_HEADER, TENANT_HEADER, TRACE_HEADER } from "./env";
 import { RegistryObject } from "./registry-object";
@@ -118,6 +118,13 @@ function validTenantName(name: string): boolean {
   return name !== "" && !/[/\\.]/.test(name);
 }
 
+/// The challenge a pending host is asked to echo back (`ManualProvider`).
+/// Unguessable, because serving it is the whole proof.
+function randomToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 async function readJsonObject(request: Request): Promise<JsonObject> {
   let v: Json;
   try {
@@ -218,44 +225,74 @@ async function handleAdmin(request: Request, env: Env, url: URL): Promise<Respon
       }
       return text(405, "GET, PUT, DELETE only\n");
     }
+    if (parts[1] === "domains" && parts.length === 2) {
+      if (request.method !== "GET") return text(405, "GET only\n");
+      return json(200, { domains: await registry(env).listDomains() });
+    }
     if (parts[1] === "domains" && parts.length === 3) {
       const host = decodeURIComponent(parts[2]!).toLowerCase();
-      // With CF_API_TOKEN + CF_ZONE_ID configured, the endpoints also manage
-      // a Cloudflare for SaaS custom hostname (src/domains.ts); without them
-      // they are registry-only and the response body says so.
-      const cf = cfApiFromEnv(env);
+      // Cloudflare for SaaS when both secrets are set, the self-check
+      // otherwise (src/domains.ts). Either way the provider — not the caller
+      // — decides when the host starts routing.
+      const provider = providerFromEnv(env);
       if (request.method === "PUT") {
         const body = await readJsonObject(request);
         if (typeof body.tenant !== "string" || !validTenantName(body.tenant)) {
           throw RsError.badRequest("PUT /admin/domains/<host> requires a 'tenant' name");
         }
         if (!validHostname(host)) throw RsError.badRequest(`'${host}' is not a valid host name`);
-        // Provision **before** the registry write (issue #2 item 5): a
-        // Cloudflare failure must leave routing exactly as it was, and a
-        // registry failure must not leave a custom hostname behind.
-        const existing = cf ? await cf.find(host) : undefined;
-        const provisioning = cf ? (existing ?? (await cf.ensure(host))) : undefined;
-        try {
-          await registry(env).putDomain(host, body.tenant);
-        } catch (e) {
-          // Roll back only a hostname this request created; one that was
-          // already there may still be serving an earlier mapping.
-          if (cf && !existing) await cf.remove(host).catch(() => undefined);
-          throw e;
+        const tenant = body.tenant;
+        const liveOwner = await registry(env).getDomain(host);
+        if (liveOwner === tenant) {
+          return json(200, attachmentResponse(host, tenant, provider.name, liveAttachment()));
         }
-        await invalidateSnapshot();
-        return json(200, domainResponse(host, body.tenant, env, cf !== undefined, provisioning));
+        if (liveOwner !== undefined) {
+          throw RsError.conflict(`'${host}' already routes to tenant '${liveOwner}'; DELETE it before re-attaching`);
+        }
+        // First claim wins until it is released: two tenants may both ask for
+        // a host, but only the one that can prove the DNS gets the mapping,
+        // and a second claimant must not be able to displace the first.
+        const claimed = await registry(env).getPending(host);
+        if (claimed !== undefined && claimed.tenant !== tenant) {
+          throw RsError.conflict(`'${host}' is already claimed by tenant '${claimed.tenant}'`);
+        }
+        const token = claimed?.token ?? randomToken();
+        // Provisioning happens **before** any registry write (issue #2 item
+        // 5): a provider failure leaves routing exactly as it was. A failure
+        // of the claim write is harmless in the other direction — it leaves
+        // at most an unused custom hostname, which the next attempt adopts.
+        const attachment = await provider.ensure(host, token);
+        if (attachment.status === "active") {
+          await registry(env).putDomain(host, tenant);
+          await registry(env).deletePending(host);
+          await invalidateSnapshot();
+          return json(200, attachmentResponse(host, tenant, provider.name, attachment));
+        }
+        await registry(env).putPending(host, tenant, token, provider.name);
+        return json(202, attachmentResponse(host, tenant, provider.name, attachment));
       }
       if (request.method === "GET") {
-        const tenant = await registry(env).getDomain(host);
-        if (tenant === undefined) throw RsError.notFound(`no domain '${host}'`);
-        const provisioning = cf ? await cf.find(host) : undefined;
-        return json(200, domainResponse(host, tenant, env, cf !== undefined, provisioning));
+        const liveOwner = await registry(env).getDomain(host);
+        if (liveOwner !== undefined) {
+          return json(200, attachmentResponse(host, liveOwner, provider.name, liveAttachment()));
+        }
+        const claimed = await registry(env).getPending(host);
+        if (claimed === undefined) throw RsError.notFound(`no domain '${host}'`);
+        // Polling is also how a proven domain goes live — the cron is the
+        // safety net for a claim nobody is watching, not the only writer.
+        const attachment = await provider.check(host, claimed.token);
+        if (attachment.status === "active") {
+          const tenant = (await registry(env).activatePending(host)) ?? claimed.tenant;
+          await invalidateSnapshot();
+          return json(200, attachmentResponse(host, tenant, provider.name, attachment));
+        }
+        return json(200, attachmentResponse(host, claimed.tenant, provider.name, attachment));
       }
       if (request.method === "DELETE") {
+        // Both halves: the live mapping and any unproven claim on the host.
         await registry(env).deleteDomain(host);
         await invalidateSnapshot();
-        if (cf) await cf.remove(host);
+        await provider.remove(host);
         return new Response(null, { status: 204 });
       }
       return text(405, "GET, PUT, DELETE only\n");
@@ -292,8 +329,27 @@ export default {
     if (path === "/healthz" || path === "/readyz") return text(200, "ok");
     if (isOperatorPath(path)) return handleAdmin(request, env, url);
 
+    // The `Host` header, falling back to the URL's authority — over HTTP/2
+    // and from a service binding there may be no header, and workerd always
+    // carries the authority on the URL.
+    const host = request.headers.get("host") ?? url.host;
+
+    // The domain-attachment challenge (§B.5), answered before tenant routing
+    // because a host being verified is by definition not routing yet. Ours
+    // is the reserved `.well-known/rs2` namespace, so shadowing a tenant
+    // mount here is deliberate. The token is bound to the asking host:
+    // proving control of one domain must never prove control of another.
+    if (path.startsWith(CHALLENGE_PREFIX)) {
+      const presented = decodeURIComponent(path.slice(CHALLENGE_PREFIX.length));
+      const claim = await registry(env).getPending((host.split(":")[0] ?? host).toLowerCase());
+      const enc = new TextEncoder();
+      if (claim !== undefined && presented !== "" && constantTimeEqual(enc.encode(claim.token), enc.encode(presented))) {
+        return text(200, claim.token);
+      }
+      return text(404, `no pending domain challenge for '${host}'\n`);
+    }
+
     // Hostname → tenant (§B.3 step 2).
-    const host = request.headers.get("host") ?? "";
     const snapshot = await registrySnapshot(env);
     const tenant = resolveTenant(
       {
@@ -332,6 +388,16 @@ export default {
           await tenantStub(env, name)
             .reconcileSchedules()
             .catch(() => undefined);
+        }
+        // Pending domain attachments (§B.5): polling `GET /admin/domains/…`
+        // also promotes a proven host, so this is the safety net for the
+        // customer who publishes the record and never comes back to look.
+        const provider = providerFromEnv(env);
+        for (const claim of await registry(env).listPending()) {
+          const attachment = await provider.check(claim.host, claim.token).catch(() => undefined);
+          if (attachment?.status !== "active") continue;
+          await registry(env).activatePending(claim.host);
+          await invalidateSnapshot();
         }
       })(),
     );

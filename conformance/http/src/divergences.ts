@@ -32,6 +32,16 @@ export interface Divergences {
    * `store.maxRuntimes`/`idleMs` are accepted and ignored.
    */
   guestAdapterPooling: "pooled" | "perInvocation";
+  /**
+   * How a domain is attached to a tenant (`/admin/domains`). Both hosts
+   * answer the read side identically. The Worker also writes (`"api"`):
+   * `PUT` claims the host, a provider proves control of the DNS, and only
+   * then does it route. The Rust host's tenancy map is static config loaded
+   * at startup and its TLS is a reverse proxy's, so it has nothing to write
+   * or provision (`"config"`) and refuses the write side with a 501
+   * `provider_unavailable` naming `serverConfig.tenancy.domainMap`.
+   */
+  domainAttachment: "api" | "config";
 }
 
 const TABLE: Record<HostKind, Divergences> = {
@@ -39,11 +49,13 @@ const TABLE: Record<HostKind, Divergences> = {
     absentDirectoryDelete: [404],
     dotSegmentTraversal: [400],
     guestAdapterPooling: "pooled",
+    domainAttachment: "config",
   },
   cloudflare: {
     absentDirectoryDelete: [204, 404],
     dotSegmentTraversal: [400, 404],
     guestAdapterPooling: "perInvocation",
+    domainAttachment: "api",
   },
 };
 

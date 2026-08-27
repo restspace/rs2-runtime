@@ -22,6 +22,18 @@ export interface RegistrySnapshot {
 
 type TenantTable = Record<string, TenantEntry>;
 
+/// A domain claimed by a tenant but not yet proven, so not yet routing
+/// (§B.5): it holds the claim, the challenge token the `manual` provider
+/// serves, and which provider is verifying it.
+export interface PendingAttachment {
+  tenant: string;
+  token: string;
+  provider: string;
+  requestedAt: number;
+}
+
+type PendingTable = Record<string, PendingAttachment>;
+
 export class RegistryObject extends DurableObject<Env> {
   private async domains(): Promise<Record<string, string>> {
     return (await this.ctx.storage.get<Record<string, string>>("domains")) ?? {};
@@ -88,15 +100,77 @@ export class RegistryObject extends DurableObject<Env> {
   async deleteTenant(name: string): Promise<void> {
     const tenants = await this.tenants();
     const map = await this.domains();
+    const waiting = await this.pending();
     for (const [host, t] of Object.entries(map)) if (t === name) delete map[host];
+    // A claim outlives its tenant otherwise, and would block a re-attach.
+    for (const [host, entry] of Object.entries(waiting)) if (entry.tenant === name) delete waiting[host];
     delete tenants[name];
-    await this.ctx.storage.put({ tenants, domains: map });
+    await this.ctx.storage.put({ tenants, domains: map, pendingDomains: waiting });
     await this.noteScheduled(name, false);
   }
 
   /// The tenant a host maps to, if registered.
   async getDomain(host: string): Promise<string | undefined> {
     return (await this.domains())[host.toLowerCase()];
+  }
+
+  private async pending(): Promise<PendingTable> {
+    return (await this.ctx.storage.get<PendingTable>("pendingDomains")) ?? {};
+  }
+
+  /// Record an attachment that is not routing yet. Claimed by one tenant, so
+  /// a second tenant asking for the same host is refused rather than
+  /// silently overwriting a claim someone is mid-way through proving.
+  async putPending(host: string, tenant: string, token: string, provider: string): Promise<void> {
+    const table = await this.pending();
+    table[host.toLowerCase()] = { tenant, token, provider, requestedAt: Date.now() };
+    await this.ctx.storage.put("pendingDomains", table);
+  }
+
+  async getPending(host: string): Promise<PendingAttachment | undefined> {
+    return (await this.pending())[host.toLowerCase()];
+  }
+
+  /// Every attachment still waiting on DNS — what the cron reconciles.
+  async listPending(): Promise<Array<PendingAttachment & { host: string }>> {
+    const table = await this.pending();
+    return Object.keys(table)
+      .sort()
+      .map((host) => ({ host, ...table[host]! }));
+  }
+
+  async deletePending(host: string): Promise<void> {
+    const table = await this.pending();
+    if (table[host.toLowerCase()] === undefined) return;
+    delete table[host.toLowerCase()];
+    await this.ctx.storage.put("pendingDomains", table);
+  }
+
+  /// The gate closing: a proven attachment becomes routing. Returns the
+  /// tenant it went live for, or `undefined` if nothing was pending (a
+  /// concurrent activation won, or the operator deleted it mid-flight).
+  async activatePending(host: string): Promise<string | undefined> {
+    const h = host.toLowerCase();
+    const entry = (await this.pending())[h];
+    if (entry === undefined) return undefined;
+    await this.putDomain(h, entry.tenant);
+    await this.deletePending(h);
+    return entry.tenant;
+  }
+
+  /// Every host this registry knows, live or not — the domains list endpoint.
+  async listDomains(): Promise<Array<{ host: string; tenant: string; status: "active" | "pending" }>> {
+    const live = Object.entries(await this.domains()).map(([host, tenant]) => ({
+      host,
+      tenant,
+      status: "active" as const,
+    }));
+    const waiting = Object.entries(await this.pending()).map(([host, entry]) => ({
+      host,
+      tenant: entry.tenant,
+      status: "pending" as const,
+    }));
+    return [...live, ...waiting].sort((a, b) => (a.host < b.host ? -1 : a.host > b.host ? 1 : 0));
   }
 
   async putDomain(host: string, tenant: string): Promise<void> {
@@ -108,10 +182,12 @@ export class RegistryObject extends DurableObject<Env> {
     await this.ctx.storage.put({ domains: map, tenants });
   }
 
+  /// Detach a host: both the live mapping and any unproven claim on it.
   async deleteDomain(host: string): Promise<void> {
     const map = await this.domains();
     const tenants = await this.tenants();
     const h = host.toLowerCase();
+    await this.deletePending(h);
     const owner = map[h];
     delete map[h];
     if (owner !== undefined && tenants[owner]) {

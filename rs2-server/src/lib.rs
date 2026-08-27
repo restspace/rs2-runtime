@@ -500,6 +500,110 @@ fn presented_admin_token(req: &hyper::Request<Incoming>) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// The operator gate shared by every `/admin/*` endpoint: 503 when no token
+/// is configured, 401 on a missing or wrong one. `None` means "carry on".
+fn admin_gate(
+    req: &hyper::Request<Incoming>,
+    admin_token: Option<&str>,
+) -> Option<Response<OutBody>> {
+    let Some(expected) = admin_token else {
+        return Some(ops_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain",
+            "admin endpoint disabled: set RS2_ADMIN_TOKEN or serverConfig.adminToken\n".to_string(),
+        ));
+    };
+    match presented_admin_token(req) {
+        Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => None,
+        _ => Some(ops_response(
+            StatusCode::UNAUTHORIZED,
+            "text/plain",
+            "missing or invalid admin token\n".to_string(),
+        )),
+    }
+}
+
+fn problem_response(err: RsError) -> Response<OutBody> {
+    ops_response(
+        StatusCode::from_u16(err.status).unwrap_or(StatusCode::BAD_REQUEST),
+        "application/problem+json",
+        err.to_problem_json("-", "-").to_string(),
+    )
+}
+
+/// `GET /admin/domains[/<host>]` (cloudflare.md §B.5): the **read** half of
+/// the domain-attachment contract, answered from the static tenancy map.
+///
+/// Attaching a domain is a write to the tenancy map plus a certificate, and
+/// this host has neither a writable map (it is `serverConfig.tenancy`, loaded
+/// at startup) nor inbound TLS of its own (a reverse proxy terminates it). So
+/// the write half is a declared 501 `provider_unavailable` naming the file to
+/// edit, rather than a half-working endpoint — while the read half answers in
+/// exactly the shape the Worker host uses, so a client listing a tenant's
+/// domains never has to know which host it is talking to.
+fn domains_endpoint(
+    runtime: &Arc<Runtime>,
+    req: &hyper::Request<Incoming>,
+    path: &str,
+) -> Response<OutBody> {
+    let rest = path.trim_start_matches("/admin/domains");
+    let host = rest.trim_start_matches('/');
+    if host.is_empty() {
+        if req.method() != http::Method::GET {
+            return ops_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "text/plain",
+                "GET only\n".to_string(),
+            );
+        }
+        let domains: Vec<_> = runtime
+            .mapped_domains()
+            .into_iter()
+            .map(|(host, tenant)| serde_json::json!({ "host": host, "tenant": tenant, "status": "active" }))
+            .collect();
+        return ops_response(
+            StatusCode::OK,
+            "application/json",
+            serde_json::json!({ "domains": domains }).to_string(),
+        );
+    }
+    // No percent-decoding: a valid host name has nothing to decode, so an
+    // encoded one is simply not attached.
+    let host = host.to_ascii_lowercase();
+    match *req.method() {
+        http::Method::GET => match runtime.mapped_domain(&host) {
+            // Already routing, so `active` with nothing left to publish —
+            // `liveAttachment()` on the Worker side.
+            Some(tenant) => ops_response(
+                StatusCode::OK,
+                "application/json",
+                serde_json::json!({
+                    "host": host,
+                    "tenant": tenant,
+                    "status": "active",
+                    "dnsRecords": [],
+                    "nextStep": format!("nothing to do: {host} is live and serving tenant '{tenant}'"),
+                    "provider": { "name": "static", "detail": null },
+                })
+                .to_string(),
+            ),
+            None => problem_response(RsError::not_found(format!("no domain '{host}'"))),
+        },
+        http::Method::PUT | http::Method::DELETE => problem_response(RsError::provider_unavailable(
+            format!(
+                "this host attaches domains through its configuration, not over HTTP: \
+                 edit `serverConfig.tenancy.domainMap` (or `mainDomain`) and restart to \
+                 attach '{host}'"
+            ),
+        )),
+        _ => ops_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain",
+            "GET, PUT, DELETE only\n".to_string(),
+        ),
+    }
+}
+
 async fn serve_request(
     runtime: Arc<Runtime>,
     admin_token: Option<Arc<str>>,
@@ -517,8 +621,15 @@ async fn serve_request(
             )
             .unwrap();
     }
-    // Node admin: reload infras without restarting (PRD §9.1). Operator-gated by
-    // the admin token; disabled (503) when no token is configured.
+    // Node admin: the domain read API (§B.5) and reloading infras without
+    // restarting (PRD §9.1). Operator-gated by the admin token; disabled
+    // (503) when no token is configured.
+    if path == "/admin/domains" || path.starts_with("/admin/domains/") {
+        if let Some(denied) = admin_gate(&req, admin_token.as_deref()) {
+            return denied;
+        }
+        return domains_endpoint(&runtime, &req, path);
+    }
     if path == "/admin/reload-infras" {
         if req.method() != http::Method::POST {
             return ops_response(
@@ -527,23 +638,8 @@ async fn serve_request(
                 "POST only\n".to_string(),
             );
         }
-        let Some(expected) = admin_token.as_deref() else {
-            return ops_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "text/plain",
-                "admin endpoint disabled: set RS2_ADMIN_TOKEN or serverConfig.adminToken\n"
-                    .to_string(),
-            );
-        };
-        match presented_admin_token(&req) {
-            Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => {}
-            _ => {
-                return ops_response(
-                    StatusCode::UNAUTHORIZED,
-                    "text/plain",
-                    "missing or invalid admin token\n".to_string(),
-                )
-            }
+        if let Some(denied) = admin_gate(&req, admin_token.as_deref()) {
+            return denied;
         }
         return match runtime.reload_infras().await {
             Ok(names) => ops_response(

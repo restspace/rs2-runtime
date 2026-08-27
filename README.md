@@ -114,7 +114,15 @@ cargo run -p rs2-server --features wasm,js -- serverConfig.json
 `serverConfig.json` sets the listener, tenancy mode, and data root — and,
 optionally, a `limits` block overriding any host limit under the name
 `/.well-known/rs2/services` reports it (`outboundCalls`, `maxDepth`,
-`wallClockServiceMs`, …; an unknown key fails startup). Tenant configs live
+`wallClockServiceMs`, …; an unknown key fails startup). In multi-tenant mode
+`tenancy.domainMap` attaches a hostname to a tenant and `tenancy.mainDomain`
+gives every tenant a `<tenant>.<mainDomain>` subdomain; both are read at
+startup, so attaching a domain here is an edit and a restart. `GET
+/admin/domains[/<host>]` (admin-token gated) reads that map back over HTTP —
+the write side answers 501 `provider_unavailable` and names the file, because
+attaching a domain on this host also means a certificate, which belongs to
+whatever terminates TLS in front of it. The Cloudflare host does attach
+domains over HTTP, behind a proof-of-control gate (`rs2-worker/README.md`). Tenant configs live
 in `tenants/<name>.json`, starting from the copy above. Your
 `tenants/main.json` is gitignored: once you enable auth it holds a real
 `auth.jwtSecret`, which does not belong in version control. Build with
