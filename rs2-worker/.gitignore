@@ -4,3 +4,5 @@ node_modules/
 *.log
 # Per-deployment `wrangler deploy --var` values (scripts/deploy.mjs).
 .deploy.vars.json
+# The tenant config `scripts/ui-fixture.mjs up` replaced, kept for `down`.
+.ui-fixture.backup.json

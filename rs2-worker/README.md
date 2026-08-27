@@ -138,6 +138,32 @@ a startup error.) Paid raises the subrequest cap to 1 000, where the
 default 64 needs no override. Put the var in `wrangler.jsonc` if you don't
 want to pass it on every deploy.
 
+## A tenant to point a UI at
+
+`scripts/ui-fixture.mjs` seeds a deployment (or a local `wrangler dev`) with
+something worth looking at in [rs2-ui](../../rs2-ui): file mounts (one open,
+one sign-in-only), a `data` mount with two schema'd datasets and records, a
+stored query, a pipeline spec, an empty template store, the log view, and a
+demo admin to sign in as.
+
+```sh
+RS2_BASE_URL=https://<worker>.workers.dev RS2_ADMIN_TOKEN=…   RS2_UI_ORIGIN=http://localhost:5173 npm run ui:up
+# …look at it…
+RS2_BASE_URL=… RS2_ADMIN_TOKEN=… npm run ui:down
+```
+
+`up` writes the tenant's existing config to `.ui-fixture.backup.json`
+(gitignored) before changing anything, and `down` deletes what it created and
+PUTs that config back. `RS2_UI_ORIGIN` adds an origin to `cors.allowedOrigins`
+so a UI served elsewhere can call the node directly — the UI authenticates
+with the bearer token from `/auth/login`, so no cross-site cookie is needed.
+Other knobs: `RS2_TENANT` (default `main`), `RS2_UI_EMAIL`/`RS2_UI_PASSWORD`
+(default `ui@demo.test` / `ui-demo-pw`).
+
+This is scaffolding for looking at things by hand, not a test fixture: the
+conformance suite provisions its own mounts and resets the tenant, so
+`deploy:verify` and `ui:up` on the same tenant will flatten each other.
+
 To hold a deployed instance to the contract, point the conformance runner at
 it (`conformance/http/README.md`):
 

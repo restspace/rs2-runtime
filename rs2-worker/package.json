@@ -8,6 +8,8 @@
     "dev": "wrangler dev",
     "deploy": "node scripts/deploy.mjs",
     "deploy:verify": "node scripts/deploy.mjs --verify",
+    "ui:up": "node scripts/ui-fixture.mjs up",
+    "ui:down": "node scripts/ui-fixture.mjs down",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build:shim": "node scripts/build-shim.mjs",
