@@ -306,7 +306,7 @@ A tenant with no scheduled mount has no alarm and costs nothing.
 | `InfraLoader` (`infras.json`) | `RegistryObject` KV `infras` | §B.5 |
 | `CatalogueClient` (`HttpCatalogueClient`) | `fetch()` bounded by `RS2_CATALOGUE_HOSTS` (var, comma list) | 64 MiB cap kept |
 | JS engine (`engines/js.rs`, prelude) | Dynamic Workers (`env.LOADER`) + guest shim | §E |
-| Resident adapters (`engines/resident.rs`: `code:` store/sms adapters) | **P4b: `capabilities/guest-stores.ts`** — `GuestDataStore`/`GuestQueryStore`/`GuestFileStore`/`GuestSmsGateway` over a Dynamic Worker per mount (id `<tenant>:<mount base>:adapter:<name>@<version>`), `env {RS2}` + the `EgressSockets` gateway; 501 `engine_unavailable` only when the deployment has no `worker_loaders` binding | pool knobs ignored (§A); sockets reconnect per invocation (§A); §I decisions 35–40 |
+| Resident adapters (`engines/resident.rs`: `code:` store/message adapters) | **P4b: `capabilities/guest-stores.ts`** — `GuestDataStore`/`GuestQueryStore`/`GuestFileStore`/`GuestMessageGateway` over a Dynamic Worker per mount (id `<tenant>:<mount base>:adapter:<name>@<version>`), `env {RS2}` + the `EgressSockets` gateway; 501 `engine_unavailable` only when the deployment has no `worker_loaders` binding | pool knobs ignored (§A); sockets reconnect per invocation (§A); §I decisions 35–40 |
 | `template` service (JS isolate, `deny_all`) | Dynamic Worker, `globalOutbound: null`, `env: {}` | §D |
 | Wasm engine (`engines/wasm.rs`) | **dropped** → 501 | declared (§A) |
 | `NativeEngine` | dropped (test-only reference binding) | — |
@@ -478,7 +478,7 @@ what is *easy to lose*.
 | `path_pattern.rs` | `runtime/path-pattern.ts` | port | Grammar verbatim (§ of the pipeline spec): `${url.path[a:b]}`, `?` elision pops a trailing `/`, `||` split at the **first** `||`, data-plane values: string raw, other JSON `JSON.stringify`, `null` → nothing. `validate` at spec-write time. |
 | `wrapper/mod.rs` | `runtime/wrapper.ts` | port | `LimitTable` defaults except `materializedBodyBytes = 32 MiB`. `CachePolicy.apply` exact strings (`public, max-age=N, immutable`, `private, no-cache`); `appendHeaderValue` dedupes case-insensitively. CORS: `EXPOSED_HEADERS` string verbatim; preflight echoes `Access-Control-Request-Headers` or the default list; `Access-Control-Max-Age: 86400`. `origin_matches` forms; same-origin compares the `Host` header. `check_access` fail-closed; `action_for`; role-spec tokens with `/`-pattern scoping and `{email}`/`{claim}` substitution (unresolved stays verbatim). Breaker: threshold 8 / window 10 s / cooldown 5 s, `retryAfterMs` = remaining. Limiter: fail fast. |
 | `runtime.rs` | `tenant-object.ts` (+ `runtime/dispatch.ts`) | port | §B.3 order. `RuntimeRequester` = recursive `handle`. `scheduler_loop` → alarms (§B.6). `purge_tenant` = drop the in-memory build. The boundary log body is `"<METHOD> <path> -> <status>"`. |
-| `tenant.rs` | `runtime/tenant-build.ts` | port | The service-name `match` is the registry of services; unknown → 400 with the exact wording. `check_elevate_not_operator`, `KNOWN_PATTERNS`, `resolve_secrets` (default-deny), `resolve_outbound_injectors` (`inject: "infra:x"` or inline with `secret:name` leaves, host-side only), `expand_store` (ignored unless `mount.service == kind`), `require_store_root` for `builtin:file`/`builtin:local`. `code:` store adapters and `sms` `code:` adapters → 501 `engine_unavailable` with the no-JS wording (P3/P4). `ServiceContext` fields are the grants: `log_store` only for `log`; `catalogue`/`builtin_adapters`/`infras` only for `services`; `sms` only for `sms`. |
+| `tenant.rs` | `runtime/tenant-build.ts` | port | The service-name `match` is the registry of services; unknown → 400 with the exact wording. `check_elevate_not_operator`, `KNOWN_PATTERNS`, `resolve_secrets` (default-deny), `resolve_outbound_injectors` (`inject: "infra:x"` or inline with `secret:name` leaves, host-side only), `expand_store` (ignored unless `mount.service == kind`), `require_store_root` for `builtin:file`/`builtin:local`. `code:` store adapters and `message` `code:` adapters → 501 `engine_unavailable` with the no-JS wording (P3/P4). `ServiceContext` fields are the grants: `log_store` only for `log`; `catalogue`/`builtin_adapters`/`infras` only for `services`; `messaging` only for `message`. A `message` mount takes either `store.adapter` or a per-channel `store.adapters` map (both ⇒ 400); a routed adapter that does not serve its channel is a build-time 400. |
 | `infra.rs` | `runtime/infra.ts` | port | `expand_infra` merge order (tenant minus `adapter` → reject `infraOnly` trespass → overlay infra config, infra wins → set `adapter` → check `requires`); 403 for `allowedTenants`. Source is the registry snapshot. |
 | `config_schema.rs` | `runtime/config-schema.ts` | port | The catalogue document (`{baseSchema, tenantSchema, services:[{name, description, configSchema}]}`) is JSON Schema **draft-07** derived from Rust types; the port ships the **same JSON as a checked-in fixture** generated by the Rust side (`cargo run -p rs2-cli -- catalogue-dump` — add in P1) so the two hosts cannot drift; `MountSpec` is strict (unknown keys 400), `AccessSpec` strict (`readRoles` 400). |
 | `capabilities/mod.rs` | `capabilities/types.ts`, `capabilities/prefixed.ts`, `capabilities/scoped.ts` | port | Trait shapes; `WritePrecondition`, `WriteOutcome`, `if_match_hits` (`W/` stripped, `*`), `DirEntry` serialization (`lastModified`/`contentType` omitted when absent), `list_records_fallback`, `sanitized_store_root` (rejects leading `/`,`\`, drive letter, `..`). |
@@ -518,7 +518,10 @@ what is *easy to lose*.
 | `services/template.rs` | `services/template.ts` | adapter | Envelope `{source, contentType}`; the compiled bundle runs as a Dynamic Worker (`LOADER.get("tpl:" + sha256(source)[0..16], …)`, `globalOutbound: null`, `env: {}`, `limits: {cpuMs: 1000}`), invoked with the resident envelope `{method:"POST", url:"/", body: props, mediaType:"application/json"}`; non-string body → 502; guest headers discarded. |
 | `services/auth.rs` | `services/auth.ts` | port | Settings merge (tenant `auth` + mount config minus `access`; empty `jwtSecret` → 400). JWT **HS512**, header bytes literally `{"alg":"HS512","typ":"JWT"}`, base64url no padding, claims `sub, roles (space string), kind, iat, exp, extra (omitted when empty)`, verify error wordings and order, no skew. Token from `Authorization: Bearer ` (case-sensitive prefix) else cookie `rs-auth`. Endpoints `POST login|refresh|logout`, `GET user`, else 404 wording. Cookie matrix (`SameSite=Strict` / `SameSite=None; Secure` for trusted origins / none otherwise), `logout` 204 with `Max-Age=0`. Lockout: 5 attempts / 10 min, map bound 10 000, DO memory. Login-origin allowlist. **Hashes** (`hash-wasm`): produce `argon2id({password, salt: 16 random bytes, parallelism: 1, iterations: 2, memorySize: 19456, hashLength: 32, outputType: "encoded"})` → `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`; verify with `argon2Verify({password, hash})` for `$argon2*` (parameters come from the hash — Rust `Argon2::default()` verifies any PHC params), `bcryptVerify` for `$2*`, else false. Cross-host test: a hash minted by each host verifies on the other (P3 acceptance). |
 | `services/proxy.rs` | `services/proxy.ts` | port | `target` required; strip `host, authorization, cookie, connection, transfer-encoding, proxy-authorization`; injector under key `proxy`; no allowlist. |
-| `services/sms.rs` | `services/sms.ts` | port | Routes and wordings; `code:` provider adapters run via `GuestSmsGateway` (P4b); `builtin:` stays a 400 (no first-party providers), no embedder default on this host. |
+| `services/message.rs` | `services/message.ts` | port | Routes and wordings: `POST /send {channel, to, …}` → 201 `{id?, channel, provider}`, `GET /status/{id}` → provider JSON or **501 `provider_unavailable`** when `deliveryStatus()` is false, `GET /channels` → `{channels, deliveryStatus, provider}`. An unserved channel is a 400 naming the configured ones, before the adapter is called. |
+| `capabilities/message.rs` | `capabilities/message.ts` | port | `Outbound` is channel-tagged (a Rust enum, a TS discriminated union) so email-only fields cannot ride on an SMS; `Receipt.id` is optional because Cloudflare's REST send mints none. The parse 400s are byte-for-byte shared — the conformance suite reads them from both hosts. `RoutingGateway` composes per-channel adapters; `MAX_RECIPIENTS` is 50. |
+| `adapters/cf_email.rs` | `capabilities/cf-email.ts` | port | `builtin:cf-email`, Cloudflare Email Service **REST API** (`POST /accounts/{id}/email/sending/send`), not the Workers `send_email` binding — the binding fixes its senders in `wrangler.jsonc` at deploy time and does not exist on the Rust host. Reports delivery in the send response, so `deliveryStatus()` is false and no id is minted. |
+| `adapters/aws_sns.rs` | `capabilities/aws-sns.ts` | port | `builtin:aws-sns`, Query API `Action=Publish` signed with the existing `awsSigV4` strategy. Mints an id but has no per-message status API, so `deliveryStatus()` is false for the opposite reason. XML scanned for `<MessageId>` / `<Code>` / `<Message>`, not parsed. |
 | `services/wrapper_service.rs` | `services/wrapper-service.ts` | port | Inline spec, `inputSchema` enforced on PUT/POST/PATCH (422 `errors: [{path, message}]`), `outputSchema` compile-only, `rest` byte-exact. |
 | `services/services_config.rs` | `services/services-config.ts` | port | Every endpoint in the Rust table: `catalogue`, `catalogues`, `catalogue/available`, `catalogue/install` (hash pin, compile check via the Dynamic Worker loader's `get` with a throwaway id → `validated`), `services`, `infras`, `raw` GET/PUT (`<secret>` masking/restore, **409** on `If-Match`), the `/code/` subtree (content-addressed `version_of` = sha256[0..8] hex; POST keyless 201 `{name, version, ref, validated}` + `Location`; PUT must match the hash else 409; `mountedAt`; DELETE refuses mounted versions; `X-RS2-Manifest` sidecar; `Cache-Control: private, max-age=31536000, immutable` + `ETag: "<version>"` on reads). |
 | `services/catalogue.rs` | `services/catalogue.ts` | port | `CatalogueItem` fields; host allowlist checked before I/O (400 no host / 403 `capability_denied` `catalogue fetch to '<host>'`); 502 `Catalogue Fetch Failed`; 64 MiB cap. |
@@ -777,6 +780,7 @@ directories with `?confirm`).
 | `discovery-limits.test.ts` | new | the `limits` object exists and `host` names the expected kind |
 | `catalogue.test.ts` | `catalogue.rs` | only the dormant path (`enabled:false`, install → 501) unless `RS2_CATALOGUE_URL` points at a fixture server the runner starts (`fixtures/catalogue-server.mjs`) and the host was started with that host allowlisted |
 | `guest-adapter.test.ts` | `guest_adapter.rs` (HTTP-visible subset, P4b) | guest (`code:`) store adapters over in-process mock Redis (RESP) + Mongo (OP_MSG/BSON) TCP backends the suite starts itself: data/file store contract, schema facet, missing-bundle 404 wording, socket denial identity, stored query over Redis, Mongo data + aggregation adapters, listing fallback vs native pushdown + catalogue `listProjection`, int64/date/ObjectId wire round-trips, the pooling observation (`guestAdapterPooling` divergence). Pool growth / idle eviction stay Rust-only in-process tests |
+| `messaging.test.ts` | `message_gateway.rs` (the no-send subset) | the `message` surface as far as it can be settled **without sending**: `GET /channels` per adapter and for a routing mount, the `channels` discovery facet, every parse/route 400 wording, the 501 `provider_unavailable` when a provider has no per-message status, the build-time config 400s (`adapter` + `adapters` together, an adapter routed at a channel it does not serve, no adapter at all, an unknown `builtin:`), and the two first-party providers in `/services/catalogue/available`. Provider wire shapes (Cloudflare's JSON body, SNS's signed form post) stay in each host's unit tests against stubs — a conformance run must not send real mail or real SMS, and a mock provider reachable from both hosts would only be testing the mock |
 
 Allowed divergences are a single table in `src/divergences.ts` keyed by
 `RS2_HOST_KIND`; today it has three entries (absent-directory DELETE
@@ -852,7 +856,7 @@ rs2-worker/
                           reference-query-store sqlite-idempotency sqlite-log-store
                           fetch-http-out credential builtin-registry
     services/             context file data spec-store pipeline-service query
-                          query-template template auth proxy sms wrapper-service
+                          query-template template auth proxy message wrapper-service
                           services-config catalogue code log-reader
     pipeline/             spec dsl condition transform response segments executor
     engines/              dynamic-worker.ts host-api.ts guest-shim.js guest-globals.js
@@ -897,7 +901,7 @@ ported from the Rust `#[cfg(test)]` modules.
 remains a follow-up — the HTTP surface it uses is conformance-covered).
 `auth` (hash-wasm; cross-host hash fixture), `query` + `query-template` +
 `reference-query-store`, `pipeline` (all of `pipeline/*`, jsonata), `wrapper`,
-`proxy`, `sms` (routes; adapters 400/501), `log` reader, `catalogue`,
+`proxy`, `message` (routes + both first-party providers), `log` reader, `catalogue`,
 `template` (Dynamic Worker, `globalOutbound: null`), scheduler alarms + cron
 fan-out, `infra` expansion via the registry. Accept: the whole suite green on
 both hosts except `code.test.ts`; `rs2-ui` built with `VITE_BASE_PATH=/admin`
@@ -919,7 +923,7 @@ empty or documented.
 `capabilities/guest-stores.ts` (the `resident.rs` port), the
 `invokeAdapter`/`adapterFeatures` engine path, the `EgressSockets`
 gateway with the §E.4 connect hook, the `features` RPC on `Rs2Guest`, and
-the `tenant-build.ts` wiring for `code:` data/file/query/sms adapters
+the `tenant-build.ts` wiring for `code:` data/file/query/message adapters
 (and `code:` spec-store backends). Proof: `conformance/http/
 guest-adapter.test.ts` (14 tests — the HTTP-observable scenarios of
 `rs2-core/tests/guest_adapter.rs` over in-process mock Redis/Mongo TCP
@@ -991,9 +995,9 @@ Accept: a 10 000-object mount copies across two `wrangler dev` tenants with
 11. **Egress gateway runs in the Worker isolate and defers to the DO** for
     grant decisions; sockets are enforced in the gateway's `connect()`.
 12. **Guest `ctx.state` is durable** (DO KV) rather than per-instance memory.
-13. **Resident (`code:`) store/sms adapters shipped in P4b** (revised —
+13. **Resident (`code:`) store/message adapters shipped in P4b** (revised —
     they were 501 until then): a `store.adapter` of `code:<name>@<version>`
-    on a data/file/query/sms mount (and on a `specStore` block) is backed
+    on a data/file/query/message mount (and on a `specStore` block) is backed
     by the deployed bundle via `capabilities/guest-stores.ts`; the 501
     `engine_unavailable` (unchanged wording) remains only when the
     deployment has no `worker_loaders` binding. `builtin:mem` is
@@ -1260,3 +1264,35 @@ Decisions 35–40 were made during the P4b build:
     change — mutable tenancy plus inbound TLS it does not own — and this
     leaves the door open for it: `ManualProvider` is exactly what it would
     use.
+46. **A provider capability written against one provider is not a capability.**
+    Outbound messaging replaced the `sms` service and `SmsGateway` with a
+    `message` service over a `MessageGateway` covering email and SMS at one
+    mount. The old surface had no users, so it was removed rather than
+    aliased. Building **two** adapters before freezing the trait — Cloudflare
+    Email Service and AWS SNS — falsified two assumptions that a single
+    provider would have baked in permanently:
+    - **`status` is not universal.** SNS has no per-message status API (it
+      needs CloudWatch delivery logging, which is not a lookup); Cloudflare's
+      REST send answers per-recipient *at send time*. So `delivery_status()`
+      is a declared facet — the `listing_pushdown` pattern — and the service
+      turns "no" into a 501 `provider_unavailable` naming the provider,
+      rather than every caller discovering the gap by trying.
+    - **A message id is not universal either.** SNS mints one; the Cloudflare
+      REST send mints none, because it already reported what happened.
+      `Receipt.id` is therefore optional, with the provider's own answer
+      passed through in `detail`. Together `id` and `delivery_status()` let a
+      caller tell which of the three provider shapes it is talking to without
+      knowing the provider.
+    The payload took the same lesson structurally: `Outbound` is
+    channel-tagged (a Rust enum, a TS discriminated union), so `subject` on an
+    SMS is not representable — one bag of optionals would have made every
+    adapter re-validate the same invariants. One mount serves both channels
+    through `store.adapters` (`channel → adapter`) composed behind a
+    `RoutingGateway`; routing an adapter at a channel it does not serve is a
+    build-time 400, not a first-send surprise. Both adapters call their
+    provider through the host's `HttpOut`, so provider traffic crosses the one
+    audited egress choke point, and both take credentials from operator infra
+    (`cf-email` a bearer token, `aws-sns` the existing vector-tested
+    `awsSigV4` strategy — no new cryptography). The rule for the next domain:
+    **write the second adapter before freezing the trait, and prefer a
+    declared facet to a method every provider has to fake.**

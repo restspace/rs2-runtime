@@ -16,6 +16,7 @@ export const codes = {
   CAPABILITY_DENIED: "capability_denied",
   CONTRACT_VIOLATION: "contract_violation",
   ENGINE_UNAVAILABLE: "engine_unavailable",
+  PROVIDER_UNAVAILABLE: "provider_unavailable",
   PATH_UNSAFE: "path_unsafe",
   INTERNAL: "internal",
 } as const;
@@ -100,6 +101,9 @@ export class RsError extends Error {
   }
   static engineUnavailable(detail: string): RsError {
     return new RsError(501, codes.ENGINE_UNAVAILABLE, "Engine Unavailable", detail);
+  }
+  static providerUnavailable(detail: string): RsError {
+    return new RsError(501, codes.PROVIDER_UNAVAILABLE, "Provider Unavailable", detail);
   }
   static internal(detail: string): RsError {
     return new RsError(500, codes.INTERNAL, "Internal Error", detail);

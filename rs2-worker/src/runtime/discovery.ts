@@ -216,6 +216,14 @@ export function patternOf(mount: Mount): [string, string[]] {
       pattern = "view";
       facets = ["url-params", "time-range", "trace-scoped"];
       break;
+    // `channels`: `GET /<mount>/channels` answers which channels this mount
+    // actually sends on and whether delivery status can be asked for. That set
+    // comes from the built adapters, not from config, so it is published there
+    // rather than guessed here.
+    case "message":
+      pattern = "api";
+      facets = ["channels"];
+      break;
     default:
       pattern = "api";
       // Every `code:` mount declares the Worker-only guest contract

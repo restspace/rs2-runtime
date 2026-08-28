@@ -9,12 +9,16 @@ import {
   GuestDataStore,
   GuestFileStore,
   GuestQueryStore,
-  GuestSmsGateway,
+  GuestMessageGateway,
 } from "../capabilities/guest-stores";
 import type { GuestAdapterWiring } from "../capabilities/guest-stores";
 import { PrefixedFileStore } from "../capabilities/prefixed";
 import { ReferenceQueryStore } from "../capabilities/reference-query-store";
-import { ScopedDataStore, ScopedFileStore, ScopedQueryStore, ScopedSmsGateway } from "../capabilities/scoped";
+import { ScopedDataStore, ScopedFileStore, ScopedMessageGateway, ScopedQueryStore } from "../capabilities/scoped";
+import { AwsSnsGateway } from "../capabilities/aws-sns";
+import { CfEmailGateway } from "../capabilities/cf-email";
+import { CHANNELS, RoutingGateway, parseChannel } from "../capabilities/message";
+import type { Channel, MessageGateway } from "../capabilities/message";
 import type { DataStore, FileStore, HttpOut, QueryStore } from "../capabilities/types";
 import { requireStoreRoot, sanitizedStoreRoot } from "../capabilities/types";
 import { AuthService } from "../services/auth";
@@ -39,7 +43,7 @@ import type { SpecValidator } from "../services/spec-store";
 import { PipelineService } from "../services/pipeline-service";
 import { QueryService } from "../services/query";
 import { ProxyService } from "../services/proxy";
-import { SmsService } from "../services/sms";
+import { MessageService } from "../services/message";
 import { TemplateService } from "../services/template";
 import { WrapperService } from "../services/wrapper-service";
 import { cpuMsFromConfig } from "../engines/dynamic-worker";
@@ -90,6 +94,9 @@ export function seedBuiltins(
   // `reference` rebuilds the scanning query adapter over the default data store.
   const refQuery = queryFactory ?? ((data: DataStore) => new ReferenceQueryStore(data));
   builtins.registerQuery("reference", () => refQuery(dataFactory("")));
+  // First-party provider adapters (the `message` capability).
+  builtins.registerMessage("cf-email", (cfg, http) => CfEmailGateway.fromConfig(cfg, http));
+  builtins.registerMessage("aws-sns", (cfg, http) => AwsSnsGateway.fromConfig(cfg, http));
   return builtins;
 }
 
@@ -357,27 +364,109 @@ function queryCapability(
   }
 }
 
-function smsCapability(
+/// Resolve a `message` mount's gateway. Only the `message` service gets it
+/// (every other mount sees `undefined`).
+///
+/// Two config shapes, because one mount often needs two providers:
+///
+/// - `store.adapter` — a single adapter serving whatever channels it declares.
+/// - `store.adapters` — a `channel -> store block` map; each entry resolves
+///   exactly like a single `store` (so `infra:` and `code:` work per channel)
+///   and the results compose behind a `RoutingGateway`. A bare string is
+///   shorthand for `{"adapter": "<string>"}`.
+///
+/// There is no node default provider: reaching one needs credentials nobody
+/// can guess, so an adapterless mount is a config 400.
+function messageCapability(
   mount: Mount,
   adapters: Adapters,
   name: string,
   infras: InfraSet,
   limits: InvocationLimits,
-): ScopedSmsGateway | undefined {
-  if (mount.service !== "sms") return undefined;
-  const [kind, store] = expandStore(mount, "sms", name, infras);
+): ScopedMessageGateway | undefined {
+  if (mount.service !== "message") return undefined;
+  const raw = mount.config.store ?? {};
+  const rawObj = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+
+  // The per-channel map wins when present; a mount that sets both is a config
+  // error rather than a silent precedence rule.
+  const map = rawObj.adapters;
+  if (map !== undefined && map !== null) {
+    if (rawObj.adapter !== undefined) {
+      throw RsError.badRequest("a message mount sets either store.adapter or store.adapters, not both");
+    }
+    if (typeof map !== "object" || Array.isArray(map)) {
+      throw RsError.badRequest("store.adapters must be an object of channel -> adapter");
+    }
+    const entries = Object.entries(map);
+    if (entries.length === 0) {
+      throw RsError.badRequest("store.adapters is empty — name at least one channel");
+    }
+    const routes: Array<[Channel, MessageGateway]> = [];
+    for (const [channelName, entry] of entries) {
+      const channel = parseChannel(channelName);
+      if (!channel) {
+        throw RsError.badRequest(
+          `unknown channel '${channelName}' in store.adapters (one of: ${CHANNELS.join(", ")})`,
+        );
+      }
+      // A bare string is shorthand for a one-key store block.
+      const block: Json = typeof entry === "string" ? { adapter: entry } : entry;
+      const expanded = expandInfra(block, infras, name);
+      const gateway = buildMessageBackend(classifyStore(expanded), expanded, adapters, mount, name, limits);
+      // An adapter routed for a channel it does not serve is a config error,
+      // not a runtime 400 on the first send.
+      if (!gateway.channels().includes(channel)) {
+        throw RsError.badRequest(
+          `adapter '${gateway.provider()}' is routed for the '${channel}' channel but serves: ${gateway
+            .channels()
+            .join(", ")}`,
+        );
+      }
+      routes.push([channel, gateway]);
+    }
+    return new ScopedMessageGateway(new RoutingGateway(routes), name);
+  }
+
+  const expanded = expandInfra(raw, infras, name);
+  const kind = classifyStore(expanded);
+  if (kind.kind === "default") {
+    throw RsError.badRequest(
+      "message mount requires a store.adapter ('builtin:<name>', 'code:<name>@<version>' or 'infra:<name>') or a per-channel store.adapters map",
+    );
+  }
+  return new ScopedMessageGateway(buildMessageBackend(kind, expanded, adapters, mount, name, limits), name);
+}
+
+/// Build one un-scoped provider adapter from an (already infra-expanded) store
+/// block. Shared by the single-adapter and per-channel paths so both accept
+/// exactly the same forms.
+function buildMessageBackend(
+  kind: StoreKind,
+  store: Json,
+  adapters: Adapters,
+  mount: Mount,
+  name: string,
+  limits: InvocationLimits,
+): MessageGateway {
+  const storeObj = store && typeof store === "object" && !Array.isArray(store) ? store : {};
   switch (kind.kind) {
     case "default":
-      throw RsError.badRequest("sms mount requires a store.adapter ('code:<name>@<version>' or 'infra:<name>')");
-    case "builtin":
-      throw RsError.badRequest(
-        `sms store adapter 'builtin:${kind.name}' is unknown (no first-party SMS providers ship yet; use a 'code:<name>@<version>' adapter)`,
-      );
-    case "code": {
-      const storeObj = store && typeof store === "object" && !Array.isArray(store) ? store : {};
-      const guest = GuestSmsGateway.fromConfig(kind.ref, storeObj, guestWiring("sms", mount, kind.ref, adapters, name, limits));
-      return new ScopedSmsGateway(guest, name);
+      throw RsError.badRequest("each store.adapters entry needs an 'adapter'");
+    case "builtin": {
+      // Provider adapters reach the network, so they are handed the node's
+      // outbound HTTP capability rather than opening their own client — every
+      // provider call crosses the one audited egress choke point.
+      const built = adapters.builtins.buildMessage(kind.name, storeObj, adapters.http);
+      if (!built) throw unknownBuiltin("message", kind.name, adapters.builtins.messageNames());
+      return built;
     }
+    case "code":
+      return GuestMessageGateway.fromConfig(
+        kind.ref,
+        storeObj,
+        guestWiring("message", mount, kind.ref, adapters, name, limits),
+      );
   }
 }
 
@@ -497,8 +586,8 @@ export function buildTenant(
       case "log":
         service = new LogReaderService();
         break;
-      case "sms":
-        service = new SmsService();
+      case "message":
+        service = new MessageService();
         break;
       case "proxy":
         service = new ProxyService();
@@ -517,7 +606,7 @@ export function buildTenant(
     const files = fileCapability(mount, adapters, name, infras, invLimits);
     const data = dataCapability(mount, adapters, name, infras, invLimits);
     const query = queryCapability(mount, adapters, name, infras, invLimits);
-    const sms = smsCapability(mount, adapters, name, infras, invLimits);
+    const messaging = messageCapability(mount, adapters, name, infras, invLimits);
     const mountSecrets = resolveSecrets(mount.config, config.secrets);
     const outboundInjectors = resolveOutboundInjectors(mount, infras, name, mountSecrets);
 
@@ -526,7 +615,7 @@ export function buildTenant(
       files,
       data,
       query,
-      sms,
+      messaging,
       http: adapters.http,
       cachePolicy: CachePolicy.fromConfig(mount.config.caching),
       cacheOpenlyReadable: CachePolicy.mountIsOpenlyReadable(mount.config),

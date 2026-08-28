@@ -11,7 +11,7 @@ import {
   GuestDataStore,
   GuestFileStore,
   GuestQueryStore,
-  GuestSmsGateway,
+  GuestMessageGateway,
   ResidentAdapter,
   queryEncode,
   scalarQuote,
@@ -175,7 +175,7 @@ describe("GuestDataStore mapping (resident.rs parity)", () => {
   });
 });
 
-describe("GuestQueryStore + GuestSmsGateway mapping", () => {
+describe("GuestQueryStore + GuestMessageGateway mapping", () => {
   it("runQuery ships {query, params, take, skip} to POST /query", async () => {
     const fake = new FakeCaller();
     const store = new GuestQueryStore(fake);
@@ -213,21 +213,43 @@ describe("GuestQueryStore + GuestSmsGateway mapping", () => {
     }
   });
 
-  it("sms maps send/status and requires a string id", async () => {
+  it("message maps send/status, tags the channel, and requires a string id", async () => {
     const fake = new FakeCaller();
-    const sms = new GuestSmsGateway(fake);
+    const gw = new GuestMessageGateway(fake, "code:texter@v1", ["sms"], true);
     fake.reply = [200, { id: "m1" }];
-    expect(await sms.send("t", "+1555", "hi")).toBe("m1");
-    expect(fake.last()).toEqual({ method: "POST", path: "/send", body: { to: "+1555", body: "hi" } });
+    // The guest sees the same channel-tagged envelope an HTTP caller sends.
+    expect(await gw.send("t", { channel: "sms", to: "+1555", text: "hi" })).toEqual({
+      id: "m1",
+      channel: "sms",
+      provider: "code:texter@v1",
+    });
+    expect(fake.last()).toEqual({
+      method: "POST",
+      path: "/send",
+      body: { channel: "sms", to: "+1555", text: "hi" },
+    });
     fake.reply = [200, { status: "sent" }];
-    expect(await sms.status("t", "m1")).toEqual({ status: "sent" });
+    expect(await gw.status("t", "m1")).toEqual({ status: "sent" });
     expect(fake.last()).toEqual({ method: "GET", path: "/status/m1", body: undefined });
     fake.reply = [200, {}];
-    const err = await sms.send("t", "x", "y").then(
+    const err = await gw.send("t", { channel: "sms", to: "x", text: "y" }).then(
       () => undefined,
       (e: unknown) => e,
     );
-    expect((err as RsError).detail).toBe("sms adapter response missing string 'id'");
+    expect((err as RsError).detail).toBe("message adapter response missing string 'id'");
+  });
+
+  it("a guest adapter declares its channels in config, not by feature probe", () => {
+    const fake = new FakeCaller();
+    const gw = GuestMessageGateway.fromConfig("code:mailer@v1", { channels: ["email"], deliveryStatus: false }, {
+      // fromConfig only reads the config; the wiring is never touched here.
+    } as never);
+    expect(gw.channels()).toEqual(["email"]);
+    expect(gw.deliveryStatus()).toBe(false);
+    // Default: every known channel, status reported.
+    const all = new GuestMessageGateway(fake, "code:x@v1", ["email", "sms"], true);
+    expect(all.channels()).toEqual(["email", "sms"]);
+    expect(all.deliveryStatus()).toBe(true);
   });
 });
 

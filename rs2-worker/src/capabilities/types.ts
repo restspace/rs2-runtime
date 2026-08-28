@@ -181,12 +181,6 @@ export interface HttpOut {
   request(msg: Message): Promise<Message>;
 }
 
-/// Outbound SMS behind a swappable provider adapter.
-export interface SmsGateway {
-  send(tenant: string, to: string, body: string): Promise<string>;
-  status(tenant: string, id: string): Promise<Json>;
-}
-
 /// Parameterized queries against a backing store (PRD §10.4).
 export interface QueryStore {
   runQuery(tenant: string, query: Json, params: JsonObject, take: number, skip: number): Promise<[Json[], number]>;

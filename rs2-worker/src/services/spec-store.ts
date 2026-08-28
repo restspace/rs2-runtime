@@ -60,7 +60,7 @@ export class SpecStore {
       files: new ScopedFileStore(prefixed, tenant),
       data: undefined,
       query: undefined,
-      sms: undefined,
+      messaging: undefined,
       http: undefined,
       cachePolicy: new CachePolicy(),
       cacheOpenlyReadable: true,

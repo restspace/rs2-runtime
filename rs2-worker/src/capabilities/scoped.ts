@@ -5,6 +5,7 @@
 import type { Body } from "../runtime/body";
 import type { Json, JsonObject } from "../runtime/error";
 import type { ListSpec } from "../runtime/listing";
+import type { Channel, MessageGateway, Outbound, Receipt } from "./message";
 import { PrefixedFileStore } from "./prefixed";
 import type {
   ByteRange,
@@ -13,7 +14,6 @@ import type {
   FileMeta,
   FileStore,
   QueryStore,
-  SmsGateway,
   WriteOutcome,
   WritePrecondition,
 } from "./types";
@@ -122,16 +122,25 @@ export class ScopedQueryStore {
   }
 }
 
-export class ScopedSmsGateway {
+export class ScopedMessageGateway {
   constructor(
-    private readonly inner: SmsGateway,
+    private readonly inner: MessageGateway,
     private readonly tenant: string,
   ) {}
 
-  send(to: string, body: string): Promise<string> {
-    return this.inner.send(this.tenant, to, body);
+  send(out: Outbound): Promise<Receipt> {
+    return this.inner.send(this.tenant, out);
   }
   status(id: string): Promise<Json> {
     return this.inner.status(this.tenant, id);
+  }
+  channels(): Channel[] {
+    return this.inner.channels();
+  }
+  deliveryStatus(): boolean {
+    return this.inner.deliveryStatus();
+  }
+  provider(): string {
+    return this.inner.provider();
   }
 }

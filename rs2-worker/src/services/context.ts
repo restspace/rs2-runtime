@@ -3,7 +3,7 @@
 // `rs2-core/src/services/mod.rs`.
 
 import type { CredentialInjector } from "../capabilities/credential";
-import type { ScopedDataStore, ScopedFileStore, ScopedQueryStore, ScopedSmsGateway } from "../capabilities/scoped";
+import type { ScopedDataStore, ScopedFileStore, ScopedMessageGateway, ScopedQueryStore } from "../capabilities/scoped";
 import type { HttpOut, WritePrecondition } from "../capabilities/types";
 import type { JsonObject } from "../runtime/error";
 import type { InfraSet } from "../runtime/infra";
@@ -34,7 +34,7 @@ export interface ServiceContext {
   files: ScopedFileStore | undefined;
   data: ScopedDataStore | undefined;
   query: ScopedQueryStore | undefined;
-  sms: ScopedSmsGateway | undefined;
+  messaging: ScopedMessageGateway | undefined;
   http: HttpOut | undefined;
   cachePolicy: CachePolicy;
   cacheOpenlyReadable: boolean;

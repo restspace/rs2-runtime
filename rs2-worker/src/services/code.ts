@@ -231,7 +231,7 @@ function storeGrantTarget(capability: string, grant: Json, ctx: ServiceContext):
     files: scoped,
     data: undefined,
     query: undefined,
-    sms: undefined,
+    messaging: undefined,
     http: undefined,
     cachePolicy: new CachePolicy(),
     cacheOpenlyReadable: true,

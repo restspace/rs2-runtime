@@ -200,20 +200,41 @@ strategy whose `secret:<name>` leaves draw on granted tenant secrets — into
 `GET /services/raw` or guest `ctx`) and `tests/proxy.rs`. SigV4 golden vector in
 `adapters/credential.rs`.
 
-**Typed swappable provider capability (`SmsGateway`) — DONE (reference domain).**
+**Typed swappable provider capability (`MessageGateway`) — DONE (reference domain).**
 The chosen model for "switch one external provider for another" is a typed Rust
 trait per *domain* (the `QueryStore` precedent: one trait, many providers), with
 dual impls — a Rust `builtin:`/embedder default and a loadable `code:` guest over
 the resident substrate — so a new *provider* needs no recompile, only a new
-*domain* touches the host. SMS is the shipped reference: `SmsGateway` +
-`ScopedSmsGateway` (`capabilities/mod.rs`), `GuestSmsGateway` mapping
-`send`/`status` to `POST /send` / `GET /status/{id}` envelopes (`resident.rs`),
-`sms_capability` wiring (`tenant.rs`, mirrors `data_capability`; `code:`/`infra:`
-only — no first-party builtins ship yet), and a stock `sms` service
-(`services/sms.rs`). Proof: `tests/sms_gateway.rs`. A `proxy` service
-(`services/proxy.rs`) packages the forward-with-auth case as a no-code mount.
-Follow-on domains (`EmailGateway`, `SignerGateway`/KMS, an LLM trait — deferred
-as its surface is leaky/fast-moving) repeat the same six seams.
+*domain* touches the host. Outbound messaging is the shipped reference:
+`MessageGateway` + `ScopedMessageGateway` (`capabilities/message.rs`),
+`GuestMessageGateway` mapping `send`/`status` to `POST /send` /
+`GET /status/{id}` envelopes (`resident.rs`), `message_capability` wiring
+(`tenant.rs`, mirrors `data_capability`), two first-party builtins
+(`adapters/cf_email.rs`, `adapters/aws_sns.rs`) and a stock `message` service
+(`services/message.rs`). Proof: `tests/message_gateway.rs`,
+`conformance/http/messaging.test.ts`. A `proxy` service (`services/proxy.rs`)
+packages the forward-with-auth case as a no-code mount. Follow-on domains
+(`SignerGateway`/KMS, an LLM trait — deferred as its surface is leaky and
+fast-moving) repeat the same six seams.
+
+**What building two providers at once taught the trait.** A domain trait written
+against one provider encodes that provider's accidents. Both of these are real
+and were found by writing the second adapter, not by design:
+
+- **Delivery status is not universal.** AWS SNS has no per-message status API
+  (it needs CloudWatch delivery logging); Cloudflare's REST send answers
+  per-recipient *at send time*. So `status` sits behind a declared
+  `delivery_status()` facet — the `listing_pushdown` pattern — and the service
+  turns "no" into a 501 naming the provider, rather than every caller
+  discovering it by trying.
+- **A message id is not universal either.** SNS mints one; the Cloudflare REST
+  send mints none, because it already told you what happened. `Receipt.id` is
+  therefore optional, with the provider's own answer passed through in `detail`.
+  Between `id` and `delivery_status()` a caller can tell which of the three
+  provider shapes it is talking to.
+
+The corollary for the next domain: build the second adapter *before* freezing
+the trait, and prefer a declared facet to a method every provider must fake.
 
 **Native listing pushdown — DONE.** The projected-listing contract
 (`rs2-core/src/listing.rs`, G-series `$select`/`$sort`) reaches guest adapters

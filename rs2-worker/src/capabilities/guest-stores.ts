@@ -2,7 +2,7 @@
 // bundle backs a mount's persistence, run as a Dynamic Worker under the
 // guest shim and speaking the **store pattern** over HTTP-shaped messages.
 // Port of `rs2-core/src/engines/resident.rs`: `GuestDataStore`,
-// `GuestQueryStore`, `GuestFileStore` (and `GuestSmsGateway`) map their
+// `GuestQueryStore`, `GuestFileStore` (and `GuestMessageGateway`) map their
 // capability interface onto `{method, url, body?, mediaType?}` requests
 // dispatched with the mount's `store` config block as the guest config,
 // and map non-2xx responses back to the same `RsError` a built-in store
@@ -26,6 +26,8 @@ import { socketAllowlistFromConfig } from "../engines/dynamic-worker";
 import type { DynamicWorkerEngine } from "../engines/dynamic-worker";
 import { codePathJs } from "../services/code";
 import type { ScopedFileStore } from "./scoped";
+import { CHANNELS, outboundJson, parseChannel } from "./message";
+import type { Channel, MessageGateway, Outbound, Receipt } from "./message";
 import {
   currentEtagFromRead,
   deleteCondDefault,
@@ -39,7 +41,6 @@ import type {
   FileMeta,
   FileStore,
   QueryStore,
-  SmsGateway,
   WriteOutcome,
   WritePrecondition,
 } from "./types";
@@ -546,26 +547,69 @@ export class GuestFileStore implements FileStore {
   }
 }
 
-/// An [`SmsGateway`] backed by a guest adapter: `send`/`status` map to
-/// `POST /send` / `GET /status/{id}` envelopes (Rust `GuestSmsGateway`).
-export class GuestSmsGateway implements SmsGateway {
-  constructor(private readonly inner: AdapterCaller) {}
+/// A `MessageGateway` backed by a guest adapter: `send`/`status` map to
+/// `POST /send` / `GET /status/{id}` envelopes (Rust `GuestMessageGateway`).
+///
+/// The served channels come from the adapter's config, not from the bundle's
+/// `features` export: a feature flag reads false until the lazy first spawn,
+/// which is harmless for a fallback like `list-records` but would make every
+/// send fail the channel check before the adapter had ever run.
+export class GuestMessageGateway implements MessageGateway {
+  constructor(
+    private readonly inner: AdapterCaller,
+    private readonly adapterRef: string,
+    private readonly served: Channel[],
+    private readonly reportsStatus: boolean,
+  ) {}
 
-  static fromConfig(adapterRef: string, storeConfig: JsonObject, wiring: GuestAdapterWiring): GuestSmsGateway {
-    return new GuestSmsGateway(new ResidentAdapter("sms", adapterRef, storeConfig, wiring));
+  static fromConfig(adapterRef: string, storeConfig: JsonObject, wiring: GuestAdapterWiring): GuestMessageGateway {
+    const raw = storeConfig.channels;
+    let served: Channel[];
+    if (raw === undefined || raw === null) served = [...CHANNELS];
+    else if (Array.isArray(raw)) {
+      served = raw.map((v) => {
+        const c = typeof v === "string" ? parseChannel(v) : undefined;
+        if (!c) throw RsError.badRequest(`message adapter 'channels' entry ${JSON.stringify(v)} is not a known channel`);
+        return c;
+      });
+    } else {
+      throw RsError.badRequest("message adapter 'channels' must be an array of channel names");
+    }
+    if (served.length === 0) {
+      throw RsError.badRequest("message adapter 'channels' must name at least one channel");
+    }
+    const reportsStatus = typeof storeConfig.deliveryStatus === "boolean" ? storeConfig.deliveryStatus : true;
+    return new GuestMessageGateway(
+      new ResidentAdapter("message", adapterRef, storeConfig, wiring),
+      adapterRef,
+      served,
+      reportsStatus,
+    );
   }
 
-  async send(_tenant: string, to: string, body: string): Promise<string> {
-    const [status, resp] = await this.inner.call("POST", "/send", { to, body });
+  async send(_tenant: string, out: Outbound): Promise<Receipt> {
+    const [status, resp] = await this.inner.call("POST", "/send", outboundJson(out));
     if (!ok(status)) throw storeError(status, resp);
     const id = resp && typeof resp === "object" && !Array.isArray(resp) ? resp.id : undefined;
-    if (typeof id !== "string") throw RsError.contractViolation("sms adapter response missing string 'id'");
-    return id;
+    if (typeof id !== "string") throw RsError.contractViolation("message adapter response missing string 'id'");
+    return { id, channel: out.channel, provider: this.adapterRef };
   }
 
   async status(_tenant: string, id: string): Promise<Json> {
     const [status, resp] = await this.inner.call("GET", `/status/${id}`);
     if (ok(status)) return resp;
     throw storeError(status, resp);
+  }
+
+  channels(): Channel[] {
+    return [...this.served];
+  }
+
+  deliveryStatus(): boolean {
+    return this.reportsStatus;
+  }
+
+  provider(): string {
+    return this.adapterRef;
   }
 }

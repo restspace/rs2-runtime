@@ -256,6 +256,18 @@ export class Seed {
   }
 
   /**
+   * `applyMounts` without the status check — for suites asserting that a
+   * *mis*configured mount is refused at tenant build. The ETag is untouched on
+   * rejection, so the caller can keep using the seed afterwards.
+   */
+  async tryApplyMounts(extra: Mount[]): Promise<Rs2Response> {
+    const config = { ...baseConfig() } as TenantConfig;
+    const replaced = new Set(extra.map((m) => m.path));
+    config.mounts = [...config.mounts.filter((m) => !replaced.has(m.path)), ...extra];
+    return this.tryPutConfig(config);
+  }
+
+  /**
    * Create principals with host-minted password hashes. Mounts the hashing
    * facade if the current config lacks it, PUTs each user through it,
    * merge-PATCHes any `extra` fields, then removes the facade again unless

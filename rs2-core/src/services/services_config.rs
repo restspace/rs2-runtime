@@ -526,6 +526,7 @@ impl ServicesService {
                 ("data", reg.data_names()),
                 ("file", reg.files_names()),
                 ("query", reg.query_names()),
+                ("message", reg.message_names()),
             ] {
                 for name in names {
                     items.push(serde_json::json!({

@@ -322,6 +322,7 @@ export class ServicesService implements Service {
         ["data", reg.dataNames()],
         ["file", reg.filesNames()],
         ["query", reg.queryNames()],
+        ["message", reg.messageNames()],
       ] as Array<[string, string[]]>) {
         for (const name of names) {
           items.push({ name, kind: "adapter", adapterKind: adapterKindName, source: "builtin", ref: `builtin:${name}` });
