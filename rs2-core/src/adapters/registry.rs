@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::capabilities::{DataStore, FileStore, QueryStore};
+use crate::capabilities::{DataStore, FileStore, HttpOut, MessageGateway, QueryStore};
 use crate::error::RsError;
 
 /// Builds an un-scoped [`DataStore`] from a mount's `store` config.
@@ -23,6 +23,15 @@ pub type FileFactory =
 /// Builds an un-scoped [`QueryStore`] from a mount's `store` config.
 pub type QueryFactory =
     Arc<dyn Fn(&serde_json::Value) -> Result<Arc<dyn QueryStore>, RsError> + Send + Sync>;
+/// Builds an un-scoped [`MessageGateway`] from a mount's `store` config. Unlike
+/// the store kinds, a provider adapter reaches the network, so it is handed the
+/// node's [`HttpOut`] rather than opening its own client — every provider call
+/// then crosses the one audited egress choke point.
+pub type MessageFactory = Arc<
+    dyn Fn(&serde_json::Value, Arc<dyn HttpOut>) -> Result<Arc<dyn MessageGateway>, RsError>
+        + Send
+        + Sync,
+>;
 
 /// Node-level registry of built-in adapters, keyed per capability kind. Rides
 /// on [`crate::tenant::Adapters`] (hence `Clone`); seeded in `Adapters::new`
@@ -32,6 +41,7 @@ pub struct BuiltinRegistry {
     data: HashMap<String, DataFactory>,
     files: HashMap<String, FileFactory>,
     query: HashMap<String, QueryFactory>,
+    message: HashMap<String, MessageFactory>,
 }
 
 impl BuiltinRegistry {
@@ -44,6 +54,9 @@ impl BuiltinRegistry {
     pub fn register_query(&mut self, name: &str, f: QueryFactory) {
         self.query.insert(name.to_string(), f);
     }
+    pub fn register_message(&mut self, name: &str, f: MessageFactory) {
+        self.message.insert(name.to_string(), f);
+    }
 
     /// Sorted built-in names per kind (for "unknown adapter" diagnostics).
     pub fn data_names(&self) -> Vec<&str> {
@@ -54,6 +67,9 @@ impl BuiltinRegistry {
     }
     pub fn query_names(&self) -> Vec<&str> {
         sorted_keys(&self.query)
+    }
+    pub fn message_names(&self) -> Vec<&str> {
+        sorted_keys(&self.message)
     }
 
     /// Build a built-in adapter by name; `Ok(None)` means no such name for this
@@ -78,6 +94,14 @@ impl BuiltinRegistry {
         config: &serde_json::Value,
     ) -> Result<Option<Arc<dyn QueryStore>>, RsError> {
         self.query.get(name).map(|f| f(config)).transpose()
+    }
+    pub fn build_message(
+        &self,
+        name: &str,
+        config: &serde_json::Value,
+        http: Arc<dyn HttpOut>,
+    ) -> Result<Option<Arc<dyn MessageGateway>>, RsError> {
+        self.message.get(name).map(|f| f(config, http)).transpose()
     }
 }
 

@@ -11,6 +11,13 @@ use time::OffsetDateTime;
 use crate::error::RsError;
 use crate::message::{Body, Message, Provenance};
 
+pub mod message;
+
+pub use message::{
+    Addr, Attachment, Channel, MessageGateway, Outbound, Receipt, RoutingGateway,
+    ScopedMessageGateway,
+};
+
 /// A parsed write precondition (the store equivalent of HTTP conditional
 /// headers), supplied by a service after parsing `If-Match`/`If-None-Match`.
 #[derive(Debug, Clone)]
@@ -328,45 +335,6 @@ pub async fn list_records_fallback<S: DataStore + ?Sized>(
 #[async_trait]
 pub trait HttpOut: Send + Sync {
     async fn request(&self, msg: Message) -> Result<Message, RsError>;
-}
-
-/// Outbound SMS behind a swappable provider adapter (Twilio, AWS SNS, …) — the
-/// reference *typed provider capability* (PRD §9.2): the canonical interface a
-/// tenant's app speaks, while the adapter maps it to one provider's wire format
-/// and auth. Like [`QueryStore`], it is one trait with many provider impls
-/// (a Rust built-in or a loadable `code:` guest), selected by config — a new
-/// provider needs no recompile. `tenant` is supplied by the host scoping
-/// wrapper, never by service code.
-#[async_trait]
-pub trait SmsGateway: Send + Sync {
-    /// Send a text message to `to`; returns the provider's message id.
-    async fn send(&self, tenant: &str, to: &str, body: &str) -> Result<String, RsError>;
-    /// Delivery status of a previously sent message (provider-shaped JSON).
-    async fn status(&self, tenant: &str, id: &str) -> Result<serde_json::Value, RsError>;
-}
-
-/// A [`SmsGateway`] handle pre-scoped to one tenant — the only form services see.
-#[derive(Clone)]
-pub struct ScopedSmsGateway {
-    inner: Arc<dyn SmsGateway>,
-    tenant: String,
-}
-
-impl ScopedSmsGateway {
-    pub fn new(inner: Arc<dyn SmsGateway>, tenant: &str) -> Self {
-        ScopedSmsGateway {
-            inner,
-            tenant: tenant.to_string(),
-        }
-    }
-
-    pub async fn send(&self, to: &str, body: &str) -> Result<String, RsError> {
-        self.inner.send(&self.tenant, to, body).await
-    }
-
-    pub async fn status(&self, id: &str) -> Result<serde_json::Value, RsError> {
-        self.inner.status(&self.tenant, id).await
-    }
 }
 
 /// Parameterized queries against a backing store (PRD §10.4) — the RS2

@@ -30,8 +30,8 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell};
 use base64::Engine as _;
 
 use crate::capabilities::{
-    list_records_fallback, ByteRange, DataStore, DirEntry, FileMeta, FileStore, QueryStore,
-    ScopedFileStore, SmsGateway,
+    list_records_fallback, ByteRange, Channel, DataStore, DirEntry, FileMeta, FileStore,
+    MessageGateway, Outbound, QueryStore, Receipt, ScopedFileStore,
 };
 use crate::contract::{GrantedHost, HostApi, InvocationLimits};
 use crate::error::{codes, RsError};
@@ -735,17 +735,29 @@ impl DataStore for GuestDataStore {
     }
 }
 
-/// An [`SmsGateway`] backed by a resident JS adapter — the reference proof that
-/// the resident substrate generalizes beyond storage to a typed *provider*
+/// A [`MessageGateway`] backed by a resident JS adapter — the reference proof
+/// that the resident substrate generalizes beyond storage to a typed *provider*
 /// capability. Maps `send`/`status` to store-pattern requests (`POST /send`,
-/// `GET /status/{id}`); the adapter bundle maps those to the provider's wire
-/// format + auth. The stock `sms` service runs unchanged over any provider.
-pub struct GuestSmsGateway {
+/// `GET /status/{id}`); the bundle maps those to the provider's wire format and
+/// auth. The stock `message` service runs unchanged over any provider.
+///
+/// The served channels come from the adapter's **config**, not from the
+/// bundle's `features` export: a feature flag reads `false` until the lazy
+/// first spawn has evaluated the module, which is harmless for a fallback like
+/// `list-records` but would make every send fail the channel check before the
+/// adapter had ever run. Config is known at tenant-build time, so a mis-routed
+/// adapter is a config 400 instead of a first-send surprise.
+pub struct GuestMessageGateway {
     inner: ResidentAdapter,
+    adapter_ref: String,
+    channels: Vec<Channel>,
+    delivery_status: bool,
 }
 
-impl GuestSmsGateway {
-    /// Build a guest-backed SMS gateway from a `"store"` config block.
+impl GuestMessageGateway {
+    /// Build a guest-backed message gateway from a `"store"` config block.
+    /// `channels` defaults to every known channel (the bundle decides), and
+    /// `deliveryStatus` to `true`.
     pub fn from_config(
         adapter_ref: &str,
         store_config: &Value,
@@ -753,33 +765,71 @@ impl GuestSmsGateway {
         tenant: &str,
         limits: InvocationLimits,
     ) -> Result<Self, RsError> {
-        Ok(GuestSmsGateway {
+        let channels = match store_config.get("channels") {
+            None | Some(Value::Null) => Channel::all().to_vec(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str().and_then(Channel::parse).ok_or_else(|| {
+                        RsError::bad_request(format!(
+                            "message adapter 'channels' entry {v} is not a known channel"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(RsError::bad_request(
+                    "message adapter 'channels' must be an array of channel names",
+                ))
+            }
+        };
+        if channels.is_empty() {
+            return Err(RsError::bad_request(
+                "message adapter 'channels' must name at least one channel",
+            ));
+        }
+        let delivery_status = store_config
+            .get("deliveryStatus")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        Ok(GuestMessageGateway {
             inner: ResidentAdapter::from_config(
-                "sms",
+                "message",
                 adapter_ref,
                 store_config,
                 files,
                 tenant,
                 limits,
             )?,
+            adapter_ref: adapter_ref.to_string(),
+            channels,
+            delivery_status,
         })
     }
 }
 
 #[async_trait]
-impl SmsGateway for GuestSmsGateway {
-    async fn send(&self, _tenant: &str, to: &str, body: &str) -> Result<String, RsError> {
+impl MessageGateway for GuestMessageGateway {
+    async fn send(&self, _tenant: &str, out: &Outbound) -> Result<Receipt, RsError> {
         let (status, resp) = self
             .inner
-            .call("POST", "/send", Some(json!({ "to": to, "body": body })))
+            .call("POST", "/send", Some(out.to_json()))
             .await?;
         if !(200..300).contains(&status) {
             return Err(store_error(status, &resp));
         }
-        resp.get("id")
+        let id = resp
+            .get("id")
             .and_then(|i| i.as_str())
             .map(String::from)
-            .ok_or_else(|| RsError::contract_violation("sms adapter response missing string 'id'"))
+            .ok_or_else(|| {
+                RsError::contract_violation("message adapter response missing string 'id'")
+            })?;
+        Ok(Receipt::with_id(
+            id,
+            out.channel(),
+            self.adapter_ref.clone(),
+        ))
     }
 
     async fn status(&self, _tenant: &str, id: &str) -> Result<Value, RsError> {
@@ -792,6 +842,18 @@ impl SmsGateway for GuestSmsGateway {
         } else {
             Err(store_error(status, &resp))
         }
+    }
+
+    fn channels(&self) -> Vec<Channel> {
+        self.channels.clone()
+    }
+
+    fn delivery_status(&self) -> bool {
+        self.delivery_status
+    }
+
+    fn provider(&self) -> &str {
+        &self.adapter_ref
     }
 }
 

@@ -6,6 +6,8 @@
 //! S3 and database-backed adapters are M1 stretch items tracked in the PRD;
 //! they slot in behind the same traits without touching services.
 
+mod aws_sns;
+mod cf_email;
 mod credential;
 mod file_data;
 mod file_log;
@@ -16,6 +18,8 @@ mod mem_data;
 mod mem_query;
 mod registry;
 
+pub use aws_sns::AwsSnsGateway;
+pub use cf_email::CfEmailGateway;
 pub use credential::{AuthStrategy, CredentialInjector};
 pub use file_data::FileDataStore;
 pub use file_log::FileLogStore;
@@ -24,4 +28,4 @@ pub use http_out::UreqHttpOut;
 pub use local_fs::LocalFsFileStore;
 pub use mem_data::MemDataStore;
 pub use mem_query::MemQueryStore;
-pub use registry::{BuiltinRegistry, DataFactory, FileFactory, QueryFactory};
+pub use registry::{BuiltinRegistry, DataFactory, FileFactory, MessageFactory, QueryFactory};

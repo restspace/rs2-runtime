@@ -9,12 +9,12 @@ pub mod code;
 mod data;
 mod file;
 mod log_reader;
+mod message;
 mod pipeline_service;
 mod proxy;
 mod query;
 pub mod query_template;
 mod services_config;
-mod sms;
 pub mod spec_store;
 #[cfg(feature = "js")]
 mod template;
@@ -25,12 +25,12 @@ pub use code::CodeService;
 pub use data::DataService;
 pub use file::FileService;
 pub use log_reader::LogReaderService;
+pub use message::MessageService;
 pub use pipeline_service::{PipelineService, PIPELINE_PREFIX, PIPELINE_SUBTREE};
 pub use proxy::ProxyService;
 pub(crate) use proxy::PROXY_INJECTOR_KEY;
 pub use query::{QueryService, QUERY_PREFIX, QUERY_SUBTREE};
 pub use services_config::ServicesService;
-pub use sms::SmsService;
 #[cfg(feature = "js")]
 pub use template::{TemplateService, TEMPLATE_PREFIX, TEMPLATE_SUBTREE};
 pub use wrapper_service::WrapperService;
@@ -40,7 +40,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::capabilities::{
-    ScopedDataStore, ScopedFileStore, ScopedQueryStore, ScopedSmsGateway, WritePrecondition,
+    ScopedDataStore, ScopedFileStore, ScopedMessageGateway, ScopedQueryStore, WritePrecondition,
 };
 use crate::contract::InvocationLimits;
 use crate::error::RsError;
@@ -54,9 +54,10 @@ pub struct ServiceContext {
     pub files: Option<ScopedFileStore>,
     pub data: Option<ScopedDataStore>,
     pub query: Option<ScopedQueryStore>,
-    /// Outbound SMS via a swappable provider adapter — granted only to an `sms`
-    /// mount (`None` elsewhere). Selected by the mount's `store.adapter`.
-    pub sms: Option<ScopedSmsGateway>,
+    /// Outbound messaging (email, SMS) via swappable provider adapters —
+    /// granted only to a `message` mount (`None` elsewhere). Selected by the
+    /// mount's `store.adapter` or per-channel `store.adapters`.
+    pub messaging: Option<ScopedMessageGateway>,
     /// Outbound HTTP adapter; grants scope it per mount (PRD §9.2).
     pub http: Option<Arc<dyn crate::capabilities::HttpOut>>,
     /// Host-applied response caching policy, parsed once at tenant build.

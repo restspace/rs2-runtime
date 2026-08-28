@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::capabilities::{
-    DataStore, FileStore, ScopedDataStore, ScopedFileStore, ScopedQueryStore, ScopedSmsGateway,
+    DataStore, FileStore, ScopedDataStore, ScopedFileStore, ScopedMessageGateway, ScopedQueryStore,
 };
 use crate::error::RsError;
 use crate::router::{Mount, MountTable};
@@ -76,10 +76,11 @@ pub struct Adapters {
     /// Query store (PRD §10.4). Defaults to the reference adapter scanning
     /// the data store; SQL adapters push queries down.
     pub query: Arc<dyn crate::capabilities::QueryStore>,
-    /// Optional embedder-supplied default SMS gateway (PRD §9.2). There is no
-    /// node default, so an `sms` mount normally names a `code:`/`infra:` adapter;
-    /// this is the fallback when the mount sets no `store.adapter`.
-    pub sms: Option<Arc<dyn crate::capabilities::SmsGateway>>,
+    /// Optional embedder-supplied default message gateway (PRD §9.2). There is
+    /// no node default, so a `message` mount normally names a `builtin:`/
+    /// `code:`/`infra:` adapter; this is the fallback when the mount sets no
+    /// `store.adapter`.
+    pub messaging: Option<Arc<dyn crate::capabilities::MessageGateway>>,
     /// Outbound HTTP (PRD §9.2): granted per mount with allowed-host
     /// patterns; `None` disables external calls entirely.
     pub http: Option<Arc<dyn crate::capabilities::HttpOut>>,
@@ -155,12 +156,33 @@ impl Adapters {
                     as Arc<dyn crate::capabilities::QueryStore>)
             })
         });
+        // First-party provider adapters. Unlike the store kinds these take the
+        // node's outbound HTTP capability, so every provider call crosses the
+        // one audited egress choke point instead of opening its own client.
+        builtins.register_message(
+            "cf-email",
+            Arc::new(|cfg: &serde_json::Value, http| {
+                Ok(
+                    Arc::new(crate::adapters::CfEmailGateway::from_config(cfg, http)?)
+                        as Arc<dyn crate::capabilities::MessageGateway>,
+                )
+            }),
+        );
+        builtins.register_message(
+            "aws-sns",
+            Arc::new(|cfg: &serde_json::Value, http| {
+                Ok(
+                    Arc::new(crate::adapters::AwsSnsGateway::from_config(cfg, http)?)
+                        as Arc<dyn crate::capabilities::MessageGateway>,
+                )
+            }),
+        );
 
         Adapters {
             files,
             query,
             data,
-            sms: None,
+            messaging: None,
             idempotency: Arc::new(crate::idempotency::MemIdempotencyStore::default()),
             http: None,
             log: Arc::new(crate::logging::NullLogStore),
@@ -214,10 +236,10 @@ impl Adapters {
         self
     }
 
-    /// Supply an embedder default SMS gateway, used by an `sms` mount that names
-    /// no `store.adapter`.
-    pub fn with_sms(mut self, sms: Arc<dyn crate::capabilities::SmsGateway>) -> Self {
-        self.sms = Some(sms);
+    /// Supply an embedder default message gateway, used by a `message` mount
+    /// that names no `store.adapter`.
+    pub fn with_messaging(mut self, gateway: Arc<dyn crate::capabilities::MessageGateway>) -> Self {
+        self.messaging = Some(gateway);
         self
     }
 
@@ -404,7 +426,7 @@ impl Tenant {
                 )?),
                 "services" => Arc::new(crate::services::ServicesService::new()),
                 "log" => Arc::new(crate::services::LogReaderService::new()),
-                "sms" => Arc::new(crate::services::SmsService::new()),
+                "message" => Arc::new(crate::services::MessageService::new()),
                 "proxy" => Arc::new(crate::services::ProxyService::new()),
                 code_ref if code_ref.starts_with("code:") => {
                     Arc::new(crate::services::CodeService::from_ref(code_ref)?)
@@ -425,7 +447,8 @@ impl Tenant {
             let data = data_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
             let query =
                 query_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
-            let sms = sms_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
+            let messaging =
+                message_capability(mount, adapters, name, limits.invocation_limits(), &infras)?;
 
             // Resolve secrets and outbound credential injectors once, host-side,
             // so the secret material lands only in the injector / `secrets` map —
@@ -441,7 +464,7 @@ impl Tenant {
                 files,
                 data,
                 query,
-                sms,
+                messaging,
                 http: adapters.http.clone(),
                 cache_policy: crate::wrapper::CachePolicy::from_config(mount.config.get("caching")),
                 cache_openly_readable: crate::wrapper::CachePolicy::mount_is_openly_readable(
@@ -909,50 +932,163 @@ fn query_capability(
     }
 }
 
-/// Resolve an `sms` mount's gateway. Only the `sms` service gets it (every other
-/// mount sees `None`). `code:…` ⇒ a resident JS provider adapter; `infra:<name>`
-/// ⇒ an operator infra resolving to one; absent `store.adapter` ⇒ the embedder
-/// default if any, else a config 400. `builtin:` is reserved for a future
-/// first-party provider — none ship today, so it is a clear 400 (use `code:`).
-fn sms_capability(
+/// Resolve a `message` mount's gateway. Only the `message` service gets it
+/// (every other mount sees `None`).
+///
+/// Two config shapes, because one mount often needs two providers:
+///
+/// - `store.adapter` — a single adapter serving whatever channels it declares.
+/// - `store.adapters` — a `channel → store block` map; each entry resolves
+///   exactly like a single `store` (so `infra:` and `code:` work per channel),
+///   and the results are composed behind a [`RoutingGateway`]. A bare string is
+///   shorthand for `{"adapter": "<string>"}`.
+///
+/// `builtin:<name>` selects a first-party provider adapter; `code:…` a resident
+/// JS one; `infra:<name>` an operator infra resolving to either. Absent ⇒ the
+/// embedder default if any, else a config 400 — there is no node default
+/// provider, because sending mail requires credentials nobody can guess.
+fn message_capability(
     mount: &Mount,
     adapters: &Adapters,
     name: &str,
     limits: crate::contract::InvocationLimits,
     infras: &crate::infra::InfraSet,
-) -> Result<Option<ScopedSmsGateway>, RsError> {
-    if mount.service != "sms" {
+) -> Result<Option<ScopedMessageGateway>, RsError> {
+    if mount.service != "message" {
         return Ok(None);
     }
-    let (kind, store) = expand_store(mount, "sms", name, infras)?;
-    match kind {
-        StoreKind::Default => match &adapters.sms {
-            Some(sms) => Ok(Some(ScopedSmsGateway::new(sms.clone(), name))),
+    let raw = mount
+        .config
+        .get("store")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // The per-channel map wins when present; a mount that sets both is a
+    // config error rather than a silent precedence rule.
+    if let Some(map) = raw.get("adapters") {
+        if raw.get("adapter").is_some() {
+            return Err(RsError::bad_request(
+                "a message mount sets either store.adapter or store.adapters, not both",
+            ));
+        }
+        let entries = map.as_object().ok_or_else(|| {
+            RsError::bad_request("store.adapters must be an object of channel → adapter")
+        })?;
+        if entries.is_empty() {
+            return Err(RsError::bad_request(
+                "store.adapters is empty — name at least one channel",
+            ));
+        }
+        let mut routes: Vec<(
+            crate::capabilities::Channel,
+            Arc<dyn crate::capabilities::MessageGateway>,
+        )> = Vec::new();
+        for (channel_name, entry) in entries {
+            let channel = crate::capabilities::Channel::parse(channel_name).ok_or_else(|| {
+                RsError::bad_request(format!(
+                    "unknown channel '{channel_name}' in store.adapters (one of: {})",
+                    crate::capabilities::Channel::all()
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+            // A bare string is shorthand for a one-key store block.
+            let block = match entry {
+                serde_json::Value::String(s) => serde_json::json!({ "adapter": s }),
+                other => other.clone(),
+            };
+            let expanded = crate::infra::expand_infra(&block, infras, name)?.into_owned();
+            let gateway = build_message_backend(
+                classify_store(&expanded)?,
+                &expanded,
+                adapters,
+                mount,
+                name,
+                limits.clone(),
+            )?;
+            // An adapter routed for a channel it does not serve is a config
+            // error, not a runtime 400 on the first send.
+            if !gateway.channels().contains(&channel) {
+                return Err(RsError::bad_request(format!(
+                    "adapter '{}' is routed for the '{channel}' channel but serves: {}",
+                    gateway.provider(),
+                    gateway
+                        .channels()
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            routes.push((channel, gateway));
+        }
+        let routing = crate::capabilities::RoutingGateway::new(routes);
+        return Ok(Some(ScopedMessageGateway::new(Arc::new(routing), name)));
+    }
+
+    let expanded = crate::infra::expand_infra(&raw, infras, name)?.into_owned();
+    let kind = classify_store(&expanded)?;
+    if matches!(kind, StoreKind::Default) {
+        return match &adapters.messaging {
+            Some(g) => Ok(Some(ScopedMessageGateway::new(g.clone(), name))),
             None => Err(RsError::bad_request(
-                "sms mount requires a store.adapter ('code:<name>@<version>' or 'infra:<name>')",
+                "message mount requires a store.adapter ('builtin:<name>', \
+                 'code:<name>@<version>' or 'infra:<name>') or a per-channel store.adapters map",
             )),
-        },
-        StoreKind::Builtin(builtin) => Err(RsError::bad_request(format!(
-            "sms store adapter 'builtin:{builtin}' is unknown (no first-party SMS providers ship \
-             yet; use a 'code:<name>@<version>' adapter)"
-        ))),
+        };
+    }
+    let gateway = build_message_backend(kind, &expanded, adapters, mount, name, limits)?;
+    Ok(Some(ScopedMessageGateway::new(gateway, name)))
+}
+
+/// Build one un-scoped provider adapter from an (already infra-expanded) store
+/// block. Shared by the single-adapter and per-channel paths so both accept
+/// exactly the same forms.
+#[allow(unused_variables)]
+fn build_message_backend(
+    kind: StoreKind,
+    store: &serde_json::Value,
+    adapters: &Adapters,
+    mount: &Mount,
+    tenant: &str,
+    limits: crate::contract::InvocationLimits,
+) -> Result<Arc<dyn crate::capabilities::MessageGateway>, RsError> {
+    match kind {
+        StoreKind::Default => Err(RsError::bad_request(
+            "each store.adapters entry needs an 'adapter'",
+        )),
+        StoreKind::Builtin(builtin) => {
+            let http = adapters.http.clone().ok_or_else(|| {
+                RsError::bad_request(format!(
+                    "message adapter 'builtin:{builtin}' calls a provider over HTTP, but this \
+                     node has no outbound HTTP capability"
+                ))
+            })?;
+            adapters
+                .builtins
+                .build_message(&builtin, store, http)?
+                .ok_or_else(|| {
+                    unknown_builtin("message", &builtin, adapters.builtins.message_names())
+                })
+        }
         StoreKind::Code(adapter_ref) => {
             #[cfg(feature = "js")]
             {
-                let files = ScopedFileStore::new(adapters.files.clone(), name);
-                let guest = crate::engines::resident::GuestSmsGateway::from_config(
+                let files = ScopedFileStore::new(adapters.files.clone(), tenant);
+                let guest = crate::engines::resident::GuestMessageGateway::from_config(
                     &adapter_ref,
-                    &store,
+                    store,
                     files,
-                    name,
+                    tenant,
                     limits,
                 )?;
-                Ok(Some(ScopedSmsGateway::new(Arc::new(guest), name)))
+                Ok(Arc::new(guest))
             }
             #[cfg(not(feature = "js"))]
             {
-                let _ = (limits, &store);
-                Err(loadable_without_js("sms", mount, &adapter_ref))
+                Err(loadable_without_js("message", mount, &adapter_ref))
             }
         }
     }

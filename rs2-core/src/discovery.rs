@@ -316,6 +316,11 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
             ],
         ),
         "log" => ("view", vec!["url-params", "time-range", "trace-scoped"]),
+        // `channels`: `GET /<mount>/channels` answers which channels this
+        // mount actually sends on and whether delivery status can be asked
+        // for. That set comes from the built adapters, not from config, so it
+        // is published there rather than guessed here.
+        "message" => ("api", vec!["channels"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),

@@ -284,7 +284,7 @@ fn store_grant_target(
         files: Some(files),
         data: None,
         query: None,
-        sms: None,
+        messaging: None,
         http: None,
         cache_policy: crate::wrapper::CachePolicy::default(),
         cache_openly_readable: true,

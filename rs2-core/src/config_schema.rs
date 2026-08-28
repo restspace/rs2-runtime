@@ -250,15 +250,38 @@ pub struct StoreConfig {
     pub adapter: Option<String>,
 }
 
-/// `sms` service config (beyond the base envelope). The provider is selected by
-/// `store.adapter` (`code:<name>@<version>` or `infra:<name>`); credentials for
-/// the provider call are injected host-side by the adapter's grants/infra.
+/// `message` service config (beyond the base envelope). The provider is
+/// selected by `store.adapter` for a single adapter, or `store.adapters` for a
+/// `channel -> adapter` map when one mount sends over several providers.
+/// Credentials for the provider call are injected host-side by the adapter's
+/// grants/infra and never appear in this config.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
-pub struct SmsConfig {
-    /// Provider backend selection (`store.adapter`). Required — no node default
-    /// SMS provider ships. See [`StoreConfig`].
-    pub store: Option<StoreConfig>,
+pub struct MessageConfig {
+    /// Provider backend selection. Required — no node default provider ships,
+    /// because reaching one needs credentials. See [`StoreConfig`].
+    pub store: Option<MessageStoreConfig>,
+}
+
+/// A `message` mount's `store` block: either one `adapter` for every channel it
+/// serves, or an `adapters` map naming one per channel.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MessageStoreConfig {
+    /// Single provider: `builtin:<name>`, `code:<name>@<version>` or
+    /// `infra:<name>`. Mutually exclusive with `adapters`.
+    pub adapter: Option<String>,
+    /// Per-channel providers, e.g.
+    /// `{"email": "infra:cf-email", "sms": "infra:aws-sms"}`. Each value is an
+    /// adapter string or a full store block. Mutually exclusive with `adapter`.
+    #[schemars(schema_with = "json_object_schema")]
+    pub adapters: Option<Value>,
+    /// Channels a `code:` adapter serves (default: all). Declared in config
+    /// rather than detected, so a mis-routed adapter is a config error.
+    pub channels: Option<Vec<String>>,
+    /// Whether the provider reports per-message delivery status (default
+    /// `true` for `code:` adapters; built-ins declare their own).
+    pub delivery_status: Option<bool>,
 }
 
 /// `proxy` service config (beyond the base envelope): forward to a fixed
@@ -376,9 +399,9 @@ pub fn catalogue() -> Value {
             { "name": "auth",
               "description": "Authentication & RBAC (PRD §10.5)",
               "configSchema": schema_of::<AuthSettings>() },
-            { "name": "sms",
-              "description": "Outbound SMS over a swappable provider adapter (PRD §9.2): POST /send {to, body}, GET /status/{id}. Select the provider with store.adapter (code:/infra:)",
-              "configSchema": schema_of::<SmsConfig>() },
+            { "name": "message",
+              "description": "Outbound messaging (email, SMS) over swappable provider adapters (PRD §9.2): POST /send {channel, to, …}, GET /status/{id}, GET /channels. Select providers with store.adapter or a per-channel store.adapters map (builtin:/code:/infra:)",
+              "configSchema": schema_of::<MessageConfig>() },
             { "name": "proxy",
               "description": "Forward to a fixed external target, attaching operator-supplied auth host-side via `inject` (the credential never appears in config)",
               "configSchema": schema_of::<ProxyConfig>() },

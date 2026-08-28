@@ -127,7 +127,7 @@ impl SpecStore {
             infras: None,
             secrets: None,
             outbound_injectors: std::collections::HashMap::new(),
-            sms: None,
+            messaging: None,
         };
         SpecStore {
             inner: FileService::new(),
