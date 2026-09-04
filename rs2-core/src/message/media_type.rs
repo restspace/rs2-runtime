@@ -93,35 +93,73 @@ impl MediaType {
         self.essence == DIR_JSON
     }
 
-    /// Known `(extension, essence)` pairs, in friendly-URL preference order
-    /// (human-readable docs first, then structured data, then assets). This is
-    /// the single source for both [`MediaType::from_extension`] and
-    /// [`MediaType::known_extensions`], so the two can't drift.
-    const EXTENSION_TABLE: &'static [(&'static str, &'static str)] = &[
-        ("html", "text/html"),
-        ("htm", "text/html"),
-        ("md", "text/markdown"),
-        ("txt", "text/plain"),
-        ("json", JSON),
-        ("xml", "application/xml"),
-        ("yaml", "application/yaml"),
-        ("yml", "application/yaml"),
-        ("csv", "text/csv"),
-        ("css", "text/css"),
-        ("js", "text/javascript"),
-        ("mjs", "text/javascript"),
-        ("jsx", "text/javascript"),
-        ("ts", "application/typescript"),
-        ("tsx", "application/typescript"),
-        ("svg", "image/svg+xml"),
-        ("png", "image/png"),
-        ("jpg", "image/jpeg"),
-        ("jpeg", "image/jpeg"),
-        ("gif", "image/gif"),
-        ("webp", "image/webp"),
-        ("pdf", "application/pdf"),
-        ("zip", "application/zip"),
-        ("wasm", "application/wasm"),
+    /// Known `(extension, essence, negotiable)` triples, in friendly-URL
+    /// preference order (human-readable docs first, then structured data, then
+    /// assets). This is the single source for both
+    /// [`MediaType::from_extension`] and [`MediaType::known_extensions`], so
+    /// the two can't drift.
+    ///
+    /// `negotiable` marks the extensions the file service probes for an
+    /// extension-less request. Bulk media (video, audio, fonts) maps to a
+    /// media type when addressed by name but is never a friendly-URL
+    /// candidate: nobody writes `/clip` meaning `/clip.mp4`, and every
+    /// candidate costs a store probe on a miss.
+    const EXTENSION_TABLE: &'static [(&'static str, &'static str, bool)] = &[
+        ("html", "text/html", true),
+        ("htm", "text/html", true),
+        ("md", "text/markdown", true),
+        ("txt", "text/plain", true),
+        ("json", JSON, true),
+        ("xml", "application/xml", true),
+        ("yaml", "application/yaml", true),
+        ("yml", "application/yaml", true),
+        ("csv", "text/csv", true),
+        ("css", "text/css", true),
+        ("js", "text/javascript", true),
+        ("mjs", "text/javascript", true),
+        ("jsx", "text/javascript", true),
+        ("ts", "application/typescript", true),
+        ("tsx", "application/typescript", true),
+        ("svg", "image/svg+xml", true),
+        ("png", "image/png", true),
+        ("jpg", "image/jpeg", true),
+        ("jpeg", "image/jpeg", true),
+        ("gif", "image/gif", true),
+        ("webp", "image/webp", true),
+        ("pdf", "application/pdf", true),
+        ("zip", "application/zip", true),
+        ("wasm", "application/wasm", true),
+        // Images addressed by name only.
+        ("avif", "image/avif", false),
+        ("ico", "image/vnd.microsoft.icon", false),
+        ("bmp", "image/bmp", false),
+        ("tif", "image/tiff", false),
+        ("tiff", "image/tiff", false),
+        // Video.
+        ("mp4", "video/mp4", false),
+        ("m4v", "video/mp4", false),
+        ("webm", "video/webm", false),
+        ("ogv", "video/ogg", false),
+        ("mov", "video/quicktime", false),
+        ("mkv", "video/x-matroska", false),
+        ("avi", "video/x-msvideo", false),
+        ("mpeg", "video/mpeg", false),
+        ("mpg", "video/mpeg", false),
+        // Audio.
+        ("mp3", "audio/mpeg", false),
+        ("m4a", "audio/mp4", false),
+        ("aac", "audio/aac", false),
+        ("ogg", "audio/ogg", false),
+        ("oga", "audio/ogg", false),
+        ("opus", "audio/ogg", false),
+        ("weba", "audio/webm", false),
+        ("wav", "audio/wav", false),
+        ("flac", "audio/flac", false),
+        // Fonts.
+        ("woff", "font/woff", false),
+        ("woff2", "font/woff2", false),
+        ("ttf", "font/ttf", false),
+        ("otf", "font/otf", false),
     ];
 
     /// Media type from a file extension; `None` if unknown.
@@ -129,17 +167,29 @@ impl MediaType {
         let ext = ext.trim_start_matches('.').to_ascii_lowercase();
         Self::EXTENSION_TABLE
             .iter()
-            .find(|(e, _)| *e == ext)
-            .map(|(_, essence)| Self::new(essence))
+            .find(|(e, _, _)| *e == ext)
+            .map(|(_, essence, _)| Self::new(essence))
     }
 
-    /// Every known `(extension-without-dot, media type)` pair, in friendly-URL
-    /// preference order. Used to probe candidate files for an extension-less
-    /// request.
+    /// Every negotiable `(extension-without-dot, media type)` pair, in
+    /// friendly-URL preference order. Used to probe candidate files for an
+    /// extension-less request.
     pub fn known_extensions() -> impl Iterator<Item = (&'static str, MediaType)> {
         Self::EXTENSION_TABLE
             .iter()
-            .map(|(ext, essence)| (*ext, Self::new(essence)))
+            .filter(|(_, _, negotiable)| *negotiable)
+            .map(|(ext, essence, _)| (*ext, Self::new(essence)))
+    }
+
+    /// The canonical extension for an essence — the reverse of the extension
+    /// map, used to name a server-named file (keyless POST) from its declared
+    /// media type. The first table entry wins, so `image/jpeg` is `jpg`, not
+    /// `jpeg`. `None` when nothing in the table claims the essence.
+    pub fn canonical_extension(&self) -> Option<&'static str> {
+        Self::EXTENSION_TABLE
+            .iter()
+            .find(|(_, essence, _)| *essence == self.essence)
+            .map(|(ext, _, _)| *ext)
     }
 
     /// Determine a media type for a stored file path (extension map),
@@ -189,6 +239,34 @@ mod tests {
         assert!(MediaType::new("text/html").is_text());
         assert!(MediaType::new("application/zip").is_zip());
         assert!(!MediaType::new("image/png").is_text());
+    }
+
+    #[test]
+    fn maps_media_and_font_extensions() {
+        for (path, essence) in [
+            ("clips/intro.mp4", "video/mp4"),
+            ("clips/intro.webm", "video/webm"),
+            ("clips/intro.MOV", "video/quicktime"),
+            ("audio/theme.mp3", "audio/mpeg"),
+            ("audio/theme.ogg", "audio/ogg"),
+            ("fonts/inter.woff2", "font/woff2"),
+            ("favicon.ico", "image/vnd.microsoft.icon"),
+        ] {
+            assert_eq!(MediaType::for_path(path).essence(), essence, "{path}");
+        }
+    }
+
+    /// Bulk media maps by name but must not join the extension-less probe
+    /// list — each candidate there costs a store probe on a miss.
+    #[test]
+    fn media_extensions_are_not_negotiated() {
+        let negotiable: Vec<&str> = MediaType::known_extensions().map(|(e, _)| e).collect();
+        assert!(negotiable.contains(&"html"));
+        assert!(negotiable.contains(&"png"));
+        for ext in ["mp4", "webm", "mp3", "woff2", "ico"] {
+            assert!(!negotiable.contains(&ext), "{ext} should not be negotiable");
+            assert!(MediaType::from_extension(ext).is_some(), "{ext} unmapped");
+        }
     }
 
     #[test]

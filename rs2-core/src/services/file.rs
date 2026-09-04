@@ -178,26 +178,21 @@ impl SiteOptions {
     }
 }
 
-/// Extension for a server-named file from its declared media type
-/// (keyless POST to a directory). Unknown types get no extension.
-fn extension_for(media_type: &MediaType) -> &'static str {
-    match media_type.essence() {
-        "application/json" => ".json",
-        "text/plain" => ".txt",
-        "text/html" => ".html",
-        "text/css" => ".css",
-        "text/csv" => ".csv",
-        "application/javascript" | "text/javascript" => ".js",
-        "application/wasm" => ".wasm",
-        "image/png" => ".png",
-        "image/jpeg" => ".jpg",
-        "image/gif" => ".gif",
-        "image/svg+xml" => ".svg",
-        "application/pdf" => ".pdf",
-        "application/zip" => ".zip",
-        _ => "",
+/// Extension for a server-named file from its declared media type (keyless
+/// POST to a directory), derived from the extension map so the two can't
+/// drift. Unknown types get no extension.
+fn extension_for(media_type: &MediaType) -> String {
+    // `application/javascript` is the one legacy alias the map doesn't carry.
+    let essence = match media_type.essence() {
+        "application/javascript" => "text/javascript",
+        other => other,
+    };
+    match MediaType::new(essence).canonical_extension() {
+        Some(ext) => format!(".{ext}"),
+        None => String::new(),
     }
 }
+
 
 /// Whether `path`'s final segment carries no extension — the precondition for
 /// treating it as a friendly URL (`/docs/readme`, not `/docs/readme.md`).

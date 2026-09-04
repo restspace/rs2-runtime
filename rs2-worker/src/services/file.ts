@@ -67,39 +67,14 @@ function siteFromConfig(config: JsonObject): SiteOptions {
 }
 
 /// Extension for a server-named file from its declared media type (keyless
-/// POST). Unknown types get no extension.
+/// POST), derived from the extension map so the two can't drift. Unknown types
+/// get no extension.
 function extensionFor(mediaType: MediaType): string {
-  switch (mediaType.essence()) {
-    case "application/json":
-      return ".json";
-    case "text/plain":
-      return ".txt";
-    case "text/html":
-      return ".html";
-    case "text/css":
-      return ".css";
-    case "text/csv":
-      return ".csv";
-    case "application/javascript":
-    case "text/javascript":
-      return ".js";
-    case "application/wasm":
-      return ".wasm";
-    case "image/png":
-      return ".png";
-    case "image/jpeg":
-      return ".jpg";
-    case "image/gif":
-      return ".gif";
-    case "image/svg+xml":
-      return ".svg";
-    case "application/pdf":
-      return ".pdf";
-    case "application/zip":
-      return ".zip";
-    default:
-      return "";
-  }
+  // `application/javascript` is the one legacy alias the map doesn't carry.
+  const essence =
+    mediaType.essence() === "application/javascript" ? "text/javascript" : mediaType.essence();
+  const ext = new MediaType(essence).canonicalExtension();
+  return ext === undefined ? "" : `.${ext}`;
 }
 
 /// Whether `path`'s final segment carries no extension.

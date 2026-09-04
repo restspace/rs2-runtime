@@ -8,33 +8,71 @@ export const JSON_TYPE = "application/json";
 export const SCHEMA_JSON = "application/schema+json";
 export const PROBLEM_JSON = "application/problem+json";
 
-/// Known `(extension, essence)` pairs, in friendly-URL preference order.
-/// The single source for `fromExtension` and `knownExtensions`.
-const EXTENSION_TABLE: ReadonlyArray<readonly [string, string]> = [
-  ["html", "text/html"],
-  ["htm", "text/html"],
-  ["md", "text/markdown"],
-  ["txt", "text/plain"],
-  ["json", JSON_TYPE],
-  ["xml", "application/xml"],
-  ["yaml", "application/yaml"],
-  ["yml", "application/yaml"],
-  ["csv", "text/csv"],
-  ["css", "text/css"],
-  ["js", "text/javascript"],
-  ["mjs", "text/javascript"],
-  ["jsx", "text/javascript"],
-  ["ts", "application/typescript"],
-  ["tsx", "application/typescript"],
-  ["svg", "image/svg+xml"],
-  ["png", "image/png"],
-  ["jpg", "image/jpeg"],
-  ["jpeg", "image/jpeg"],
-  ["gif", "image/gif"],
-  ["webp", "image/webp"],
-  ["pdf", "application/pdf"],
-  ["zip", "application/zip"],
-  ["wasm", "application/wasm"],
+/// Known `(extension, essence, negotiable)` triples, in friendly-URL
+/// preference order. The single source for `fromExtension` and
+/// `knownExtensions`.
+///
+/// `negotiable` marks the extensions the file service probes for an
+/// extension-less request. Bulk media (video, audio, fonts) maps to a media
+/// type when addressed by name but is never a friendly-URL candidate: nobody
+/// writes `/clip` meaning `/clip.mp4`, and every candidate costs a store probe
+/// on a miss.
+const EXTENSION_TABLE: ReadonlyArray<readonly [string, string, boolean]> = [
+  ["html", "text/html", true],
+  ["htm", "text/html", true],
+  ["md", "text/markdown", true],
+  ["txt", "text/plain", true],
+  ["json", JSON_TYPE, true],
+  ["xml", "application/xml", true],
+  ["yaml", "application/yaml", true],
+  ["yml", "application/yaml", true],
+  ["csv", "text/csv", true],
+  ["css", "text/css", true],
+  ["js", "text/javascript", true],
+  ["mjs", "text/javascript", true],
+  ["jsx", "text/javascript", true],
+  ["ts", "application/typescript", true],
+  ["tsx", "application/typescript", true],
+  ["svg", "image/svg+xml", true],
+  ["png", "image/png", true],
+  ["jpg", "image/jpeg", true],
+  ["jpeg", "image/jpeg", true],
+  ["gif", "image/gif", true],
+  ["webp", "image/webp", true],
+  ["pdf", "application/pdf", true],
+  ["zip", "application/zip", true],
+  ["wasm", "application/wasm", true],
+  // Images addressed by name only.
+  ["avif", "image/avif", false],
+  ["ico", "image/vnd.microsoft.icon", false],
+  ["bmp", "image/bmp", false],
+  ["tif", "image/tiff", false],
+  ["tiff", "image/tiff", false],
+  // Video.
+  ["mp4", "video/mp4", false],
+  ["m4v", "video/mp4", false],
+  ["webm", "video/webm", false],
+  ["ogv", "video/ogg", false],
+  ["mov", "video/quicktime", false],
+  ["mkv", "video/x-matroska", false],
+  ["avi", "video/x-msvideo", false],
+  ["mpeg", "video/mpeg", false],
+  ["mpg", "video/mpeg", false],
+  // Audio.
+  ["mp3", "audio/mpeg", false],
+  ["m4a", "audio/mp4", false],
+  ["aac", "audio/aac", false],
+  ["ogg", "audio/ogg", false],
+  ["oga", "audio/ogg", false],
+  ["opus", "audio/ogg", false],
+  ["weba", "audio/webm", false],
+  ["wav", "audio/wav", false],
+  ["flac", "audio/flac", false],
+  // Fonts.
+  ["woff", "font/woff", false],
+  ["woff2", "font/woff2", false],
+  ["ttf", "font/ttf", false],
+  ["otf", "font/otf", false],
 ];
 
 export class MediaType {
@@ -111,10 +149,21 @@ export class MediaType {
     return hit ? new MediaType(hit[1]) : undefined;
   }
 
-  /// Every known `(extension-without-dot, media type)` pair, in friendly-URL
-  /// preference order.
+  /// Every negotiable `(extension-without-dot, media type)` pair, in
+  /// friendly-URL preference order.
   static knownExtensions(): Array<[string, MediaType]> {
-    return EXTENSION_TABLE.map(([ext, essence]) => [ext, new MediaType(essence)]);
+    return EXTENSION_TABLE.filter(([, , negotiable]) => negotiable).map(([ext, essence]) => [
+      ext,
+      new MediaType(essence),
+    ]);
+  }
+
+  /// The canonical extension for an essence — the reverse of the extension
+  /// map, used to name a server-named file (keyless POST) from its declared
+  /// media type. The first table entry wins, so `image/jpeg` is `jpg`, not
+  /// `jpeg`. `undefined` when nothing in the table claims the essence.
+  canonicalExtension(): string | undefined {
+    return EXTENSION_TABLE.find(([, essence]) => essence === this._essence)?.[0];
   }
 
   /// Media type for a stored file path (extension map), falling back to

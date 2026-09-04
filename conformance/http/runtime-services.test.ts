@@ -172,6 +172,38 @@ describe("runtime services", () => {
     status(await anon.move("/files/nope.txt", "/files/x.txt"), 404, "[file] MOVE missing source");
   });
 
+  test("file: media extensions map both ways", async () => {
+    // Serving is by extension, never sniffed: a video is a video.
+    status(await anon.put("/files/media/clip.mp4", text("fake-mp4", "video/mp4")), 201, "[file] PUT clip.mp4");
+    let res = await anon.get("/files/media/clip.mp4");
+    status(res, 200, "[file] GET clip.mp4");
+    expect(res.contentType(), "[file] .mp4 is video/mp4").toBe("video/mp4");
+
+    // Same for audio and fonts, the other basics a site needs.
+    status(await anon.put("/files/media/theme.mp3", text("fake-mp3", "audio/mpeg")), 201, "[file] PUT theme.mp3");
+    res = await anon.get("/files/media/theme.mp3");
+    expect(res.contentType(), "[file] .mp3 is audio/mpeg").toBe("audio/mpeg");
+    status(await anon.put("/files/media/inter.woff2", text("fake-woff2", "font/woff2")), 201, "[file] PUT inter.woff2");
+    res = await anon.get("/files/media/inter.woff2");
+    expect(res.contentType(), "[file] .woff2 is font/woff2").toBe("font/woff2");
+
+    // Keyless POST reverses the map: a declared video/mp4 is named `.mp4`, so
+    // the file it creates reads back as a video.
+    res = await anon.post("/files/media/", text("fake-mp4", "video/mp4"));
+    status(res, 201, "[file] keyless POST video");
+    const location = res.header("location");
+    expect(location, "[file] keyless POST names .mp4").toMatch(/\.mp4$/);
+    res = await anon.get(location!);
+    status(res, 200, "[file] GET the server-named video");
+    expect(res.contentType(), "[file] server-named video round-trips").toBe("video/mp4");
+
+    status(await anon.delete(location!), 204, "[file] cleanup server-named video");
+    for (const name of ["clip.mp4", "theme.mp3", "inter.woff2"]) {
+      status(await anon.delete(`/files/media/${name}`), 204, `[file] cleanup ${name}`);
+    }
+    status(await anon.delete("/files/media/"), 204, "[file] cleanup media dir");
+  });
+
   test("data: .schemas index and record listing contentType", async () => {
     const schema = { type: "object", properties: { n: { type: "integer" } } };
     status(await anon.put("/data/widgets/.schema.json", { json: schema }), 200, "[data] install schema");
