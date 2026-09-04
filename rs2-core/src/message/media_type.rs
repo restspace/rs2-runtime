@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use super::media_type_table::{CANONICAL_EXTENSIONS, EXTENSION_TABLE, NEGOTIABLE_EXTENSIONS};
+
 /// Structured directory listing type, replacing Restspace's `inode/directory+json`.
 pub const DIR_JSON: &str = "application/vnd.rs2.dir+json";
 pub const OCTET_STREAM: &str = "application/octet-stream";
@@ -93,103 +95,39 @@ impl MediaType {
         self.essence == DIR_JSON
     }
 
-    /// Known `(extension, essence, negotiable)` triples, in friendly-URL
-    /// preference order (human-readable docs first, then structured data, then
-    /// assets). This is the single source for both
-    /// [`MediaType::from_extension`] and [`MediaType::known_extensions`], so
-    /// the two can't drift.
-    ///
-    /// `negotiable` marks the extensions the file service probes for an
-    /// extension-less request. Bulk media (video, audio, fonts) maps to a
-    /// media type when addressed by name but is never a friendly-URL
-    /// candidate: nobody writes `/clip` meaning `/clip.mp4`, and every
-    /// candidate costs a store probe on a miss.
-    const EXTENSION_TABLE: &'static [(&'static str, &'static str, bool)] = &[
-        ("html", "text/html", true),
-        ("htm", "text/html", true),
-        ("md", "text/markdown", true),
-        ("txt", "text/plain", true),
-        ("json", JSON, true),
-        ("xml", "application/xml", true),
-        ("yaml", "application/yaml", true),
-        ("yml", "application/yaml", true),
-        ("csv", "text/csv", true),
-        ("css", "text/css", true),
-        ("js", "text/javascript", true),
-        ("mjs", "text/javascript", true),
-        ("jsx", "text/javascript", true),
-        ("ts", "application/typescript", true),
-        ("tsx", "application/typescript", true),
-        ("svg", "image/svg+xml", true),
-        ("png", "image/png", true),
-        ("jpg", "image/jpeg", true),
-        ("jpeg", "image/jpeg", true),
-        ("gif", "image/gif", true),
-        ("webp", "image/webp", true),
-        ("pdf", "application/pdf", true),
-        ("zip", "application/zip", true),
-        ("wasm", "application/wasm", true),
-        // Images addressed by name only.
-        ("avif", "image/avif", false),
-        ("ico", "image/vnd.microsoft.icon", false),
-        ("bmp", "image/bmp", false),
-        ("tif", "image/tiff", false),
-        ("tiff", "image/tiff", false),
-        // Video.
-        ("mp4", "video/mp4", false),
-        ("m4v", "video/mp4", false),
-        ("webm", "video/webm", false),
-        ("ogv", "video/ogg", false),
-        ("mov", "video/quicktime", false),
-        ("mkv", "video/x-matroska", false),
-        ("avi", "video/x-msvideo", false),
-        ("mpeg", "video/mpeg", false),
-        ("mpg", "video/mpeg", false),
-        // Audio.
-        ("mp3", "audio/mpeg", false),
-        ("m4a", "audio/mp4", false),
-        ("aac", "audio/aac", false),
-        ("ogg", "audio/ogg", false),
-        ("oga", "audio/ogg", false),
-        ("opus", "audio/ogg", false),
-        ("weba", "audio/webm", false),
-        ("wav", "audio/wav", false),
-        ("flac", "audio/flac", false),
-        // Fonts.
-        ("woff", "font/woff", false),
-        ("woff2", "font/woff2", false),
-        ("ttf", "font/ttf", false),
-        ("otf", "font/otf", false),
-    ];
-
-    /// Media type from a file extension; `None` if unknown.
+    /// Media type from a file extension; `None` if unknown. The table is
+    /// sorted, so this is a binary search — a directory listing types one path
+    /// per entry, which puts it on the hot path.
     pub fn from_extension(ext: &str) -> Option<Self> {
         let ext = ext.trim_start_matches('.').to_ascii_lowercase();
-        Self::EXTENSION_TABLE
-            .iter()
-            .find(|(e, _, _)| *e == ext)
-            .map(|(_, essence, _)| Self::new(essence))
+        EXTENSION_TABLE
+            .binary_search_by(|(e, _)| (*e).cmp(ext.as_str()))
+            .ok()
+            .map(|i| Self::new(EXTENSION_TABLE[i].1))
     }
 
-    /// Every negotiable `(extension-without-dot, media type)` pair, in
-    /// friendly-URL preference order. Used to probe candidate files for an
-    /// extension-less request.
+    /// The `(extension-without-dot, media type)` pairs the file service probes
+    /// for an extension-less request, in friendly-URL preference order.
+    ///
+    /// Deliberately a short list, not the whole map: every candidate costs a
+    /// store probe on a miss, and nobody writes `/clip` meaning `/clip.mp4`.
+    /// Bulk media is served when addressed by name and never negotiated.
     pub fn known_extensions() -> impl Iterator<Item = (&'static str, MediaType)> {
-        Self::EXTENSION_TABLE
+        NEGOTIABLE_EXTENSIONS
             .iter()
-            .filter(|(_, _, negotiable)| *negotiable)
-            .map(|(ext, essence, _)| (*ext, Self::new(essence)))
+            .map(|ext| (*ext, Self::from_extension(ext).unwrap_or_else(Self::octet_stream)))
     }
 
-    /// The canonical extension for an essence — the reverse of the extension
+    /// The canonical extension for this essence — the reverse of the extension
     /// map, used to name a server-named file (keyless POST) from its declared
-    /// media type. The first table entry wins, so `image/jpeg` is `jpg`, not
-    /// `jpeg`. `None` when nothing in the table claims the essence.
+    /// media type. Every entry round-trips (the extension maps back to this
+    /// essence), so the file that gets named is served as what was posted.
+    /// `None` when no extension claims the essence.
     pub fn canonical_extension(&self) -> Option<&'static str> {
-        Self::EXTENSION_TABLE
-            .iter()
-            .find(|(_, essence, _)| *essence == self.essence)
-            .map(|(ext, _, _)| *ext)
+        CANONICAL_EXTENSIONS
+            .binary_search_by(|(essence, _)| (*essence).cmp(self.essence.as_str()))
+            .ok()
+            .map(|i| CANONICAL_EXTENSIONS[i].1)
     }
 
     /// Determine a media type for a stored file path (extension map),
@@ -251,9 +189,26 @@ mod tests {
             ("audio/theme.ogg", "audio/ogg"),
             ("fonts/inter.woff2", "font/woff2"),
             ("favicon.ico", "image/vnd.microsoft.icon"),
+            // The long tail the generated map brought in.
+            ("docs/report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            ("book.epub", "application/epub+zip"),
+            ("captions.vtt", "text/vtt"),
+            ("stream.m3u8", "application/vnd.apple.mpegurl"),
+            ("archive.tar.gz", "application/gzip"),
+            ("photo.heic", "image/heic"),
         ] {
             assert_eq!(MediaType::for_path(path).essence(), essence, "{path}");
         }
+    }
+
+    /// A `.ts` in a tenant's files is TypeScript source, not the MPEG
+    /// transport stream nginx (and so mime-db) calls it.
+    #[test]
+    fn rs2_pins_beat_the_aggregate() {
+        assert_eq!(MediaType::for_path("src/app.ts").essence(), "application/typescript");
+        assert_eq!(MediaType::for_path("src/app.tsx").essence(), "application/typescript");
+        assert_eq!(MediaType::for_path("feed.xml").essence(), "application/xml");
+        assert_eq!(MediaType::for_path("app.js").essence(), "text/javascript");
     }
 
     /// Bulk media maps by name but must not join the extension-less probe
@@ -261,12 +216,54 @@ mod tests {
     #[test]
     fn media_extensions_are_not_negotiated() {
         let negotiable: Vec<&str> = MediaType::known_extensions().map(|(e, _)| e).collect();
-        assert!(negotiable.contains(&"html"));
+        assert_eq!(negotiable.first(), Some(&"html"));
         assert!(negotiable.contains(&"png"));
-        for ext in ["mp4", "webm", "mp3", "woff2", "ico"] {
+        assert_eq!(negotiable.len(), NEGOTIABLE_EXTENSIONS.len());
+        for ext in ["mp4", "webm", "mp3", "woff2", "ico", "docx"] {
             assert!(!negotiable.contains(&ext), "{ext} should not be negotiable");
             assert!(MediaType::from_extension(ext).is_some(), "{ext} unmapped");
         }
+        // Every negotiable extension must actually map.
+        for (ext, mt) in MediaType::known_extensions() {
+            assert_ne!(mt.essence(), OCTET_STREAM, "negotiable .{ext} has no media type");
+        }
+    }
+
+    /// The reverse map names a server-named file (keyless POST). Every entry
+    /// must map back to its own essence, or the file would be served as
+    /// something other than what was posted.
+    #[test]
+    fn canonical_extensions_round_trip() {
+        for (essence, ext) in CANONICAL_EXTENSIONS {
+            let back = MediaType::from_extension(ext);
+            assert_eq!(
+                back.as_ref().map(MediaType::essence),
+                Some(*essence),
+                "{essence} -> .{ext} does not round-trip"
+            );
+        }
+        // The ones people actually post.
+        for (essence, ext) in [
+            ("video/mp4", "mp4"),
+            ("audio/mpeg", "mp3"),
+            ("image/jpeg", "jpg"),
+            ("text/javascript", "js"),
+            ("application/pdf", "pdf"),
+        ] {
+            assert_eq!(MediaType::new(essence).canonical_extension(), Some(ext));
+        }
+        assert_eq!(MediaType::new("application/x-not-a-real-type").canonical_extension(), None);
+    }
+
+    /// The tables are binary-searched, so a sort slip would silently lose rows.
+    #[test]
+    fn generated_tables_are_sorted_and_whole() {
+        assert!(EXTENSION_TABLE.len() > 1000, "the map should be exhaustive");
+        assert!(EXTENSION_TABLE.windows(2).all(|w| w[0].0 < w[1].0), "EXTENSION_TABLE unsorted");
+        assert!(
+            CANONICAL_EXTENSIONS.windows(2).all(|w| w[0].0 < w[1].0),
+            "CANONICAL_EXTENSIONS unsorted"
+        );
     }
 
     #[test]

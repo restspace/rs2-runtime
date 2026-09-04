@@ -187,6 +187,19 @@ describe("runtime services", () => {
     res = await anon.get("/files/media/inter.woff2");
     expect(res.contentType(), "[file] .woff2 is font/woff2").toBe("font/woff2");
 
+    // The long tail both hosts read from the generated table, and the pin that
+    // matters most: a `.ts` in a tenant's files is source, not an MPEG stream.
+    const mapped: Array<[string, string]> = [
+      ["report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+      ["captions.vtt", "text/vtt"],
+      ["app.ts", "application/typescript"],
+    ];
+    for (const [name, essence] of mapped) {
+      status(await anon.put(`/files/media/${name}`, text("x", essence)), 201, `[file] PUT ${name}`);
+      res = await anon.get(`/files/media/${name}`);
+      expect(res.contentType(), `[file] .${name.split(".").pop()} is ${essence}`).toBe(essence);
+    }
+
     // Keyless POST reverses the map: a declared video/mp4 is named `.mp4`, so
     // the file it creates reads back as a video.
     res = await anon.post("/files/media/", text("fake-mp4", "video/mp4"));
@@ -198,7 +211,7 @@ describe("runtime services", () => {
     expect(res.contentType(), "[file] server-named video round-trips").toBe("video/mp4");
 
     status(await anon.delete(location!), 204, "[file] cleanup server-named video");
-    for (const name of ["clip.mp4", "theme.mp3", "inter.woff2"]) {
+    for (const name of ["clip.mp4", "theme.mp3", "inter.woff2", ...mapped.map(([n]) => n)]) {
       status(await anon.delete(`/files/media/${name}`), 204, `[file] cleanup ${name}`);
     }
     status(await anon.delete("/files/media/"), 204, "[file] cleanup media dir");

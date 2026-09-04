@@ -15,12 +15,14 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "build:shim": "node scripts/build-shim.mjs",
-    "vendor:hash-wasm": "node scripts/vendor-hash-wasm.mjs"
+    "vendor:hash-wasm": "node scripts/vendor-hash-wasm.mjs",
+    "gen:media-types": "node scripts/gen-media-types.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^5.20260825.1",
     "hash-wasm": "^4.12.0",
+    "mime-db": "^1.53.0",
     "typescript": "^5.6.0",
     "vitest": "^4.1.0",
     "wrangler": "^4.126.0"

@@ -2,6 +2,7 @@
 
 mod body;
 pub mod media_type;
+mod media_type_table;
 #[allow(clippy::module_inception)]
 mod message;
 

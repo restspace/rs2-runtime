@@ -8,72 +8,27 @@ export const JSON_TYPE = "application/json";
 export const SCHEMA_JSON = "application/schema+json";
 export const PROBLEM_JSON = "application/problem+json";
 
-/// Known `(extension, essence, negotiable)` triples, in friendly-URL
-/// preference order. The single source for `fromExtension` and
-/// `knownExtensions`.
-///
-/// `negotiable` marks the extensions the file service probes for an
-/// extension-less request. Bulk media (video, audio, fonts) maps to a media
-/// type when addressed by name but is never a friendly-URL candidate: nobody
-/// writes `/clip` meaning `/clip.mp4`, and every candidate costs a store probe
-/// on a miss.
-const EXTENSION_TABLE: ReadonlyArray<readonly [string, string, boolean]> = [
-  ["html", "text/html", true],
-  ["htm", "text/html", true],
-  ["md", "text/markdown", true],
-  ["txt", "text/plain", true],
-  ["json", JSON_TYPE, true],
-  ["xml", "application/xml", true],
-  ["yaml", "application/yaml", true],
-  ["yml", "application/yaml", true],
-  ["csv", "text/csv", true],
-  ["css", "text/css", true],
-  ["js", "text/javascript", true],
-  ["mjs", "text/javascript", true],
-  ["jsx", "text/javascript", true],
-  ["ts", "application/typescript", true],
-  ["tsx", "application/typescript", true],
-  ["svg", "image/svg+xml", true],
-  ["png", "image/png", true],
-  ["jpg", "image/jpeg", true],
-  ["jpeg", "image/jpeg", true],
-  ["gif", "image/gif", true],
-  ["webp", "image/webp", true],
-  ["pdf", "application/pdf", true],
-  ["zip", "application/zip", true],
-  ["wasm", "application/wasm", true],
-  // Images addressed by name only.
-  ["avif", "image/avif", false],
-  ["ico", "image/vnd.microsoft.icon", false],
-  ["bmp", "image/bmp", false],
-  ["tif", "image/tiff", false],
-  ["tiff", "image/tiff", false],
-  // Video.
-  ["mp4", "video/mp4", false],
-  ["m4v", "video/mp4", false],
-  ["webm", "video/webm", false],
-  ["ogv", "video/ogg", false],
-  ["mov", "video/quicktime", false],
-  ["mkv", "video/x-matroska", false],
-  ["avi", "video/x-msvideo", false],
-  ["mpeg", "video/mpeg", false],
-  ["mpg", "video/mpeg", false],
-  // Audio.
-  ["mp3", "audio/mpeg", false],
-  ["m4a", "audio/mp4", false],
-  ["aac", "audio/aac", false],
-  ["ogg", "audio/ogg", false],
-  ["oga", "audio/ogg", false],
-  ["opus", "audio/ogg", false],
-  ["weba", "audio/webm", false],
-  ["wav", "audio/wav", false],
-  ["flac", "audio/flac", false],
-  // Fonts.
-  ["woff", "font/woff", false],
-  ["woff2", "font/woff2", false],
-  ["ttf", "font/ttf", false],
-  ["otf", "font/otf", false],
-];
+import {
+  CANONICAL_EXTENSIONS,
+  EXTENSION_TABLE,
+  NEGOTIABLE_EXTENSIONS,
+} from "./media-type-table";
+
+/// Index of `key` in a table sorted by its first column, or -1. The tables run
+/// to ~1200 rows and a directory listing types one path per entry, so lookup
+/// is a binary search rather than a scan (and needs no startup Map).
+function lookup(table: ReadonlyArray<readonly [string, string]>, key: string): string | undefined {
+  let lo = 0;
+  let hi = table.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const at = table[mid]![0];
+    if (at === key) return table[mid]![1];
+    if (at < key) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  return undefined;
+}
 
 export class MediaType {
   /// The essence, e.g. `application/json` — always lowercase, no params.
@@ -144,26 +99,30 @@ export class MediaType {
 
   /// Media type from a file extension; `undefined` if unknown.
   static fromExtension(ext: string): MediaType | undefined {
-    const e = ext.replace(/^\.+/, "").toLowerCase();
-    const hit = EXTENSION_TABLE.find(([x]) => x === e);
-    return hit ? new MediaType(hit[1]) : undefined;
+    const essence = lookup(EXTENSION_TABLE, ext.replace(/^\.+/, "").toLowerCase());
+    return essence === undefined ? undefined : new MediaType(essence);
   }
 
-  /// Every negotiable `(extension-without-dot, media type)` pair, in
-  /// friendly-URL preference order.
+  /// The `[extension-without-dot, media type]` pairs the file service probes
+  /// for an extension-less request, in friendly-URL preference order.
+  ///
+  /// Deliberately a short list, not the whole map: every candidate costs a
+  /// store probe on a miss, and nobody writes `/clip` meaning `/clip.mp4`.
+  /// Bulk media is served when addressed by name and never negotiated.
   static knownExtensions(): Array<[string, MediaType]> {
-    return EXTENSION_TABLE.filter(([, , negotiable]) => negotiable).map(([ext, essence]) => [
+    return NEGOTIABLE_EXTENSIONS.map((ext) => [
       ext,
-      new MediaType(essence),
+      MediaType.fromExtension(ext) ?? MediaType.octetStream(),
     ]);
   }
 
-  /// The canonical extension for an essence — the reverse of the extension
+  /// The canonical extension for this essence — the reverse of the extension
   /// map, used to name a server-named file (keyless POST) from its declared
-  /// media type. The first table entry wins, so `image/jpeg` is `jpg`, not
-  /// `jpeg`. `undefined` when nothing in the table claims the essence.
+  /// media type. Every entry round-trips (the extension maps back to this
+  /// essence), so the file that gets named is served as what was posted.
+  /// `undefined` when no extension claims the essence.
   canonicalExtension(): string | undefined {
-    return EXTENSION_TABLE.find(([, essence]) => essence === this._essence)?.[0];
+    return lookup(CANONICAL_EXTENSIONS, this._essence);
   }
 
   /// Media type for a stored file path (extension map), falling back to
