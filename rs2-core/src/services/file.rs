@@ -27,37 +27,94 @@ impl FileService {
         }
     }
 
+    /// The validators a served body carries: its (quoted) content-version
+    /// ETag and `Last-Modified`, both owned so no `&Body` is held across an
+    /// await.
+    fn validators(body: &Body) -> (Option<String>, Option<String>) {
+        (
+            match &body.provenance {
+                Provenance::Replayable { version, .. } => Some(format!("\"{version}\"")),
+                _ => None,
+            },
+            body.last_modified.and_then(|lm| {
+                lm.format(&time::format_description::well_known::Rfc2822)
+                    .ok()
+            }),
+        )
+    }
+
+    /// 416 with the `Content-Range: bytes */<total>` RFC 9110 §15.5.17 asks
+    /// for: a client that guessed past the end learns the real size from the
+    /// refusal instead of having to issue another request to find it.
+    fn range_not_satisfiable(template: &Message, total: u64) -> Message {
+        let err = RsError::new(
+            416,
+            crate::error::codes::BAD_REQUEST,
+            "Range Not Satisfiable",
+            format!("no satisfiable byte range in the request for a {total}-byte resource"),
+        );
+        let mut resp = template.error_response(&err);
+        resp.set_header("content-range", &format!("bytes */{total}"));
+        resp.set_header("accept-ranges", "bytes");
+        resp
+    }
+
     /// Serve one stored file with Range/ETag/304 semantics. Takes owned
     /// request facts rather than `&Message` (request bodies are not Sync,
     /// so a `&Message` may not be held across awaits).
     async fn serve_file(
         &self,
         template: Message,
-        range: Option<ByteRange>,
-        if_none_match: Option<String>,
+        conds: &ReadConditions,
         files: &crate::capabilities::ScopedFileStore,
         path: &str,
     ) -> Result<Message, RsError> {
-        let body = files.read(path, range).await?;
-        let mut resp = if range.is_some() {
-            template.response(StatusCode::PARTIAL_CONTENT, Some(body))
-        } else {
-            template.ok(Some(body))
+        // A range is resolved against the resource's current size *before* the
+        // read: `bytes=-500` names nothing without the total, and the total is
+        // what both `Content-Range` and a 416 have to report. Only a ranged
+        // request pays for the extra `head`.
+        let mut resolved = match conds.range {
+            None => None,
+            Some(spec) => {
+                let total = files.head(path).await?.size;
+                match spec.resolve(total) {
+                    Some((first, last)) => Some((first, last, total)),
+                    None => return Ok(Self::range_not_satisfiable(&template, total)),
+                }
+            }
+        };
+        let mut body = files
+            .read(
+                path,
+                resolved.map(|(first, last, _)| ByteRange {
+                    start: first,
+                    end: Some(last),
+                }),
+            )
+            .await?;
+        let (mut etag, mut last_modified) = Self::validators(&body);
+        // `If-Range` on a stale validator: the client's partial copy is no
+        // longer of this representation, so a slice would be spliced onto
+        // bytes that no longer match. Hand back the whole current resource.
+        if resolved.is_some()
+            && conds
+                .if_range
+                .as_deref()
+                .is_some_and(|ir| !if_range_matches(ir, etag.as_deref(), last_modified.as_deref()))
+        {
+            body = files.read(path, None).await?;
+            (etag, last_modified) = Self::validators(&body);
+            resolved = None;
+        }
+        let mut resp = match resolved {
+            Some((first, last, total)) => {
+                let mut partial = template.response(StatusCode::PARTIAL_CONTENT, Some(body));
+                partial.set_header("content-range", &format!("bytes {first}-{last}/{total}"));
+                partial
+            }
+            None => template.ok(Some(body)),
         };
         resp.set_header("accept-ranges", "bytes");
-        let (etag, last_modified) = match &resp.body {
-            Some(b) => (
-                match &b.provenance {
-                    Provenance::Replayable { version, .. } => Some(format!("\"{version}\"")),
-                    _ => None,
-                },
-                b.last_modified.and_then(|lm| {
-                    lm.format(&time::format_description::well_known::Rfc2822)
-                        .ok()
-                }),
-            ),
-            None => (None, None),
-        };
         if let Some(etag) = &etag {
             resp.set_header("etag", etag);
         }
@@ -67,7 +124,7 @@ impl FileService {
         // Conditional GET: a matching If-None-Match revalidates the
         // caller's copy without resending the body.
         if let Some(etag) = &etag {
-            if super::if_none_match_hits(if_none_match.as_deref(), etag) {
+            if super::if_none_match_hits(conds.if_none_match.as_deref(), etag) {
                 let mut not_modified = resp.response(StatusCode::NOT_MODIFIED, None);
                 not_modified.set_header("etag", etag);
                 if let Some(lm) = &last_modified {
@@ -193,7 +250,6 @@ fn extension_for(media_type: &MediaType) -> String {
     }
 }
 
-
 /// Whether `path`'s final segment carries no extension — the precondition for
 /// treating it as a friendly URL (`/docs/readme`, not `/docs/readme.md`).
 fn is_extensionless(path: &str) -> bool {
@@ -309,20 +365,101 @@ fn negotiate_extensions(accept: Option<&str>, priority: &[String]) -> Vec<String
     candidates.into_iter().map(|(ext, _)| ext).collect()
 }
 
-fn parse_range(header: &str) -> Option<ByteRange> {
-    // Single range only: `bytes=start-end` | `bytes=start-`.
+/// The conditional-read headers of one GET, gathered once and passed down to
+/// every path that can end up serving a file (exact hit, default document,
+/// friendly URL, SPA fallback) so they all answer them identically.
+#[derive(Default)]
+struct ReadConditions {
+    range: Option<RangeSpec>,
+    if_none_match: Option<String>,
+    if_range: Option<String>,
+}
+
+/// A single `Range` the service understands, before it is resolved against
+/// the resource. A suffix range has no meaning until the total size is
+/// known, which is why parsing and resolution are two steps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RangeSpec {
+    /// `bytes=start-` / `bytes=start-end` (`end` inclusive, HTTP-style).
+    Offset { start: u64, end: Option<u64> },
+    /// `bytes=-n`: the last `n` bytes. Common for reading a trailer (a zip
+    /// central directory, a media index) without fetching the whole file.
+    Suffix(u64),
+}
+
+impl RangeSpec {
+    /// Resolve against a resource of `total` bytes to an inclusive
+    /// `(first, last)` pair, or `None` when the range is unsatisfiable and
+    /// the answer is a 416 (RFC 9110 §14.1.1: a first-byte-pos at or past
+    /// the end, or a zero-length suffix).
+    fn resolve(self, total: u64) -> Option<(u64, u64)> {
+        if total == 0 {
+            return None;
+        }
+        match self {
+            RangeSpec::Offset { start, end } => {
+                if start >= total {
+                    return None;
+                }
+                // An absent or over-long end clamps to the last byte.
+                Some((start, end.unwrap_or(total - 1).min(total - 1)))
+            }
+            RangeSpec::Suffix(0) => None,
+            // A suffix longer than the resource is the whole resource.
+            RangeSpec::Suffix(n) => Some((total.saturating_sub(n), total - 1)),
+        }
+    }
+}
+
+/// Parse a `Range` header. `None` means "no usable range" — the header is
+/// then ignored and the whole resource served, which RFC 9110 §14.2 allows
+/// for anything a server chooses not to satisfy. That covers a unit other
+/// than `bytes`, a multi-range set, and a syntactically invalid spec such as
+/// `bytes=500-400` (last before first): invalid is *not* unsatisfiable, so
+/// it is a 200, not a 416.
+fn parse_range(header: &str) -> Option<RangeSpec> {
     let spec = header.strip_prefix("bytes=")?;
     if spec.contains(',') {
         return None; // multi-range unsupported; serve the full resource
     }
     let (start, end) = spec.split_once('-')?;
-    let start: u64 = start.trim().parse().ok()?;
-    let end: Option<u64> = if end.trim().is_empty() {
-        None
-    } else {
-        end.trim().parse().ok()
-    };
-    Some(ByteRange { start, end })
+    let (start, end) = (start.trim(), end.trim());
+    if start.is_empty() {
+        // `bytes=-n`. A bare `bytes=-` names nothing.
+        return end.parse().ok().map(RangeSpec::Suffix);
+    }
+    let start: u64 = start.parse().ok()?;
+    if end.is_empty() {
+        return Some(RangeSpec::Offset { start, end: None });
+    }
+    let end: u64 = end.parse().ok()?;
+    if end < start {
+        return None; // invalid spec: ignore the header entirely
+    }
+    Some(RangeSpec::Offset {
+        start,
+        end: Some(end),
+    })
+}
+
+/// `If-Range` (RFC 9110 §13.1.5): a client resuming a download says "give me
+/// the range only if what you hold is still what I hold". A mismatch is not
+/// an error — it means the client's partial copy is stale and must be
+/// replaced by the whole current representation.
+///
+/// An entity-tag is compared *strongly*: a weak tag never satisfies an
+/// `If-Range`, because weak equivalence permits byte differences and splicing
+/// a slice onto a stale prefix would silently corrupt the result. Any other
+/// value is treated as a date and must equal `Last-Modified` exactly.
+fn if_range_matches(if_range: &str, etag: Option<&str>, last_modified: Option<&str>) -> bool {
+    let value = if_range.trim();
+    if value.starts_with("W/") {
+        return false;
+    }
+    if value.starts_with('"') {
+        return etag == Some(value);
+    }
+    last_modified == Some(value)
 }
 
 #[async_trait]
@@ -335,8 +472,17 @@ impl Service for FileService {
         let path = msg.url.service_path.clone();
 
         let site = &self.site;
-        let range = msg.header("range").and_then(parse_range);
-        let if_none_match = msg.header("if-none-match").map(String::from);
+        // A `Range` only applies to a GET that would otherwise return the
+        // whole representation; on any other method it is meaningless and
+        // ignored (RFC 9110 §14.2).
+        let conds = ReadConditions {
+            range: match msg.method {
+                Method::GET => msg.header("range").and_then(parse_range),
+                _ => None,
+            },
+            if_none_match: msg.header("if-none-match").map(String::from),
+            if_range: msg.header("if-range").map(String::from),
+        };
         let accept = msg.header("accept").map(String::from);
 
         // MOVE renames a file within this store (the `move` facet). The
@@ -395,8 +541,7 @@ impl Service for FileService {
                         match self
                             .serve_file(
                                 msg.response(StatusCode::OK, None),
-                                range,
-                                if_none_match.clone(),
+                                &conds,
                                 files,
                                 &format!("{path}{default}"),
                             )
@@ -414,8 +559,7 @@ impl Service for FileService {
                                 let mut resp = self
                                     .serve_file(
                                         msg.response(StatusCode::OK, None),
-                                        range,
-                                        if_none_match,
+                                        &conds,
                                         files,
                                         &format!("/{default}"),
                                     )
@@ -491,13 +635,7 @@ impl Service for FileService {
             }
             Method::GET => {
                 let e = match self
-                    .serve_file(
-                        msg.response(StatusCode::OK, None),
-                        range,
-                        if_none_match.clone(),
-                        files,
-                        &path,
-                    )
+                    .serve_file(msg.response(StatusCode::OK, None), &conds, files, &path)
                     .await
                 {
                     Ok(resp) => return Ok(resp),
@@ -531,8 +669,7 @@ impl Service for FileService {
                             let mut resp = self
                                 .serve_file(
                                     msg.response(StatusCode::OK, None),
-                                    range,
-                                    if_none_match,
+                                    &conds,
                                     files,
                                     &real,
                                 )
@@ -555,8 +692,7 @@ impl Service for FileService {
                         return self
                             .serve_file(
                                 msg.response(StatusCode::OK, None),
-                                range,
-                                if_none_match,
+                                &conds,
                                 files,
                                 &format!("/{default}"),
                             )
@@ -756,6 +892,123 @@ impl Service for FileService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_parses_the_three_forms() {
+        assert_eq!(
+            parse_range("bytes=0-99"),
+            Some(RangeSpec::Offset {
+                start: 0,
+                end: Some(99)
+            })
+        );
+        assert_eq!(
+            parse_range("bytes=100-"),
+            Some(RangeSpec::Offset {
+                start: 100,
+                end: None
+            })
+        );
+        assert_eq!(parse_range("bytes=-500"), Some(RangeSpec::Suffix(500)));
+        // Whitespace around the numbers is tolerated.
+        assert_eq!(
+            parse_range("bytes= 5 - 9 "),
+            Some(RangeSpec::Offset {
+                start: 5,
+                end: Some(9)
+            })
+        );
+    }
+
+    #[test]
+    fn unusable_range_headers_are_ignored() {
+        // Not the `bytes` unit, a multi-range set, and pure nonsense: all
+        // mean "serve the whole thing", never a 416.
+        assert_eq!(parse_range("items=0-9"), None);
+        assert_eq!(parse_range("bytes=0-9,20-29"), None);
+        assert_eq!(parse_range("bytes=abc"), None);
+        assert_eq!(parse_range("bytes=-"), None);
+        // Invalid (last before first) is not the same as unsatisfiable.
+        assert_eq!(parse_range("bytes=500-400"), None);
+    }
+
+    #[test]
+    fn range_resolves_against_the_size() {
+        let total = 1000;
+        assert_eq!(
+            RangeSpec::Offset {
+                start: 0,
+                end: Some(99)
+            }
+            .resolve(total),
+            Some((0, 99))
+        );
+        // An open end, and an end past the last byte, both clamp.
+        assert_eq!(
+            RangeSpec::Offset {
+                start: 900,
+                end: None
+            }
+            .resolve(total),
+            Some((900, 999))
+        );
+        assert_eq!(
+            RangeSpec::Offset {
+                start: 900,
+                end: Some(9999)
+            }
+            .resolve(total),
+            Some((900, 999))
+        );
+        // Suffix ranges count back from the end; one longer than the
+        // resource is the whole resource.
+        assert_eq!(RangeSpec::Suffix(10).resolve(total), Some((990, 999)));
+        assert_eq!(RangeSpec::Suffix(5000).resolve(total), Some((0, 999)));
+    }
+
+    #[test]
+    fn unsatisfiable_ranges_resolve_to_none() {
+        // A first-byte-pos at or past the end, a zero-length suffix, and any
+        // range at all against an empty resource.
+        assert_eq!(
+            RangeSpec::Offset {
+                start: 1000,
+                end: None
+            }
+            .resolve(1000),
+            None
+        );
+        assert_eq!(RangeSpec::Suffix(0).resolve(1000), None);
+        assert_eq!(
+            RangeSpec::Offset {
+                start: 0,
+                end: Some(0)
+            }
+            .resolve(0),
+            None
+        );
+    }
+
+    #[test]
+    fn if_range_compares_strongly() {
+        let etag = Some("\"v7\"");
+        let lm = Some("Mon, 31 Aug 2026 17:54:48 +0000");
+        assert!(if_range_matches("\"v7\"", etag, lm));
+        assert!(!if_range_matches("\"v6\"", etag, lm));
+        // A weak tag can never license splicing bytes together.
+        assert!(!if_range_matches("W/\"v7\"", etag, lm));
+        // A date form matches the resource's own Last-Modified.
+        assert!(if_range_matches(
+            "Mon, 31 Aug 2026 17:54:48 +0000",
+            etag,
+            lm
+        ));
+        assert!(!if_range_matches(
+            "Tue, 01 Sep 2026 00:00:00 +0000",
+            etag,
+            lm
+        ));
+    }
 
     #[test]
     fn extensionless_detects_final_segment() {

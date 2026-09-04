@@ -80,11 +80,14 @@ async fn file_write_read_list_delete() {
     let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
     assert_eq!(&bytes[..], b"alpha2");
 
-    // Range read → 206 partial
+    // Range read → 206 partial, and the 206 says which bytes these are: a
+    // 206 without Content-Range tells the client nothing it can assemble.
     let mut range_req = req(Method::GET, "/files/docs/a.txt");
     range_req.set_header("range", "bytes=0-2");
     let mut resp = rt.handle(range_req).await;
     assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT));
+    assert_eq!(resp.header("content-range"), Some("bytes 0-2/6"));
+    assert_eq!(resp.header("accept-ranges"), Some("bytes"));
     let bytes = resp.body.as_mut().unwrap().materialize(1024).await.unwrap();
     assert_eq!(&bytes[..], b"alp");
 
@@ -593,4 +596,136 @@ async fn tenant_storage_is_host_scoped() {
 
     // And on disk the file sits under the tenant prefix.
     assert!(dir.path().join("alpha").join("x.txt").exists());
+}
+
+/// The `Range` surface end to end: every form a client actually sends, and
+/// what each one has to answer with. The bodies are checked alongside the
+/// headers because a `Content-Range` that disagrees with the bytes is worse
+/// than none at all.
+#[tokio::test]
+async fn file_range_forms_and_their_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = test_runtime(dir.path());
+    rt.handle(
+        req(Method::PUT, "/files/r.txt").with_body(Body::from_string(
+            "0123456789",
+            MediaType::new("text/plain"),
+        )),
+    )
+    .await;
+
+    let ranged = |spec: &'static str| {
+        let rt = rt.clone();
+        async move {
+            let mut r = req(Method::GET, "/files/r.txt");
+            r.set_header("range", spec);
+            rt.handle(r).await
+        }
+    };
+
+    // An open-ended range runs to the last byte.
+    let mut resp = ranged("bytes=7-").await;
+    assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT));
+    assert_eq!(resp.header("content-range"), Some("bytes 7-9/10"));
+    let bytes = resp.body.as_mut().unwrap().materialize(64).await.unwrap();
+    assert_eq!(&bytes[..], b"789");
+
+    // A suffix range counts back from the end — the form a client uses to
+    // read a trailer without knowing the size.
+    let mut resp = ranged("bytes=-3").await;
+    assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT));
+    assert_eq!(resp.header("content-range"), Some("bytes 7-9/10"));
+    let bytes = resp.body.as_mut().unwrap().materialize(64).await.unwrap();
+    assert_eq!(&bytes[..], b"789");
+
+    // A suffix longer than the resource is the whole resource, still as a 206.
+    let resp = ranged("bytes=-500").await;
+    assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT));
+    assert_eq!(resp.header("content-range"), Some("bytes 0-9/10"));
+
+    // An end past the last byte clamps rather than failing.
+    let resp = ranged("bytes=5-99").await;
+    assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT));
+    assert_eq!(resp.header("content-range"), Some("bytes 5-9/10"));
+
+    // Past the end is unsatisfiable: 416, naming the real size so the client
+    // can re-ask without a second round trip to discover it.
+    let resp = ranged("bytes=10-20").await;
+    assert_eq!(resp.status, Some(StatusCode::RANGE_NOT_SATISFIABLE));
+    assert_eq!(resp.header("content-range"), Some("bytes */10"));
+    assert_eq!(resp.header("accept-ranges"), Some("bytes"));
+
+    // Headers we can't satisfy are ignored, not rejected: another unit, a
+    // multi-range set, and an invalid spec all serve the whole resource.
+    for spec in ["items=0-5", "bytes=0-1,5-6", "bytes=8-2"] {
+        let mut r = req(Method::GET, "/files/r.txt");
+        r.set_header("range", spec);
+        let mut resp = rt.handle(r).await;
+        assert_eq!(resp.status, Some(StatusCode::OK), "{spec} should serve 200");
+        assert!(resp.header("content-range").is_none(), "{spec}");
+        let bytes = resp.body.as_mut().unwrap().materialize(64).await.unwrap();
+        assert_eq!(&bytes[..], b"0123456789", "{spec}");
+    }
+
+    // A Range on a method that isn't GET means nothing.
+    let mut head = req(Method::HEAD, "/files/r.txt");
+    head.set_header("range", "bytes=0-2");
+    let resp = rt.handle(head).await;
+    assert_eq!(resp.status, Some(StatusCode::OK));
+    assert_eq!(resp.header("content-length"), Some("10"));
+}
+
+/// `If-Range` is what makes a resumed download safe: the slice is only served
+/// while the client's copy is still of this representation.
+#[tokio::test]
+async fn file_if_range_guards_the_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = test_runtime(dir.path());
+    rt.handle(
+        req(Method::PUT, "/files/r.txt").with_body(Body::from_string(
+            "0123456789",
+            MediaType::new("text/plain"),
+        )),
+    )
+    .await;
+    let resp = rt.handle(req(Method::GET, "/files/r.txt")).await;
+    let etag = resp.header("etag").unwrap().to_string();
+
+    // The validator still matches → the partial read proceeds.
+    let mut r = req(Method::GET, "/files/r.txt");
+    r.set_header("range", "bytes=0-2");
+    r.set_header("if-range", &etag);
+    let mut resp = rt.handle(r).await;
+    assert_eq!(resp.status, Some(StatusCode::PARTIAL_CONTENT));
+    assert_eq!(resp.header("content-range"), Some("bytes 0-2/10"));
+    let bytes = resp.body.as_mut().unwrap().materialize(64).await.unwrap();
+    assert_eq!(&bytes[..], b"012");
+
+    // A stale validator: the client's partial copy is of a resource that no
+    // longer exists, so it gets the whole current one instead of a slice it
+    // would splice onto bytes that don't match.
+    let mut r = req(Method::GET, "/files/r.txt");
+    r.set_header("range", "bytes=0-2");
+    r.set_header("if-range", "\"stale-version\"");
+    let mut resp = rt.handle(r).await;
+    assert_eq!(resp.status, Some(StatusCode::OK));
+    assert!(resp.header("content-range").is_none());
+    let bytes = resp.body.as_mut().unwrap().materialize(64).await.unwrap();
+    assert_eq!(&bytes[..], b"0123456789");
+
+    // A weak tag never licenses a resume, even one that names this version.
+    let mut r = req(Method::GET, "/files/r.txt");
+    r.set_header("range", "bytes=0-2");
+    r.set_header("if-range", &format!("W/{etag}"));
+    let resp = rt.handle(r).await;
+    assert_eq!(resp.status, Some(StatusCode::OK));
+
+    // If-None-Match still wins over a Range: a fresh client copy is a 304,
+    // not a partial body.
+    let mut r = req(Method::GET, "/files/r.txt");
+    r.set_header("range", "bytes=0-2");
+    r.set_header("if-none-match", &etag);
+    let resp = rt.handle(r).await;
+    assert_eq!(resp.status, Some(StatusCode::NOT_MODIFIED));
+    assert!(resp.header("content-range").is_none());
 }

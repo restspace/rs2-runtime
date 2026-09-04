@@ -7,6 +7,12 @@
 //! is media_type.rs / media-type.ts: this file is only the data.
 
 /// `(extension, essence)`, sorted by extension for binary search.
+///
+/// `rustfmt::skip`, here and below: rustfmt explodes the handful of rows
+/// wider than 100 columns across four lines, which would make this file churn
+/// every time it is regenerated and reformatted. One row per line is also how
+/// a data table wants to be read.
+#[rustfmt::skip]
 pub(super) const EXTENSION_TABLE: &[(&str, &str)] = &[
     ("123", "application/vnd.lotus-1-2-3"),
     ("1km", "application/vnd.1000minds.decision-model+xml"),
@@ -1221,6 +1227,7 @@ pub(super) const EXTENSION_TABLE: &[(&str, &str)] = &[
 
 /// `(essence, canonical extension)`, sorted by essence for binary search.
 /// Every entry round-trips: the extension maps back to the same essence.
+#[rustfmt::skip]
 pub(super) const CANONICAL_EXTENSIONS: &[(&str, &str)] = &[
     ("application/andrew-inset", "ez"),
     ("application/appinstaller", "appinstaller"),
@@ -2188,6 +2195,7 @@ pub(super) const CANONICAL_EXTENSIONS: &[(&str, &str)] = &[
 ];
 
 /// The friendly-URL probe order for an extension-less request, best first.
+#[rustfmt::skip]
 pub(super) const NEGOTIABLE_EXTENSIONS: &[&str] = &[
     "html",
     "htm",

@@ -113,9 +113,12 @@ impl MediaType {
     /// store probe on a miss, and nobody writes `/clip` meaning `/clip.mp4`.
     /// Bulk media is served when addressed by name and never negotiated.
     pub fn known_extensions() -> impl Iterator<Item = (&'static str, MediaType)> {
-        NEGOTIABLE_EXTENSIONS
-            .iter()
-            .map(|ext| (*ext, Self::from_extension(ext).unwrap_or_else(Self::octet_stream)))
+        NEGOTIABLE_EXTENSIONS.iter().map(|ext| {
+            (
+                *ext,
+                Self::from_extension(ext).unwrap_or_else(Self::octet_stream),
+            )
+        })
     }
 
     /// The canonical extension for this essence — the reverse of the extension
@@ -190,7 +193,10 @@ mod tests {
             ("fonts/inter.woff2", "font/woff2"),
             ("favicon.ico", "image/vnd.microsoft.icon"),
             // The long tail the generated map brought in.
-            ("docs/report.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            (
+                "docs/report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ),
             ("book.epub", "application/epub+zip"),
             ("captions.vtt", "text/vtt"),
             ("stream.m3u8", "application/vnd.apple.mpegurl"),
@@ -205,8 +211,14 @@ mod tests {
     /// transport stream nginx (and so mime-db) calls it.
     #[test]
     fn rs2_pins_beat_the_aggregate() {
-        assert_eq!(MediaType::for_path("src/app.ts").essence(), "application/typescript");
-        assert_eq!(MediaType::for_path("src/app.tsx").essence(), "application/typescript");
+        assert_eq!(
+            MediaType::for_path("src/app.ts").essence(),
+            "application/typescript"
+        );
+        assert_eq!(
+            MediaType::for_path("src/app.tsx").essence(),
+            "application/typescript"
+        );
         assert_eq!(MediaType::for_path("feed.xml").essence(), "application/xml");
         assert_eq!(MediaType::for_path("app.js").essence(), "text/javascript");
     }
@@ -225,7 +237,11 @@ mod tests {
         }
         // Every negotiable extension must actually map.
         for (ext, mt) in MediaType::known_extensions() {
-            assert_ne!(mt.essence(), OCTET_STREAM, "negotiable .{ext} has no media type");
+            assert_ne!(
+                mt.essence(),
+                OCTET_STREAM,
+                "negotiable .{ext} has no media type"
+            );
         }
     }
 
@@ -252,14 +268,20 @@ mod tests {
         ] {
             assert_eq!(MediaType::new(essence).canonical_extension(), Some(ext));
         }
-        assert_eq!(MediaType::new("application/x-not-a-real-type").canonical_extension(), None);
+        assert_eq!(
+            MediaType::new("application/x-not-a-real-type").canonical_extension(),
+            None
+        );
     }
 
     /// The tables are binary-searched, so a sort slip would silently lose rows.
     #[test]
     fn generated_tables_are_sorted_and_whole() {
         assert!(EXTENSION_TABLE.len() > 1000, "the map should be exhaustive");
-        assert!(EXTENSION_TABLE.windows(2).all(|w| w[0].0 < w[1].0), "EXTENSION_TABLE unsorted");
+        assert!(
+            EXTENSION_TABLE.windows(2).all(|w| w[0].0 < w[1].0),
+            "EXTENSION_TABLE unsorted"
+        );
         assert!(
             CANONICAL_EXTENSIONS.windows(2).all(|w| w[0].0 < w[1].0),
             "CANONICAL_EXTENSIONS unsorted"

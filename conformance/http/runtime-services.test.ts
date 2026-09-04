@@ -102,7 +102,7 @@ describe("runtime services", () => {
   afterAll(async () => {
     if (!seed) return;
     // Root-level files the tests author (no directory to confirm-delete).
-    for (const p of ["/files/a.txt", "/files/b.txt", "/files/c.txt", "/site/index.html", "/site/app.js", "/spa/index.html"]) {
+    for (const p of ["/files/a.txt", "/files/b.txt", "/files/c.txt", "/files/r.txt", "/files/ir.txt", "/site/index.html", "/site/app.js", "/spa/index.html"]) {
       await seed.admin.delete(p);
     }
     await seed.restore();
@@ -122,10 +122,13 @@ describe("runtime services", () => {
     expect(res.etag(), "[file] GET carries ETag").not.toBeNull();
     expect(res.text()).toBe("alpha2");
 
-    // Range read → 206 partial
+    // Range read → 206 partial, and the 206 says which bytes these are: a
+    // 206 without Content-Range tells the client nothing it can assemble.
     res = await anon.get("/files/docs/a.txt", { headers: { range: "bytes=0-2" } });
     status(res, 206, "[file] Range GET");
     expect(res.text(), "[file] Range body").toBe("alp");
+    expect(res.header("content-range"), "[file] Range Content-Range").toBe("bytes 0-2/6");
+    expect(res.header("accept-ranges"), "[file] Range Accept-Ranges").toBe("bytes");
 
     // Directory listing is paginated dir+json
     res = await anon.put("/files/docs/b.txt", text("beta"));
@@ -321,6 +324,82 @@ describe("runtime services", () => {
     // Passes auth, then 404s on the missing file — proving the gate opened.
     const user = await seed!.clientAs(U_USER);
     status(await user.get("/private/missing.txt"), 404, "[private] authenticated read of a missing file");
+  });
+
+  test("file: every Range form, and what each one answers", async () => {
+    await anon.put("/files/r.txt", text("0123456789"));
+    const ranged = (spec: string) => anon.get("/files/r.txt", { headers: { range: spec } });
+
+    // An open-ended range runs to the last byte.
+    let res = await ranged("bytes=7-");
+    status(res, 206, "[file] open-ended range");
+    expect(res.header("content-range"), "[file] open-ended Content-Range").toBe("bytes 7-9/10");
+    expect(res.text(), "[file] open-ended body").toBe("789");
+
+    // A suffix range counts back from the end — the form a client uses to
+    // read a trailer without knowing the size.
+    res = await ranged("bytes=-3");
+    status(res, 206, "[file] suffix range");
+    expect(res.header("content-range"), "[file] suffix Content-Range").toBe("bytes 7-9/10");
+    expect(res.text(), "[file] suffix body").toBe("789");
+
+    // A suffix longer than the resource is the whole resource, still a 206.
+    res = await ranged("bytes=-500");
+    status(res, 206, "[file] oversized suffix");
+    expect(res.header("content-range"), "[file] oversized suffix Content-Range").toBe("bytes 0-9/10");
+
+    // An end past the last byte clamps rather than failing.
+    res = await ranged("bytes=5-99");
+    status(res, 206, "[file] over-long end clamps");
+    expect(res.header("content-range"), "[file] clamped Content-Range").toBe("bytes 5-9/10");
+
+    // Past the end is unsatisfiable: 416, naming the real size so the client
+    // can re-ask without a round trip to discover it.
+    res = await ranged("bytes=10-20");
+    status(res, 416, "[file] unsatisfiable range");
+    expect(res.header("content-range"), "[file] 416 Content-Range").toBe("bytes */10");
+
+    // Headers we can't satisfy are ignored, not rejected: another unit, a
+    // multi-range set, and an invalid spec all serve the whole resource.
+    for (const spec of ["items=0-5", "bytes=0-1,5-6", "bytes=8-2"]) {
+      res = await ranged(spec);
+      status(res, 200, `[file] '${spec}' serves the whole resource`);
+      expect(res.header("content-range"), `[file] '${spec}' has no Content-Range`).toBeNull();
+      expect(res.text(), `[file] '${spec}' body`).toBe("0123456789");
+    }
+
+    status(await anon.delete("/files/r.txt"), 204, "[file] DELETE r.txt");
+  });
+
+  test("file: If-Range guards a resumed download", async () => {
+    await anon.put("/files/ir.txt", text("0123456789"));
+    const etag = (await anon.get("/files/ir.txt")).etag();
+    expect(etag, "[file] If-Range fixture has an ETag").not.toBeNull();
+
+    // The validator still matches → the partial read proceeds.
+    let res = await anon.get("/files/ir.txt", { headers: { range: "bytes=0-2", "if-range": etag! } });
+    status(res, 206, "[file] If-Range match → 206");
+    expect(res.header("content-range"), "[file] If-Range match Content-Range").toBe("bytes 0-2/10");
+    expect(res.text(), "[file] If-Range match body").toBe("012");
+
+    // A stale validator: the client's partial copy is of a resource that no
+    // longer exists, so it gets the whole current one rather than a slice it
+    // would splice onto bytes that don't match.
+    res = await anon.get("/files/ir.txt", { headers: { range: "bytes=0-2", "if-range": '"stale-version"' } });
+    status(res, 200, "[file] stale If-Range → whole resource");
+    expect(res.header("content-range"), "[file] stale If-Range has no Content-Range").toBeNull();
+    expect(res.text(), "[file] stale If-Range body").toBe("0123456789");
+
+    // A weak tag never licenses a resume, even one naming this version.
+    res = await anon.get("/files/ir.txt", { headers: { range: "bytes=0-2", "if-range": `W/${etag}` } });
+    status(res, 200, "[file] weak If-Range → whole resource");
+
+    // If-None-Match still wins over a Range: a fresh client copy is a 304.
+    res = await anon.get("/files/ir.txt", { headers: { range: "bytes=0-2", "if-none-match": etag! } });
+    status(res, 304, "[file] If-None-Match beats Range");
+    expect(res.header("content-range"), "[file] 304 has no Content-Range").toBeNull();
+
+    status(await anon.delete("/files/ir.txt"), 204, "[file] DELETE ir.txt");
   });
 
   test("file: static-site mode (default resource, SPA fallback, listings off)", async () => {

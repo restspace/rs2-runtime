@@ -182,17 +182,25 @@ ${marker} is media_type.rs / media-type.ts: this file is only the data.
 
 const rustOut = `${preamble("//!")}
 /// \`(extension, essence)\`, sorted by extension for binary search.
+///
+/// \`rustfmt::skip\`, here and below: rustfmt explodes the handful of rows
+/// wider than 100 columns across four lines, which would make this file churn
+/// every time it is regenerated and reformatted. One row per line is also how
+/// a data table wants to be read.
+#[rustfmt::skip]
 pub(super) const EXTENSION_TABLE: &[(&str, &str)] = &[
 ${extRows.map(([ext, essence]) => `    ("${ext}", "${essence}"),`).join("\n")}
 ];
 
 /// \`(essence, canonical extension)\`, sorted by essence for binary search.
 /// Every entry round-trips: the extension maps back to the same essence.
+#[rustfmt::skip]
 pub(super) const CANONICAL_EXTENSIONS: &[(&str, &str)] = &[
 ${canonRows.map(([essence, ext]) => `    ("${essence}", "${ext}"),`).join("\n")}
 ];
 
 /// The friendly-URL probe order for an extension-less request, best first.
+#[rustfmt::skip]
 pub(super) const NEGOTIABLE_EXTENSIONS: &[&str] = &[
 ${NEGOTIABLE.map((ext) => `    "${ext}",`).join("\n")}
 ];
