@@ -15,6 +15,7 @@ import { Message, MsgUrl } from "../runtime/message";
 import { validatePath } from "../runtime/router";
 import { CachePolicy, CorsPolicy } from "../runtime/wrapper";
 import { sanitizedStoreRoot } from "../capabilities/types";
+import { imagesGrantConfig, imagesGrantTarget } from "../capabilities/images";
 import { hostMatches, urlHost } from "../runtime/outbound";
 import { FileService } from "./file";
 import type { Service, ServiceContext } from "./context";
@@ -102,7 +103,8 @@ export class CodeService implements Service {
   /// Build the default-deny capability table from the mount's `grants`.
   /// Grant kinds mirror `services/code.rs`: `prefix` (re-enters dispatch
   /// with the caller's principal), `httpOut` (allowlist + injector),
-  /// `store` (service-private storage under `.rs2-store/<root>`).
+  /// `store` (service-private storage under `.rs2-store/<root>`), plus this
+  /// host's `images` (transforms by reference over sibling grants).
   grants(ctx: ServiceContext): Map<string, CapabilityTarget> {
     const grants = new Map<string, CapabilityTarget>();
     const configGrants = ctx.config.grants;
@@ -113,6 +115,14 @@ export class CodeService implements Service {
       if (!grant || typeof grant !== "object" || Array.isArray(grant)) continue;
       if (grant.type === "store") {
         grants.set(capability, storeGrantTarget(capability, grant, ctx));
+        continue;
+      }
+      if (grant.type === "images") {
+        // Host-side transforms by reference over sibling grants (the
+        // originals' `source`, the derivatives' `cache`): the table is
+        // captured, so the siblings may be declared in any order.
+        const cfg = imagesGrantConfig(capability, grant);
+        grants.set(capability, imagesGrantTarget(capability, cfg, grants, ctx.images, ctx.limits.materializedBodyBytes));
         continue;
       }
       if (grant.type === "httpOut") {

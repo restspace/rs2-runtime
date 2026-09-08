@@ -70,6 +70,9 @@ for `RS2_BASE_URL`).
 | `RS2_ADMIN_TOKEN` | — | Worker only: gates `globalSetup` seeding through `/admin/tenants` |
 | `RS2_HOST_KIND` | `rust` | `rust` \| `cloudflare` — selects the allowed-divergence table (`src/divergences.ts`) |
 | `RS2_CODE_BUNDLE` | `fixtures/echo.js` | The JS echo bundle used by code-mount cases |
+| `RS2_IMAGE_COMPONENT` | — | Rust leg of `image.test.ts`: the built `guest-services/image` `.wasm` (skipped without it; start `host:rust` with `RS2_RUST_FEATURES=js,wasm`) |
+| `RS2_RUST_FEATURES` | `js` | `host:rust` only: cargo features for the server build (`js,wasm` for the image suite) |
+| `RS2_CF_REMOTE` | — | Worker only: marks a real-platform run (`@remote` cases, full-fidelity image geometry) |
 | `RS2_SECOND_HOST` | — | Worker only: a second tenant's `Host` for isolation cases |
 | `RS2_SERVER_BIN` | — | `host:rust` only: prebuilt server binary instead of `cargo run` |
 | `RS2_HOST_DIR` | `<tmpdir>/rs2-conf-<port>` | `host:rust` only: the scratch data dir |

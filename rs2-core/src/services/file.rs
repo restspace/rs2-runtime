@@ -742,6 +742,12 @@ impl Service for FileService {
                 resp.set_header("content-length", &meta.size.to_string());
                 resp.set_header("accept-ranges", "bytes");
                 resp.set_header("content-type", &MediaType::for_path(&real).to_string());
+                // The same validator GET serves (RFC 9110 §9.3.2: HEAD carries
+                // GET's headers) — what lets a caller version a file without
+                // reading it (the image mount keys its derivatives on it).
+                if let Some(etag) = files.current_etag(&real).await? {
+                    resp.set_header("etag", &etag);
+                }
                 if real != path {
                     resp.set_header(
                         "content-location",

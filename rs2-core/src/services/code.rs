@@ -165,6 +165,33 @@ impl CodeService {
                 );
                 continue;
             }
+            if grant.get("type").and_then(|t| t.as_str()) == Some("images") {
+                // Host-side image transforms by reference (the Worker's
+                // Cloudflare Images binding; `rs2-worker/src/capabilities/
+                // images.ts`). Accepted at build time on every host so one
+                // tenant file mounts on both; this host has no transform
+                // backend, so a call answers 501 `provider_unavailable`
+                // (mount the `guest-services/image` wasm component here).
+                for key in ["source", "cache"] {
+                    if let Some(v) = grant.get(key) {
+                        if v.as_str().is_none_or(str::is_empty) {
+                            return Err(RsError::bad_request(format!(
+                                "images grant '{capability}' '{key}' must name a sibling grant"
+                            )));
+                        }
+                    }
+                }
+                let target: CapabilityTarget = Arc::new(move |_msg: Message| {
+                    Box::pin(async move {
+                        Err(RsError::provider_unavailable(
+                            "this host has no image transform backend (the images capability \
+                             is served by the Cloudflare host; mount the wasm image component here)",
+                        ))
+                    })
+                });
+                grants.insert(capability.clone(), target);
+                continue;
+            }
             if grant.get("type").and_then(|t| t.as_str()) == Some("httpOut") {
                 let hosts: Vec<String> = grant
                     .get("hosts")

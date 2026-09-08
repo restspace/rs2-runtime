@@ -26,6 +26,10 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TenantObject", "RegistryObject"] }],
   "r2_buckets": [{ "binding": "RS2_FILES", "bucket_name": "rs2-files" }],
   "worker_loaders": [{ "binding": "LOADER" }],
+  // Cloudflare Images: the `images` grant on `code:` mounts (the JS image
+  // service in `guest-services/image-js`). Local `wrangler dev` emulates
+  // width/height/format only; `--remote` gives the full transform set.
+  "images": { "binding": "IMAGES" },
   // Safety net only (§B.6): tenant DOs self-arm alarms on config writes;
   // this just re-arms a lost alarm for registry-tracked scheduled tenants.
   "triggers": { "crons": ["*/5 * * * *"] },

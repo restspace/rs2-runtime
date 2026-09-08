@@ -42,6 +42,24 @@ export interface Divergences {
    * `provider_unavailable` naming `serverConfig.tenancy.domainMap`.
    */
   domainAttachment: "api" | "config";
+  /**
+   * Which deployable serves the image-transform mount (`image.test.ts`).
+   * The contract is one: `code:image@<v>` with the README's params and
+   * headers. On Rust the codecs live in the `guest-services/image` Wasm
+   * component (`"wasm"`, needs a `--features wasm` host and
+   * `RS2_IMAGE_COMPONENT` naming the built `.wasm`); on the Worker the
+   * pixel work is the host's Images binding behind the `images` grant and
+   * the bundle is `guest-services/image-js/image.js` (`"js"`).
+   */
+  imageBundle: "wasm" | "js";
+  /**
+   * How faithfully the host's transform backend honours fit/gravity/rect.
+   * The Wasm component implements them all (`"full"`). Local `wrangler
+   * dev` emulates the Images binding with width/height/format only
+   * (`"basic"`), so cover/gravity/rect geometry is asserted only on a
+   * `RS2_CF_REMOTE` run, where the real platform serves the binding.
+   */
+  imageFidelity: "full" | "basic";
 }
 
 const TABLE: Record<HostKind, Divergences> = {
@@ -50,12 +68,16 @@ const TABLE: Record<HostKind, Divergences> = {
     dotSegmentTraversal: [400],
     guestAdapterPooling: "pooled",
     domainAttachment: "config",
+    imageBundle: "wasm",
+    imageFidelity: "full",
   },
   cloudflare: {
     absentDirectoryDelete: [204, 404],
     dotSegmentTraversal: [400, 404],
     guestAdapterPooling: "perInvocation",
     domainAttachment: "api",
+    imageBundle: "js",
+    imageFidelity: process.env.RS2_CF_REMOTE ? "full" : "basic",
   },
 };
 

@@ -1,5 +1,10 @@
 # rs2-image — query-string image resize/crop (Wasm component)
 
+> Cloudflare host: the same mount is served by the JS bundle in
+> [`../image-js`](../image-js) over the host's `images` grant (the Worker
+> cannot run Wasm components). Same URLs, params, config, headers and cache
+> layout; only the codecs differ.
+
 Responsive-design image transforms as a sandboxed RS2 service: mount it in
 front of any file mount and request derivatives with query parameters. The
 runtime stays image-free — codecs live in this bundle, paid for only by

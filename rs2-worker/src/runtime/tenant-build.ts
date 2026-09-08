@@ -34,6 +34,7 @@ import {
   TEMPLATE_SUBTREE,
 } from "../services/context";
 import type { Requester, Service, ServiceContext, TenantControl } from "../services/context";
+import type { ImagesBackend } from "../capabilities/images";
 import { DataService } from "../services/data";
 import { FileService } from "../services/file";
 import { LogReaderService } from "../services/log-reader";
@@ -75,6 +76,9 @@ export interface Adapters {
   /// The Dynamic Worker engine (§E); absent when the deployment has no
   /// `worker_loaders` binding — `code:`/`template` mounts then answer 501.
   engine: DynamicWorkerEngine | undefined;
+  /// Cloudflare Images (the `images` grant on `code:` mounts); absent
+  /// without an `images` binding — the grant then answers 501 at use.
+  images: ImagesBackend | undefined;
 }
 
 /// Seed the built-in registry with the node's own built-ins: `mem`, `local`
@@ -633,6 +637,7 @@ export function buildTenant(
       infras: mount.service === "services" ? infras : undefined,
       secrets: mountSecrets,
       outboundInjectors,
+      images: mount.service.startsWith("code:") ? adapters.images : undefined,
     };
     instances.set(mount.basePath, [service, ctx]);
   }

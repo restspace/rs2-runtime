@@ -61,6 +61,13 @@ $env:RS2_IMAGE_COMPONENT = "$PWD\guest-services\image\target\wasm32-wasip2\relea
 cargo test --features wasm -p rs2-core --test image_service
 ```
 
+The same mount is conformance-tested over HTTP on both hosts by
+`conformance/http/image.test.ts` (Rust: `RS2_RUST_FEATURES=js,wasm npm run
+host:rust` + `RS2_IMAGE_COMPONENT`; Worker: the JS bundle in
+`guest-services/image-js`, whose own logic tests run with `node --test` in
+that directory, and the `images` grant's unit tests in
+`rs2-worker/test/images.test.ts`).
+
 ## Integration harness
 
 Tests build a `Runtime` over real adapters and drive it with `rt.handle(msg)`:

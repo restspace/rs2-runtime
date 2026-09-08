@@ -80,7 +80,8 @@ if (process.env.RS2_SERVER_BIN) {
   }
 } else {
   cmd = "cargo";
-  args = ["run", "-p", "rs2-server", "--features", "js", "--", configPath];
+  // `RS2_RUST_FEATURES` widens the build (e.g. `js,wasm` for `image.test.ts`).
+  args = ["run", "-p", "rs2-server", "--features", process.env.RS2_RUST_FEATURES || "js", "--", configPath];
   cwd = repo;
 }
 

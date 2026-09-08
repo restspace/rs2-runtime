@@ -10,6 +10,10 @@ export interface Env {
   /// Dynamic Workers (§E): `code:`/`template` mounts. Optional so a
   /// deployment without the binding degrades to 501, not a build error.
   LOADER?: WorkerLoader;
+  /// Cloudflare Images (`capabilities/images.ts`): the `images` grant on
+  /// `code:` mounts. Optional so a deployment without the binding answers
+  /// 501 `provider_unavailable` at first use, not a build error.
+  IMAGES?: ImagesBinding;
   RS2_DEFAULT_TENANT?: string;
   RS2_MAIN_DOMAIN?: string;
   RS2_LOG_LEVEL?: string;

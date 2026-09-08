@@ -183,6 +183,7 @@ export class TenantObject extends DurableObject<Env> {
       catalogue: catalogueHosts.length ? new HttpCatalogueClient(http, catalogueHosts) : undefined,
       infras: this.infras,
       engine: this.buildEngine(tenant),
+      images: this.env.IMAGES,
     };
   }
 

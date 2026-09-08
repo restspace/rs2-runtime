@@ -431,6 +431,11 @@ export class FileService implements Service {
         resp.setHeader("content-length", String(meta.size));
         resp.setHeader("accept-ranges", "bytes");
         resp.setHeader("content-type", MediaType.forPath(real).toString());
+        // The same validator GET serves (RFC 9110 §9.3.2: HEAD carries GET's
+        // headers) — what lets a caller version a file without reading it
+        // (the image mount keys its derivatives on it).
+        const etag = await files.currentEtag(real);
+        if (etag !== undefined) resp.setHeader("etag", etag);
         if (real !== path) resp.setHeader("content-location", `${msg.url.basePath}${real}`);
         return resp;
       }

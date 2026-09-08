@@ -3,6 +3,7 @@
 // `rs2-core/src/services/mod.rs`.
 
 import type { CredentialInjector } from "../capabilities/credential";
+import type { ImagesBackend } from "../capabilities/images";
 import type { ScopedDataStore, ScopedFileStore, ScopedMessageGateway, ScopedQueryStore } from "../capabilities/scoped";
 import type { HttpOut, WritePrecondition } from "../capabilities/types";
 import type { JsonObject } from "../runtime/error";
@@ -54,6 +55,9 @@ export interface ServiceContext {
   infras: InfraSet | undefined;
   secrets: JsonObject | undefined;
   outboundInjectors: Map<string, CredentialInjector>;
+  /// Host image transforms — granted only to `code:` mounts, and only on a
+  /// deployment with an Images binding (`capabilities/images.ts`).
+  images?: ImagesBackend;
 }
 
 /// A unit of behavior handling messages at a mount: Message → Message.
