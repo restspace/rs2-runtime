@@ -6,16 +6,35 @@ use crate::client::Client;
 use crate::config;
 
 /// `rs2 login` — authenticate against `{host}/auth/login` and persist the
-/// returned token into `rsconfig.json`.
+/// returned token into `rsconfig.json`. With `--server <name>` the token goes
+/// into `servers.<name>` (created from `--host` if new) and the default
+/// `host`/`auth` are left alone.
 pub fn login(
+    server: Option<&str>,
     host: Option<&str>,
     email: Option<&str>,
     password: Option<&str>,
 ) -> Result<(), String> {
     let mut loaded = config::load()?;
-    let host = config::resolve_host(host, &loaded.config)?;
+    let named = server.map(|name| loaded.config.servers.get(name).cloned().unwrap_or_default());
+    let host = match (&named, host) {
+        (Some(entry), None) if !entry.host.is_empty() => {
+            entry.host.trim_end_matches('/').to_string()
+        }
+        (Some(_), None) => {
+            return Err(format!(
+                "server '{}' is not in rsconfig.json yet — pass --host to add it",
+                server.unwrap_or_default()
+            ))
+        }
+        _ => config::resolve_host(host, &loaded.config)?,
+    };
 
-    let stored_login = loaded.config.login.clone().unwrap_or_default();
+    let stored_login = named
+        .as_ref()
+        .and_then(|e| e.login.clone())
+        .or_else(|| loaded.config.login.clone())
+        .unwrap_or_default();
     let email = email
         .map(str::to_string)
         .or(stored_login.email)
@@ -45,13 +64,28 @@ pub fn login(
         .to_string();
     let exp = json.get("exp").and_then(|v| v.as_i64()).unwrap_or(0);
 
-    loaded.config.host = Some(host.clone());
-    loaded.config.auth = Some(config::Auth { token, exp, host });
+    let auth = config::Auth {
+        token,
+        exp,
+        host: host.clone(),
+    };
+    match (server, named) {
+        (Some(name), Some(mut entry)) => {
+            entry.host = host;
+            entry.auth = Some(auth);
+            loaded.config.servers.insert(name.to_string(), entry);
+        }
+        _ => {
+            loaded.config.host = Some(host);
+            loaded.config.auth = Some(auth);
+        }
+    }
     config::save(&loaded.path, &loaded.config)?;
 
     let mins = ((exp - config::now_secs()).max(0)) / 60;
     println!(
-        "logged in — token saved to {} (expires in ~{mins} min)",
+        "logged in{} — token saved to {} (expires in ~{mins} min)",
+        server.map(|s| format!(" to '{s}'")).unwrap_or_default(),
         loaded.path.display()
     );
     Ok(())
@@ -479,7 +513,7 @@ pub fn auth_init(
         user_dataset,
     )?;
     // 3. Log in as that admin so the lockdown PUT carries operator authority.
-    login(host, Some(admin_email), Some(&password))?;
+    login(None, host, Some(admin_email), Some(&password))?;
 
     // 4. Lock down: user store write → operator, /services read+write → operator.
     let loaded = config::load()?;
@@ -515,13 +549,28 @@ pub fn auth_init(
 /// `patch` returns `Ok(true)` to proceed with the PUT, `Ok(false)` for an
 /// idempotent no-op, or `Err` to abort. It re-runs against a freshly read
 /// config on each attempt, so write it as "ensure X is present", not "append X".
-fn merge_config<F>(client: &Client, had_token: bool, mut patch: F) -> Result<(), String>
+fn merge_config<F>(client: &Client, had_token: bool, patch: F) -> Result<(), String>
+where
+    F: FnMut(&mut serde_json::Value) -> Result<bool, String>,
+{
+    merge_config_at(client, had_token, "/services/raw", patch)
+}
+
+/// [`merge_config`] against an explicit self-config path — the `control.config`
+/// a discovery surface names, for a node whose `services` mount isn't at
+/// `/services`.
+pub(crate) fn merge_config_at<F>(
+    client: &Client,
+    had_token: bool,
+    config_path: &str,
+    mut patch: F,
+) -> Result<(), String>
 where
     F: FnMut(&mut serde_json::Value) -> Result<bool, String>,
 {
     const MAX_TRIES: u32 = 3;
     for attempt in 0..MAX_TRIES {
-        let current = client.get("/services/raw")?;
+        let current = client.get(config_path)?;
         if current.status != 200 {
             return Err(format!(
                 "could not read current config: {}{}",
@@ -538,7 +587,7 @@ where
             return Ok(());
         }
         let resp = client.put(
-            "/services/raw",
+            config_path,
             "application/json",
             cfg.to_string().as_bytes(),
             Some(&etag),

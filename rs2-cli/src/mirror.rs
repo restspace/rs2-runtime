@@ -99,13 +99,20 @@ pub struct Discovery {
     pub control: Option<ControlBlock>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServiceEntry {
     pub path: String,
+    /// The service type (`file`, `data`, `code:<name>@<v>`, …).
+    #[serde(default)]
+    pub service: String,
     /// The reserved authoring subtree of a spec store (`.pipelines`, …); its
     /// presence is what marks a mount as part of the instruction plane.
     #[serde(default, rename = "specSubtree")]
     pub spec_subtree: Option<String>,
+    /// The interaction pattern (`store`, `store-view`, `api`, …) — a `store`
+    /// is what `rs2 sync` walks as data.
+    #[serde(default)]
+    pub pattern: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,11 +130,14 @@ struct DirListing {
     total: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct DirEntry {
-    name: String,
+/// One entry of a `dir+json` listing (the fields a walker consumes).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DirEntry {
+    pub name: String,
     #[serde(default)]
-    dir: bool,
+    pub dir: bool,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// One spec walked out of a store: its path relative to the subtree root, the
@@ -210,7 +220,23 @@ pub fn discover(client: &Client) -> Result<Discovery, String> {
 
 /// List a container fully, following `$take`/`$skip` pagination to `total`.
 /// `container` must end in `/`.
-fn list_dir_all(client: &Client, container: &str) -> Result<Vec<DirEntry>, String> {
+pub(crate) fn list_dir_all(client: &Client, container: &str) -> Result<Vec<DirEntry>, String> {
+    list_dir_status(client, container).and_then(|(status, entries)| {
+        if status == 200 {
+            Ok(entries)
+        } else {
+            Err(format!("cannot list {container}: HTTP {status}"))
+        }
+    })
+}
+
+/// [`list_dir_all`] returning the first page's status instead of erroring on
+/// it, so a caller can treat a 403/404 (a hidden or absent container) as
+/// "skip" rather than "abort". `(200, entries)` on success.
+pub(crate) fn list_dir_status(
+    client: &Client,
+    container: &str,
+) -> Result<(u16, Vec<DirEntry>), String> {
     const PAGE: u64 = 1000;
     let mut all = Vec::new();
     let mut skip = 0u64;
@@ -218,6 +244,9 @@ fn list_dir_all(client: &Client, container: &str) -> Result<Vec<DirEntry>, Strin
         let path = format!("{container}?$take={PAGE}&$skip={skip}");
         let resp = client.get(&path)?;
         if resp.status != 200 {
+            if skip == 0 {
+                return Ok((resp.status, all));
+            }
             return Err(format!("cannot list {container}: {}", resp.error_detail()));
         }
         let listing: DirListing = serde_json::from_str(&resp.body)
@@ -229,7 +258,7 @@ fn list_dir_all(client: &Client, container: &str) -> Result<Vec<DirEntry>, Strin
             break;
         }
     }
-    Ok(all)
+    Ok((200, all))
 }
 
 /// Recursively walk a spec store's authoring subtree, returning every stored
@@ -316,7 +345,7 @@ pub fn remote_spec_path(local_rel: &str, mounts: &[(String, String)]) -> Option<
 }
 
 /// Join a mount path and a sub-path into a single slash-normalized path.
-fn join_path(base: &str, rest: &str) -> String {
+pub(crate) fn join_path(base: &str, rest: &str) -> String {
     let base = base.trim_end_matches('/');
     let rest = rest.trim_start_matches('/');
     if base.is_empty() {

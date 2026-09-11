@@ -2,15 +2,19 @@
 //!
 //! Verbs: `new` (scaffold a service), `dev` (run a local node), `test`
 //! (validate a manifest + component), `deploy` (upload via the self-config
-//! API), `migrate` (convert a Restspace `services.json`).
+//! API), `migrate` (convert a Restspace `services.json`), `pull`/`push` (the
+//! local instruction-plane mirror), `sync` (copy a tenant or mount between
+//! two nodes).
 
 mod client;
 mod commands;
 mod commands_mirror;
+mod commands_sync;
 mod config;
 mod migrate;
 mod mirror;
 mod scaffold;
+mod sync;
 
 use clap::{Parser, Subcommand};
 
@@ -97,6 +101,11 @@ enum Command {
     },
     /// Authenticate to a server and save the token to `rsconfig.json`.
     Login {
+        /// Save the token under `servers.<name>` instead of the default
+        /// `host`/`auth` — for a second server (`rs2 sync --from/--to`).
+        /// A new name needs `--host` once; after that it is remembered.
+        #[arg(long)]
+        server: Option<String>,
         /// Server base URL (else `host` from rsconfig.json).
         #[arg(long)]
         host: Option<String>,
@@ -158,6 +167,34 @@ enum Command {
         /// expected (an intentional rotation).
         #[arg(long)]
         allow_secret_rotation: bool,
+    },
+    /// Copy a tenant — or named mounts of it — from one server to another:
+    /// code bundles, config, spec stores, then data. Source wins; target-only
+    /// things are kept unless --prune.
+    Sync {
+        /// Source: a name under `servers` in rsconfig.json, or a base URL.
+        #[arg(long)]
+        from: String,
+        /// Target: a name under `servers` in rsconfig.json, or a base URL.
+        #[arg(long)]
+        to: String,
+        /// Transfer only this mount (its entry, specs, bundle, and data);
+        /// repeatable. Without it the whole config is transferred.
+        #[arg(long = "mount", value_name = "PATH")]
+        mounts: Vec<String>,
+        /// Instruction plane only: config, specs, and code — no data.
+        #[arg(long, conflicts_with = "data_only")]
+        no_data: bool,
+        /// Data plane only; the mounts must already exist on the target.
+        #[arg(long)]
+        data_only: bool,
+        /// Delete what exists only on the target: mounts (whole-config mode),
+        /// specs, records/files, and datasets inside the synced mounts.
+        #[arg(long)]
+        prune: bool,
+        /// Show the planned operations without changing the target.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run a script of `rs2` commands (one per line; aborts on first failure).
     Run {
@@ -323,10 +360,16 @@ fn dispatch(command: Command) -> Result<(), String> {
         },
         Command::Migrate { input, output } => migrate::migrate(&input, &output),
         Command::Login {
+            server,
             host,
             email,
             password,
-        } => commands::login(host.as_deref(), email.as_deref(), password.as_deref()),
+        } => commands::login(
+            server.as_deref(),
+            host.as_deref(),
+            email.as_deref(),
+            password.as_deref(),
+        ),
         Command::Send {
             path,
             file,
@@ -399,6 +442,23 @@ fn dispatch(command: Command) -> Result<(), String> {
             dry_run,
             allow_secret_rotation,
         } => commands_mirror::push(dir.as_deref(), dry_run, allow_secret_rotation),
+        Command::Sync {
+            from,
+            to,
+            mounts,
+            no_data,
+            data_only,
+            prune,
+            dry_run,
+        } => commands_sync::sync(commands_sync::Options {
+            from: &from,
+            to: &to,
+            mounts: &mounts,
+            no_data,
+            data_only,
+            prune,
+            dry_run,
+        }),
         Command::Run { script } => run_script(&script),
     }
 }

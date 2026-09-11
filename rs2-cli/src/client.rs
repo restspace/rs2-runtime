@@ -11,6 +11,26 @@ pub struct Response {
     pub body: String,
 }
 
+/// A [`Response`] whose body is raw bytes, with the `Content-Type` it came with.
+pub struct BytesResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+impl BytesResponse {
+    /// The problem-details explanation for an unexpected status, as
+    /// [`Response::error_detail`].
+    pub fn error_detail(&self) -> String {
+        Response {
+            status: self.status,
+            etag: None,
+            body: String::from_utf8_lossy(&self.body).into_owned(),
+        }
+        .error_detail()
+    }
+}
+
 pub struct Client {
     host: String,
     token: Option<String>,
@@ -24,6 +44,11 @@ impl Client {
         let host = host.into();
         let agent = build_agent(&host);
         Self { host, token, agent }
+    }
+
+    /// The base URL this client talks to.
+    pub fn host(&self) -> &str {
+        &self.host
     }
 
     fn url(&self, path: &str) -> String {
@@ -44,6 +69,28 @@ impl Client {
     pub fn get(&self, path: &str) -> Result<Response, String> {
         let req = self.auth(self.agent.get(&self.url(path)));
         finish(req.call())
+    }
+
+    /// GET with the body kept as bytes (a file, a Wasm component) and the
+    /// `Content-Type` retained — what a copy to another node needs to PUT it
+    /// back faithfully. [`get`] decodes to a string and so cannot carry these.
+    pub fn get_bytes(&self, path: &str) -> Result<BytesResponse, String> {
+        let req = self.auth(self.agent.get(&self.url(path)));
+        let resp = match req.call() {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(_, resp)) => resp,
+            Err(e) => return Err(transport_error(&e.to_string())),
+        };
+        let status = resp.status();
+        let content_type = resp.header("content-type").map(str::to_string);
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut body)
+            .map_err(|e| format!("request failed reading {path}: {e}"))?;
+        Ok(BytesResponse {
+            status,
+            content_type,
+            body,
+        })
     }
 
     /// PUT raw bytes with a content type; `if_match` sets `If-Match` for
@@ -94,9 +141,23 @@ impl Client {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<Response, String> {
-        let req = self
+        self.post_bytes_with(path, content_type, bytes, &[])
+    }
+
+    /// [`post_bytes`] with extra request headers (a deploy's `X-RS2-Manifest`).
+    pub fn post_bytes_with(
+        &self,
+        path: &str,
+        content_type: &str,
+        bytes: &[u8],
+        headers: &[(&str, &str)],
+    ) -> Result<Response, String> {
+        let mut req = self
             .auth(self.agent.post(&self.url(path)))
             .set("content-type", content_type);
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
         match req.send_bytes(bytes) {
             Err(ureq::Error::Transport(t)) if t.kind() == ureq::ErrorKind::Io => Err(format!(
                 "request failed: {t} — the server may have closed the upload before it finished, \

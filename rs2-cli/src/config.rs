@@ -3,6 +3,7 @@
 //! from the current directory (like the `rs` CLI's project config), so a
 //! `run` script or a repo can carry its own server identity.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,33 @@ pub struct RsConfig {
     /// with its server identity, as it already carries the host and the token.
     #[serde(default, rename = "caFile", skip_serializing_if = "Option::is_none")]
     pub ca_file: Option<String>,
+    /// Named servers beyond the default one — so a repo can hold a token for
+    /// `staging` and `prod` at once and `rs2 sync --from staging --to prod`
+    /// can authenticate to both. `rs2 login --server <name>` fills an entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub servers: BTreeMap<String, ServerEntry>,
+}
+
+/// One named server: the same shape as the top-level default (`host`,
+/// optional `login`, the `auth` minted by `login`, optional `caFile`).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ServerEntry {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<Login>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Auth>,
+    #[serde(default, rename = "caFile", skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+}
+
+/// A resolved server to talk to: its base URL, a usable token if one is
+/// stored, and a label (the server name or the origin) for messages.
+#[derive(Debug, Clone)]
+pub struct Target {
+    pub host: String,
+    pub token: Option<String>,
+    pub label: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -155,14 +183,56 @@ pub fn origin(url: &str) -> String {
 /// server decide; this avoids forcing `rs2 login` against an open mount (e.g.
 /// bootstrapping the first `/auth` mount before any admin exists).
 pub fn token_if_valid(config: &RsConfig, host: &str) -> Option<String> {
-    let auth = config.auth.as_ref()?;
-    if auth.host.trim_end_matches('/') != host {
-        return None;
+    token_for_origin(config, host)
+}
+
+/// A usable token for `host` from anywhere in the config: the top-level
+/// `auth`, then every named server's `auth`. The first unexpired match wins,
+/// so a token minted with `rs2 login --server prod` also serves `rs2 send`
+/// pointed at that host.
+pub fn token_for_origin(config: &RsConfig, host: &str) -> Option<String> {
+    let host = host.trim_end_matches('/');
+    let now = now_secs();
+    std::iter::once(config.auth.as_ref())
+        .chain(config.servers.values().map(|s| s.auth.as_ref()))
+        .flatten()
+        .find(|a| a.host.trim_end_matches('/') == host && a.exp > now)
+        .map(|a| a.token.clone())
+}
+
+/// Resolve a server named on the command line: a key of `servers`, or a bare
+/// URL (anything with `://`). A URL is reduced to its origin and its token is
+/// looked up by origin across the whole config; an unknown name is an error
+/// naming the file to fix.
+pub fn resolve_server(spec: &str, loaded: &Loaded) -> Result<Target, String> {
+    let config = &loaded.config;
+    if let Some(entry) = config.servers.get(spec) {
+        let host = entry.host.trim_end_matches('/').to_string();
+        let token = entry
+            .auth
+            .as_ref()
+            .filter(|a| a.host.trim_end_matches('/') == host && a.exp > now_secs())
+            .map(|a| a.token.clone())
+            .or_else(|| token_for_origin(config, &host));
+        return Ok(Target {
+            host,
+            token,
+            label: spec.to_string(),
+        });
     }
-    if auth.exp <= now_secs() {
-        return None;
+    if spec.contains("://") {
+        let host = origin(spec);
+        let token = token_for_origin(config, &host);
+        return Ok(Target {
+            label: host.clone(),
+            host,
+            token,
+        });
     }
-    Some(auth.token.clone())
+    Err(format!(
+        "'{spec}' is neither a URL nor a server named under \"servers\" in {}",
+        loaded.path.display()
+    ))
 }
 
 pub fn now_secs() -> i64 {
@@ -201,6 +271,7 @@ mod tests {
                 host: "http://127.0.0.1:3100".to_string(),
             }),
             ca_file: None,
+            servers: BTreeMap::new(),
         };
         let services = "http://127.0.0.1:3100/services";
         assert_eq!(
@@ -227,7 +298,90 @@ mod tests {
                 host: "http://h".to_string(),
             }),
             ca_file: None,
+            servers: BTreeMap::new(),
         };
         assert_eq!(token_if_valid(&config, "http://h"), None);
+    }
+
+    fn loaded(config: RsConfig) -> Loaded {
+        Loaded {
+            config,
+            path: PathBuf::from("rsconfig.json"),
+        }
+    }
+
+    fn entry(host: &str, token: Option<&str>, exp_delta: i64) -> ServerEntry {
+        ServerEntry {
+            host: host.to_string(),
+            login: None,
+            auth: token.map(|t| Auth {
+                token: t.to_string(),
+                exp: now_secs() + exp_delta,
+                host: host.to_string(),
+            }),
+            ca_file: None,
+        }
+    }
+
+    /// A pre-`servers` file parses unchanged, and a file with only `servers`
+    /// (no default host) parses too.
+    #[test]
+    fn legacy_and_servers_only_files_parse() {
+        let legacy: RsConfig = serde_json::from_str(
+            r#"{"host":"http://a","auth":{"token":"t","exp":1,"host":"http://a"}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.host.as_deref(), Some("http://a"));
+        assert!(legacy.servers.is_empty());
+        let named: RsConfig =
+            serde_json::from_str(r#"{"servers":{"prod":{"host":"https://p.example/"}}}"#).unwrap();
+        assert_eq!(named.host, None);
+        assert_eq!(named.servers["prod"].host, "https://p.example/");
+        // Round-trip omits an empty map, so legacy files stay legacy.
+        let text = serde_json::to_string(&legacy).unwrap();
+        assert!(!text.contains("servers"));
+    }
+
+    #[test]
+    fn resolve_server_by_name_and_by_url() {
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "prod".to_string(),
+            entry("https://p.example/", Some("tp"), 600),
+        );
+        servers.insert(
+            "stale".to_string(),
+            entry("https://s.example", Some("ts"), -1),
+        );
+        let cfg = loaded(RsConfig {
+            host: Some("http://127.0.0.1:3100".to_string()),
+            login: None,
+            auth: Some(Auth {
+                token: "tl".to_string(),
+                exp: now_secs() + 600,
+                host: "http://127.0.0.1:3100".to_string(),
+            }),
+            ca_file: None,
+            servers,
+        });
+        let prod = resolve_server("prod", &cfg).unwrap();
+        assert_eq!(prod.host, "https://p.example");
+        assert_eq!(prod.token.as_deref(), Some("tp"));
+        assert_eq!(prod.label, "prod");
+        // An expired named token is not used.
+        assert_eq!(resolve_server("stale", &cfg).unwrap().token, None);
+        // A URL finds the token by origin — from the map or the default.
+        let by_url = resolve_server("https://p.example/services", &cfg).unwrap();
+        assert_eq!(by_url.host, "https://p.example");
+        assert_eq!(by_url.token.as_deref(), Some("tp"));
+        let local = resolve_server("http://127.0.0.1:3100/", &cfg).unwrap();
+        assert_eq!(local.token.as_deref(), Some("tl"));
+        // Unknown name, not a URL.
+        assert!(resolve_server("nope", &cfg).is_err());
+        // The legacy lookup also sees named-server tokens now.
+        assert_eq!(
+            token_if_valid(&cfg.config, "https://p.example"),
+            Some("tp".to_string())
+        );
     }
 }

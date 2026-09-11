@@ -21,7 +21,7 @@ cargo build --release -p rs2-cli    # binary at target/release/rs2
 | `rs2 deploy <file> --name <n> [--server <url>] [--token <t>] [--bundle]` | Keyless `POST` to `<server>/code/<n>/`; the content-addressed store derives the version. `.js`/`.mjs` → JS bundle; `\0asm` → component. Server and token default from `rsconfig.json` like the other admin verbs. `--bundle` runs `npx esbuild … --bundle --format=esm --platform=browser` first |
 | `rs2 template build <entry.jsx|tsx> [--out <file>]` | Bundle a Preact component into the `{source, contentType}` envelope stored by a `template` mount (6.6) |
 | `rs2 migrate <services.json> [-o tenant.json]` | Convert a v1 Restspace config to an RS2 tenant config (Part 11) |
-| `rs2 login [--host <url>] [--email <e>] [--password <p>]` | Log in through `/auth/login` and save the token, expiry, and issuing host to `rsconfig.json` |
+| `rs2 login [--server <name>] [--host <url>] [--email <e>] [--password <p>]` | Log in through `/auth/login` and save the token, expiry, and issuing host to `rsconfig.json`. `--server <name>` saves under `servers.<name>` instead (a new name needs `--host` once), so several servers stay logged in at once |
 | `rs2 send <path> --file <local> [--content-type <ct>]` | PUT one local file to the configured host; content type is inferred when omitted; uses a saved valid token when present |
 | `rs2 send <path> --dir <local-dir>` | Recursively PUT every file under `<local-dir>` to `<path>`, preserving the tree (e.g. a Vite `dist/` into a static-site mount — see 4.3); content type is inferred per file; stops at the first failed upload |
 | `rs2 service add <mount.json> [--path <p>]` | ETag-safe read/append/write of one new mount; refuses an occupied path |
@@ -31,6 +31,7 @@ cargo build --release -p rs2-cli    # binary at target/release/rs2
 | `rs2 auth create-admin --email <e> [options]` | Hash a password locally and seed the first operator while that user store is open; skips an existing visible record |
 | `rs2 pull [--host <url>] [--dir <d>]` | Mirror the tenant's instruction plane (config + every `specSubtree` store + code pins) into a local `rs2/` directory for git-based editing; records baseline ETags in `rs2/mirror.json` (§3.6) |
 | `rs2 push [--dir <d>] [--dry-run] [--allow-secret-rotation]` | Push local instruction-plane edits back through the validated APIs (config `If-Match`, spec `If-Match`/412); aborts on a remote change rather than clobbering. `--dry-run` shows the diff; refuses a real secret value in a `"<secret>"` slot without `--allow-secret-rotation` |
+| `rs2 sync --from <name\|url> --to <name\|url> [--mount <path>]… [--no-data\|--data-only] [--prune] [--dry-run]` | Copy a tenant, or only the named mounts, between two servers: code bundles (skipped when the target already holds the version), then config via `PUT /services/raw`, then spec stores, then the contents of every `store`-shaped mount. Source wins; target-only mounts/specs/files/records are kept unless `--prune`. The target's own `services` mount is never replaced. Secrets stay `"<secret>"` and are restored from the target's stored values — a slot the target lacks aborts before any write (10.6). `--dry-run` lists every planned operation; a repeat run reports nothing changed |
 | `rs2 run <script>` | Run one `rs2` command per line, skipping blanks/comments and aborting on the first failure; `dev` is rejected because it never returns |
 
 ## Global flags
@@ -99,7 +100,24 @@ The admin commands walk upward from the current directory to the nearest
 
 `login` writes `auth`; other commands reuse it only while it is unexpired and
 matches `host`. Prefer `RS2_PASSWORD` (or the command flag) to storing
-`login.password` in this file. `send` and `service add` also work anonymously
+`login.password` in this file.
+
+An optional `servers` map holds **named servers** beyond the default, each with
+the same `host`/`login`/`auth`/`caFile` shape. `rs2 login --server prod --host
+https://api.example.com` fills `servers.prod`; `rs2 sync --from staging --to
+prod` reads both by name (a bare URL is also accepted, its token found by
+origin). A token stored under any name is used by every admin verb pointed at
+that host.
+
+```json
+{
+  "host": "http://127.0.0.1:3100",
+  "servers": {
+    "staging": { "host": "https://staging.example.com", "auth": { "…": "…" } },
+    "prod": { "host": "https://api.example.com" }
+  }
+}
+``` `send` and `service add` also work anonymously
 when the server's access policy permits it, which is useful during first-node
 bootstrap.
 
@@ -145,6 +163,18 @@ mirror, inspect `rs2 push --dry-run`, then push. The mirror contains config,
 specs, and code pins — not data, site assets, or bundle bytes. For site
 assets in bulk (a built SPA, a docs site), use `rs2 send <path> --dir <dir>`
 instead (§4.3).
+
+**Promote a tenant, or one mount, to another server:**
+
+```powershell
+rs2 login --server prod --host https://api.example.com --email admin@example.com
+rs2 sync --from http://127.0.0.1:3100 --to prod --dry-run   # read the plan
+rs2 sync --from http://127.0.0.1:3100 --to prod             # bundles, config, specs, data
+rs2 sync --from http://127.0.0.1:3100 --to prod --mount /catalogue --prune
+```
+
+Sync moves both planes plus bundles through the validated APIs (10.4); the
+target's `services` mount and secrets are never overwritten (10.6).
 
 **Migrate from v1:**
 
