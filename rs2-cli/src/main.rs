@@ -14,6 +14,7 @@ mod config;
 mod migrate;
 mod mirror;
 mod scaffold;
+mod server_path;
 mod sync;
 
 use clap::{Parser, Subcommand};
@@ -121,6 +122,7 @@ enum Command {
     Send {
         /// Destination path on the server, e.g. `/files/report.pdf` or
         /// `/admin` (the mount root a `--dir` upload is written under).
+        #[arg(value_parser = server_path::parse)]
         path: String,
         /// Local file to upload.
         #[arg(long)]
@@ -180,7 +182,7 @@ enum Command {
         to: String,
         /// Transfer only this mount (its entry, specs, bundle, and data);
         /// repeatable. Without it the whole config is transferred.
-        #[arg(long = "mount", value_name = "PATH")]
+        #[arg(long = "mount", value_name = "PATH", value_parser = server_path::parse)]
         mounts: Vec<String>,
         /// Instruction plane only: config, specs, and code — no data.
         #[arg(long, conflicts_with = "data_only")]
@@ -210,13 +212,14 @@ enum ServiceCommand {
         /// Path to the mount-spec JSON (`{ path?, service, config? }`).
         file: String,
         /// Override / supply the mount path (e.g. `/notes`).
-        #[arg(long)]
+        #[arg(long, value_parser = server_path::parse)]
         path: Option<String>,
     },
     /// Set the `access` policy (and optional `--set k=v` config keys) on an
     /// existing mount — used to tighten an open bootstrap mount.
     SetAccess {
         /// Mount path to update, e.g. `/services`.
+        #[arg(value_parser = server_path::parse)]
         path: String,
         /// Access policy as JSON, e.g. `{"read":"A","write":"A"}`.
         #[arg(long)]
@@ -244,7 +247,7 @@ enum AuthCommand {
         #[arg(long)]
         user_dataset: Option<String>,
         /// User-store mount path (default `/data`).
-        #[arg(long)]
+        #[arg(long, value_parser = server_path::parse)]
         data_mount: Option<String>,
         /// Server base URL (else `host` from rsconfig.json).
         #[arg(long)]
@@ -266,7 +269,7 @@ enum AuthCommand {
         #[arg(long)]
         session_minutes: Option<u32>,
         /// User-store mount path (default `/data`).
-        #[arg(long)]
+        #[arg(long, value_parser = server_path::parse)]
         data_mount: Option<String>,
         /// Server base URL (else `host` from rsconfig.json).
         #[arg(long)]
@@ -288,7 +291,7 @@ enum AuthCommand {
         #[arg(long, default_value = "A")]
         roles: String,
         /// User-store mount path (default `/data`).
-        #[arg(long)]
+        #[arg(long, value_parser = server_path::parse)]
         data_mount: Option<String>,
         /// User dataset name (default `users`).
         #[arg(long)]
