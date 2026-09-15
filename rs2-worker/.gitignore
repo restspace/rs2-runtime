@@ -6,3 +6,6 @@ node_modules/
 .deploy.vars.json
 # The tenant config `scripts/ui-fixture.mjs up` replaced, kept for `down`.
 .ui-fixture.backup.json
+
+# Deployed operator secrets kept locally — never commit
+.secrets.local
