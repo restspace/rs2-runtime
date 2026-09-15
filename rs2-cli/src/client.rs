@@ -71,6 +71,17 @@ impl Client {
         finish(req.call())
     }
 
+    /// GET naming the representation wanted. A static-site file mount serves
+    /// its default document for a directory URL, and only an explicit
+    /// `Accept: application/vnd.rs2.dir+json` turns that URL into a listing —
+    /// so every container walk must ask for it by name.
+    pub fn get_accept(&self, path: &str, accept: &str) -> Result<Response, String> {
+        let req = self
+            .auth(self.agent.get(&self.url(path)))
+            .set("accept", accept);
+        finish(req.call())
+    }
+
     /// GET with the body kept as bytes (a file, a Wasm component) and the
     /// `Content-Type` retained — what a copy to another node needs to PUT it
     /// back faithfully. [`get`] decodes to a string and so cannot carry these.

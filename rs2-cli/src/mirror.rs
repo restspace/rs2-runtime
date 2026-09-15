@@ -23,6 +23,9 @@ use crate::config;
 pub const MIRROR_DIR: &str = "rs2";
 pub const STATE_FILE: &str = "mirror.json";
 
+/// The listing media type a store container answers with.
+pub const DIR_JSON: &str = "application/vnd.rs2.dir+json";
+
 // ---------------------------------------------------------------------------
 // On-disk mirror state (`rs2/mirror.json`)
 // ---------------------------------------------------------------------------
@@ -242,7 +245,9 @@ pub(crate) fn list_dir_status(
     let mut skip = 0u64;
     loop {
         let path = format!("{container}?$take={PAGE}&$skip={skip}");
-        let resp = client.get(&path)?;
+        // Named explicitly: on a static-site mount a plain GET of a directory
+        // URL returns the default document (index.html), not a listing.
+        let resp = client.get_accept(&path, DIR_JSON)?;
         if resp.status != 200 {
             if skip == 0 {
                 return Ok((resp.status, all));
