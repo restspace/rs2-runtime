@@ -661,21 +661,26 @@ impl Executor {
         }
 
         if let Some(template) = &step.transform {
+            // Media-type-directed, matching Restspace v1: JSON parses, text
+            // arrives as a string, binary as base64. A transform over an HTML
+            // or CSV body is a normal thing to want, so a non-JSON body is
+            // not an error here.
             let input = match &mut msg.body {
-                Some(body) => body.as_json(self.limits.materialize_cap).await?,
+                Some(body) => body.as_any(self.limits.materialize_cap).await?,
                 None => Value::Null,
             };
-            // The exact request bytes (now materialized by `as_json`), so a
-            // transform can verify a signature over the raw payload — e.g.
+            // The exact request bytes (already materialized by `as_any`), so
+            // a transform can verify a signature over the raw payload — e.g.
             // `$hmacVerify('sha256', $secret, $_rawBody, $sig)` — before any
-            // later step rewrites the body. Bound only when the template
-            // mentions it: it's a full owned copy of the body per step.
+            // later step rewrites the body. Byte-faithful (base64 when the
+            // payload is not UTF-8): a lossy decode would silently break
+            // verification. Bound only when the template mentions it: it's a
+            // full owned copy of the body per step.
             let raw_body = match &mut msg.body {
                 Some(body) if transform::mentions(template, "_rawBody") => body
-                    .materialize(self.limits.materialize_cap)
+                    .as_raw_string(self.limits.materialize_cap)
                     .await
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                    .ok(),
                 _ => None,
             };
             let mut eval_vars = vars.clone();
@@ -926,10 +931,11 @@ impl Executor {
                 })
             } else {
                 match &mut out.body {
-                    Some(b) if b.media_type.is_json() => {
-                        b.as_json(self.limits.materialize_cap).await?
-                    }
-                    _ => Value::Null,
+                    // Capturing a text response gave null before this went
+                    // through the shared conversion; now it captures the
+                    // string (and a binary body as base64).
+                    Some(b) => b.as_any(self.limits.materialize_cap).await?,
+                    None => Value::Null,
                 }
             };
             vars.insert(capture.trim_start_matches('$').to_string(), value);
@@ -1064,13 +1070,9 @@ impl Executor {
                         })
                     } else {
                         match &mut m.body {
-                            Some(b) if b.media_type.is_json() => {
-                                b.as_json(self.limits.materialize_cap).await?
-                            }
-                            Some(b) => {
-                                let bytes = b.materialize(self.limits.materialize_cap).await?;
-                                Value::String(String::from_utf8_lossy(bytes).into_owned())
-                            }
+                            // Same three-way conversion as a transform input,
+                            // so a binary leg joins as base64, not mojibake.
+                            Some(b) => b.as_any(self.limits.materialize_cap).await?,
                             None => Value::Null,
                         }
                     };

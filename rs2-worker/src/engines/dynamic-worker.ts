@@ -7,7 +7,7 @@
 // (`egress.ts`) keyed by the invocation id; the DO-side handlers live here
 // so `tenant-object.ts` only delegates.
 
-import { Body, EPHEMERAL, utf8Decode } from "../runtime/body";
+import { Body, EPHEMERAL } from "../runtime/body";
 import { RsError, codes, toRsError } from "../runtime/error";
 import type { Json, JsonObject } from "../runtime/error";
 import { MediaType } from "../runtime/media-type";
@@ -187,18 +187,9 @@ async function runHostRequest(
   let payload: Json = null;
   if (resp.body) {
     mediaType = resp.body.mediaType.toString();
-    const isJson = resp.body.mediaType.isJson();
-    const bytes = await resp.body.materialize(materializeCap);
-    const text = utf8Decode(bytes);
-    if (isJson) {
-      try {
-        payload = JSON.parse(text) as Json;
-      } catch {
-        payload = text;
-      }
-    } else {
-      payload = text;
-    }
+    // Media-type-directed: JSON parses, text is a string, binary is base64.
+    // Decoding binary as lossy UTF-8 used to corrupt it.
+    payload = await resp.body.asAny(materializeCap);
   }
   const headers: JsonObject = {};
   resp.headers.forEach((v, k) => {
@@ -596,18 +587,10 @@ export class DynamicWorkerEngine {
       }
     } else if (msg.body) {
       mediaType = msg.body.mediaType.toString();
-      const isJson = msg.body.mediaType.isJson();
-      const bytes = await msg.body.materialize(args.materializeCap);
-      const text = utf8Decode(bytes);
-      if (isJson) {
-        try {
-          payload = JSON.parse(text) as Json;
-        } catch {
-          payload = text;
-        }
-      } else {
-        payload = text;
-      }
+      // Same three-way conversion the host uses everywhere: a guest sees an
+      // object for JSON, a string for text, and base64 for binary rather
+      // than mojibake.
+      payload = await msg.body.asAny(args.materializeCap);
     }
 
     const headers: JsonObject = {};

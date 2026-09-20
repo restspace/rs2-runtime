@@ -128,6 +128,66 @@ describe("pipeline", () => {
     });
   });
 
+  // ---- body conversion -----------------------------------------------------
+  // How an incoming body reaches a transform, by media type (Restspace v1
+  // `MessageBody.asJson`): JSON parses to a value, text arrives as a string,
+  // anything else as standard base64. Both hosts must agree exactly — this is
+  // observable to any client that transforms a non-JSON body.
+  describe("transform input by media type", () => {
+    const ROOT = "/pipe/.pipelines/.root";
+
+    beforeAll(async () => {
+      await seed.applyMounts([{ path: "/pipe", service: "pipeline", config: { access: { invoke: "all", write: "A" } } }]);
+      await dropSpec(admin, ROOT);
+    });
+    afterAll(async () => {
+      await dropSpec(admin, ROOT);
+    });
+
+    async function author(pipeline: unknown): Promise<void> {
+      const res = await admin.put(ROOT, { json: { pipeline } });
+      expect([200, 201], `author: ${res.describe()}`).toContain(res.status);
+    }
+
+    test("a text body arrives as a string, not a 400", async () => {
+      await author({ steps: [{ transform: { page: "$", len: "$length($)" } }] });
+      const res = await anon.post("/pipe", { body: "<p>hi</p>", contentType: "text/html" });
+      expect(res.status, `text body is not an error: ${res.describe()}`).toBe(200);
+      expect(res.json().page).toBe("<p>hi</p>");
+      expect(res.json().len).toBe(9);
+    });
+
+    test("a CSV body can be parsed inside the transform", async () => {
+      await author({ steps: [{ transform: { rows: "$count($split($, '\n'))" } }] });
+      const res = await anon.post("/pipe", { body: "a,b\n1,2\n3,4", contentType: "text/csv" });
+      expect(res.status, res.describe()).toBe(200);
+      expect(res.json().rows).toBe(3);
+    });
+
+    test("a binary body arrives as lossless standard base64", async () => {
+      await author({ steps: [{ transform: { b64: "$" } }] });
+      const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xd8]);
+      const res = await anon.post("/pipe", { body: png, contentType: "image/png" });
+      expect(res.status, res.describe()).toBe(200);
+      // Pinned literal: padded standard base64, identical on both hosts. A
+      // lossy UTF-8 decode would have replaced 0xff 0xd8 with U+FFFD.
+      expect(res.json().b64).toBe("iVBORw0KGgr/2A==");
+    });
+
+    test("a JSON body still parses to a value", async () => {
+      await author({ steps: [{ transform: { doubled: "a * 2" } }] });
+      const res = await anon.post("/pipe", { json: { a: 21 } });
+      expect(res.status, res.describe()).toBe(200);
+      expect(res.json().doubled).toBe(42);
+    });
+
+    test("a body that lies about being JSON is still a 400", async () => {
+      await author({ steps: [{ transform: { x: "$" } }] });
+      const res = await anon.post("/pipe", { body: "not json", contentType: "application/json" });
+      expect(res.status, `malformed JSON stays an error: ${res.describe()}`).toBe(400);
+    });
+  });
+
   // ---- pipeline_response.rs ------------------------------------------------
   // A transform whose output is `{"$response": {...}}` sets the response
   // status/headers/mediaType/body; captured transforms and plain outputs keep

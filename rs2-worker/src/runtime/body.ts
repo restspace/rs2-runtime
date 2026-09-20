@@ -21,6 +21,7 @@ export type Payload =
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+const strictDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 
 export class Body {
   payload: Payload;
@@ -174,15 +175,61 @@ export class Body {
     if (!this.mediaType.isJson()) {
       throw RsError.badRequest(`expected a JSON body, got '${this.mediaType.essence()}'`);
     }
-    let bytes = await this.materialize(maxBytes);
-    // Strip a UTF-8 BOM, which may appear on bodies read from files.
-    if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-      bytes = bytes.subarray(3);
-    }
+    const bytes = stripBom(await this.materialize(maxBytes));
     try {
       return JSON.parse(decoder.decode(bytes)) as Json;
     } catch (e) {
       throw RsError.badRequest(`invalid JSON body: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /// The media-type-directed conversion every body-consuming boundary uses
+  /// (Restspace v1 `MessageBody.asJson`): JSON parses to a value, text
+  /// becomes a string, and anything else becomes a base64 string. The result
+  /// is always a valid JSON value, so a transform or a code service never
+  /// fails purely because the body was not JSON, and binary bodies survive
+  /// the crossing intact instead of being mangled by lossy UTF-8 decoding.
+  ///
+  /// Must stay byte-identical to the Rust host's `Body::as_any`.
+  async asAny(maxBytes: number): Promise<Json> {
+    const isJson = this.mediaType.isJson();
+    const isText = this.mediaType.isText();
+    const bytes = stripBom(await this.materialize(maxBytes));
+    if (isJson) {
+      // A body typed as JSON but holding something else is the one case that
+      // still fails loudly: it is a producer bug, not a shape the pipeline
+      // should paper over.
+      try {
+        return JSON.parse(decoder.decode(bytes)) as Json;
+      } catch (e) {
+        throw RsError.badRequest(
+          `invalid JSON body: ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
+    if (isText) {
+      try {
+        return strictDecoder.decode(bytes);
+      } catch {
+        // Declared text but not decodable: fall back to base64 rather than
+        // losing bytes to replacement characters.
+        return base64(bytes);
+      }
+    }
+    return base64(bytes);
+  }
+
+  /// The raw payload rendered as a string, the way v1's `asString` did it:
+  /// the UTF-8 text when the bytes decode, standard base64 when they do not.
+  /// Unlike `asAny` it never parses JSON — it is the byte-faithful view a
+  /// signature is computed over, so a lossy decode here would silently break
+  /// HMAC verification on a non-UTF-8 payload.
+  async asRawString(maxBytes: number): Promise<string> {
+    const bytes = await this.materialize(maxBytes);
+    try {
+      return strictDecoder.decode(bytes);
+    } catch {
+      return base64(bytes);
     }
   }
 
@@ -231,4 +278,22 @@ export function utf8Decode(bytes: Uint8Array): string {
 
 export function utf8Encode(text: string): Uint8Array {
   return encoder.encode(text);
+}
+
+/// Strip a leading UTF-8 BOM, which bodies read from files often carry.
+function stripBom(bytes: Uint8Array): Uint8Array {
+  return bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+    ? bytes.subarray(3)
+    : bytes;
+}
+
+/// Standard base64, matching the Rust host's `STANDARD` engine (padded).
+/// Chunked so a large body does not blow the argument limit of `apply`.
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
 }

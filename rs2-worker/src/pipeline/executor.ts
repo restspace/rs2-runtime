@@ -399,12 +399,18 @@ export class Executor {
 
     if (step.transform !== undefined) {
       const template = step.transform;
-      const input: Json = msg.body ? await msg.body.asJson(this.limits.materializeCap) : null;
+      // Media-type-directed, matching Restspace v1: JSON parses, text
+      // arrives as a string, binary as base64. A transform over an HTML or
+      // CSV body is a normal thing to want, so a non-JSON body is not an
+      // error here.
+      const input: Json = msg.body ? await msg.body.asAny(this.limits.materializeCap) : null;
       // The exact request bytes, bound only when the template mentions it.
+      // Byte-faithful (base64 when the payload is not UTF-8): a lossy decode
+      // would silently break signature verification.
       let rawBody: string | undefined;
       if (msg.body && transform.mentions(template, "_rawBody")) {
         try {
-          rawBody = new TextDecoder().decode(await msg.body.materialize(this.limits.materializeCap));
+          rawBody = await msg.body.asRawString(this.limits.materializeCap);
         } catch {
           rawBody = undefined;
         }
@@ -580,8 +586,11 @@ export class Executor {
       let value: Json;
       if (!out.isOk()) {
         value = { _errorStatus: out.status ?? 500, _errorMessage: await this.bodyText(out) };
-      } else if (out.body && out.body.mediaType.isJson()) {
-        value = await out.body.asJson(this.limits.materializeCap);
+      } else if (out.body) {
+        // Capturing a text response gave null before this went through the
+        // shared conversion; now it captures the string (and a binary body
+        // as base64).
+        value = await out.body.asAny(this.limits.materializeCap);
       } else {
         value = null;
       }
@@ -655,10 +664,10 @@ export class Executor {
           let value: Json;
           if (!m.isOk()) {
             value = { _errorStatus: m.status ?? 500, _errorMessage: await this.bodyText(m) };
-          } else if (m.body && m.body.mediaType.isJson()) {
-            value = await m.body.asJson(this.limits.materializeCap);
           } else if (m.body) {
-            value = new TextDecoder().decode(await m.body.materialize(this.limits.materializeCap));
+            // Same three-way conversion as a transform input, so a binary
+            // leg joins as base64, not mojibake.
+            value = await m.body.asAny(this.limits.materializeCap);
           } else {
             value = null;
           }

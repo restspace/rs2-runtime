@@ -39,6 +39,37 @@ Pitfall: anything you compute here runs on the hot path. Gate optional work
 behind a cheap check (e.g. `LogStore::enabled()` skips building a record when
 no sink is configured) so the G1 budget holds. See `testing.md`.
 
+## Body conversion (one rule, one place)
+
+Every boundary that turns a body into a *value* goes through
+`Body::as_any` (`src/message/body.rs`), which converts by media type, the
+rule Restspace v1 kept in `MessageBody.asJson`:
+
+| `MediaType` says | `as_any` yields |
+| --- | --- |
+| `is_json()` | the parsed `serde_json::Value` |
+| `is_text()` | the UTF-8 string |
+| otherwise | a **standard base64** string |
+
+So a transform over an HTML or CSV body is ordinary, and a binary body
+crosses intact instead of being mangled by a lossy UTF-8 decode. The one
+remaining hard failure is a body typed `application/json` that does not
+parse — a producer bug worth a 400. Callers: the transform step, `as:`
+captures, the `jsonObject` join, and both JS-engine envelope builders.
+
+`Body::as_raw_string` is the sibling for `$_rawBody`: byte-faithful (UTF-8
+text when it decodes, base64 when it does not), never parsing, because a
+lossy decode there would silently break HMAC verification.
+
+`Body::as_json` stays for the boundaries that genuinely require JSON (a
+data-store write, a schema, `jsonSplit`, credentials); it rejects anything
+else. Reach for `as_json` when non-JSON is a caller error, `as_any` when the
+body is just data passing through, and `materialize` when you want bytes.
+
+The Worker host mirrors this in `rs2-worker/src/runtime/body.ts`; the two
+must agree byte-for-byte, which `conformance/http/pipeline.test.ts`
+("transform input by media type") pins with a literal base64 expectation.
+
 ## The store pattern (client polymorphism)
 
 `file`, `data`, the spec stores, and the code store all obey **one normative

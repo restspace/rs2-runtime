@@ -520,14 +520,9 @@ async fn run_host_request(
         None => (Value::Null, Value::Null),
         Some(body) => {
             let mt = body.media_type.to_string();
-            let is_json = body.media_type.is_json();
-            let bytes = body.materialize(materialize_cap).await?;
-            let text = String::from_utf8_lossy(bytes).into_owned();
-            let payload = if is_json {
-                serde_json::from_str(&text).unwrap_or(Value::String(text))
-            } else {
-                Value::String(text)
-            };
+            // Media-type-directed: JSON parses, text is a string, binary is
+            // base64. Decoding binary as lossy UTF-8 used to corrupt it.
+            let payload = body.as_any(materialize_cap).await?;
             (json!(mt), payload)
         }
     };
@@ -1103,14 +1098,10 @@ impl Engine for JsEngine {
                 None => Value::Null,
                 Some(body) => {
                     let media_type = body.media_type.to_string();
-                    let is_json = body.media_type.is_json();
-                    let bytes = body.materialize(limits.materialized_body_bytes).await?;
-                    let text = String::from_utf8_lossy(bytes).into_owned();
-                    let payload = if is_json {
-                        serde_json::from_str(&text).unwrap_or(Value::String(text))
-                    } else {
-                        Value::String(text)
-                    };
+                    // Same three-way conversion the host uses everywhere: a
+                    // guest sees an object for JSON, a string for text, and
+                    // base64 for binary rather than mojibake.
+                    let payload = body.as_any(limits.materialized_body_bytes).await?;
                     json!({ "payload": payload, "mediaType": media_type })
                 }
             }
