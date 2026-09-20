@@ -685,7 +685,8 @@ guest, unforgeable). Methods:
 | `bodyRead()` → `Uint8Array|null` | `op_rs2_body_read` when `requestStreaming`; cumulative cap |
 | `streamBegin(envelope)`, `bodyWrite(bytes)` | `responseStreaming`: the host resolves the client response on `streamBegin` with a `TransformStream` and pumps writes into it; twice → 502 `beginStream called more than once`; write before begin → 502 |
 | `socketConnect(host, port, tls)` | **not RPC** — sockets stay in the guest via `cloudflare:sockets`; the gateway's `connect()` hook enforces the `{"type":"socket","hosts":[…]}` allowlist (`socket_allowed` patterns: `host:port`, host-only, `*`, `*.suffix[:port]`) and denies with `capability 'socket <host>:<port>' is not granted to this service` |
-| `socketSend(invocationId, socketId, data)` | inbound-WebSocket only (`websocket.md`): the host issues a `system` request to the invocation's own mount's `/.sockets/?$id=<socketId>` carrying `data` as the frame body — any socket id on that mount, never another mount's |
+| `socketList(invocationId, target)` | `ctx.sockets.list`: `GET` of the selection's subtree on the invocation's own mount's `/.sockets/`, `system`-sourced like the two below |
+| `socketSend(invocationId, target, data)` — `target` is a socket id (the `socket` handle) or a `ctx.sockets` selection `{path?, subtree?, id?, user?}`, validated host-side | inbound-WebSocket only (`websocket.md`): the host issues a `system` request to the invocation's own mount's `/.sockets/?$id=<socketId>` carrying `data` as the frame body — any socket id on that mount, never another mount's |
 | `socketClose(invocationId, socketId, code?, reason?)` | same shape as `socketSend`, but `DELETE …/.sockets/?$id=<socketId>[&code=&reason=]` |
 
 Host → guest: `const worker = env.LOADER.get(id, loadCode)` where `id =

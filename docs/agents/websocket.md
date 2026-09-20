@@ -119,7 +119,23 @@ guest message (body = the frame; for `close`, `{code, reason, wasClean}`);
 `send`/`close` are `env.RS2.socketSend/socketClose` → the host issues a
 `system` request to the **invocation's own mount's** `/.sockets/?$id=<id>`
 (any socket id on that mount; never another mount). The returned envelope is
-the reply, as for pipelines. Missing `onOpen`/`onClose` → 204 no-op; missing
+the reply, as for pipelines.
+
+Every invocation on a `webSocket` `code:` mount — a handler, a plain request
+to `default`, a scheduler tick — also gets `ctx.sockets`: `send(sel, data)`,
+`close(sel, code?, reason?)`, `list(sel)` with `sel = {path?, subtree?, id?,
+user?}` (`path` relative to the mount; `{}` = the whole mount). It is the same
+`system` op as the handle with a selection instead of one id
+(`env.RS2.socketSend/socketClose/socketList`): the URL is built host-side from
+the invocation's own mount base, `path` is admitted segment by segment (no dot
+segments, separators, `?`/`#`, control characters), and `id`/`user` are only
+ever encoded query values — so it cannot leave that mount's `/.sockets/`.
+This is deliberately **not** a general escalation: a guest's `ctx.request`
+still runs as its caller and never inherits a tick's `system` source (socket
+events are `system` too, and carry a user's principal — propagating it would
+let any connected user bypass access on every grant). A mount without the
+flag gets no socket surface (`capability_denied`), since `/.sockets/` there is
+an ordinary path of the service itself. Missing `onOpen`/`onClose` → 204 no-op; missing
 `onMessage` → 502 `contract_violation`. Each handler call is one ordinary
 invocation: own CPU budget, own wall clock, own outbound budget.
 

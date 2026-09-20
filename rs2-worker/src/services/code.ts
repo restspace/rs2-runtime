@@ -13,6 +13,7 @@ import { RsError } from "../runtime/error";
 import type { Json } from "../runtime/error";
 import { Message, MsgUrl } from "../runtime/message";
 import { validatePath } from "../runtime/router";
+import { webSocketConfigOf } from "../runtime/sockets";
 import { CachePolicy, CorsPolicy } from "../runtime/wrapper";
 import { sanitizedStoreRoot } from "../capabilities/types";
 import { imagesGrantConfig, imagesGrantTarget } from "../capabilities/images";
@@ -220,8 +221,11 @@ export class CodeService implements Service {
       cpuMs: cpuMsFromConfig(ctx.config),
       // The guest's `socket.send`/`socket.close` reach exactly this mount's
       // `/.sockets/` subtree (§E.6) — the base is the host's, never the
-      // guest's, so a socket id cannot be steered off the mount.
-      socketMount: ctx.requester ? { base, requester: ctx.requester } : undefined,
+      // guest's, so a socket id cannot be steered off the mount. Only a
+      // `webSocket` mount has the subtree: on any other, `/.sockets/` is an
+      // ordinary path of this very service, and the op would call back in.
+      socketMount:
+        ctx.requester && webSocketConfigOf(ctx.config, "code:") ? { base, requester: ctx.requester } : undefined,
     });
     return resolveBodyRef(resp, grants, tenant, principal, trace, depth, BODY_REF_HEADER);
   }

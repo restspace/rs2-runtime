@@ -19,7 +19,7 @@ import { connect as connectSocket } from "cloudflare:sockets";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Json } from "./runtime/error";
 import { SOCKET_DIAL_SUFFIX } from "./engines/dynamic-worker";
-import type { SerializedRequest, SerializedResponse } from "./engines/dynamic-worker";
+import type { GuestSocketTarget, SerializedRequest, SerializedResponse } from "./engines/dynamic-worker";
 import type { Env } from "./env";
 
 export interface GuestBoundaryProps {
@@ -39,10 +39,11 @@ interface TenantGuestRpc {
   guestBodyWrite(invocationId: string, data: Uint8Array): Promise<Json>;
   guestSocketCheck(invocationId: string, host: string, port: number, tls: boolean): Promise<Json>;
   guestSocketConsume(nonce: string): Promise<{ host: string; port: number; tls: boolean } | null>;
-  guestSocketSend(invocationId: string, socketId: string, data: string | Uint8Array): Promise<Json>;
+  guestSocketSend(invocationId: string, target: GuestSocketTarget, data: string | Uint8Array): Promise<Json>;
+  guestSocketList(invocationId: string, target: GuestSocketTarget): Promise<Json>;
   guestSocketClose(
     invocationId: string,
-    socketId: string,
+    target: GuestSocketTarget,
     code: number | undefined,
     reason: string | undefined,
   ): Promise<Json>;
@@ -103,18 +104,20 @@ export class HostApi extends WorkerEntrypoint<Env> {
   /// The guest `socket` handle (§E.6). The socket id is the only thing the
   /// guest supplies; the mount it resolves against is invocation state held
   /// by the DO, so these cannot address another mount.
-  socketSend(invocationId: string, socketId: string, data: string | Uint8Array): Promise<Json> {
-    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketSend(
-      invocationId,
-      String(socketId),
-      data,
-    );
+  /// `target` is one socket id (the `socket` handle) or a `ctx.sockets`
+  /// selection; the DO validates it.
+  socketSend(invocationId: string, target: GuestSocketTarget, data: string | Uint8Array): Promise<Json> {
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketSend(invocationId, target, data);
   }
 
-  socketClose(invocationId: string, socketId: string, code?: number, reason?: string): Promise<Json> {
+  socketList(invocationId: string, target: GuestSocketTarget): Promise<Json> {
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketList(invocationId, target);
+  }
+
+  socketClose(invocationId: string, target: GuestSocketTarget, code?: number, reason?: string): Promise<Json> {
     return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketClose(
       invocationId,
-      String(socketId),
+      target,
       code === undefined ? undefined : Number(code),
       reason === undefined ? undefined : String(reason),
     );

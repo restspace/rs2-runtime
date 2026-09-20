@@ -206,6 +206,13 @@ describe.runIf(divergences().webSocket === "served")("websocket (cloudflare: Soc
   /** onOpen greets; onMessage echoes the frame with a marker (code.test.ts pattern). */
   const GUEST_BUNDLE = `
 export default async (msg, ctx) => {
+  // A non-socket invocation (an HTTP request here; a scheduler tick is the
+  // same shape) pushing to the mount's own sockets through ctx.sockets.
+  if (msg.method === "POST") {
+    const pushed = await ctx.sockets.send({ path: "/room/", subtree: true }, { pushed: msg.body });
+    const listed = await ctx.sockets.list({ path: "/room" });
+    return { status: 200, body: { sent: pushed.sent, total: listed.total } };
+  }
   return { status: 200, body: { method: msg.method } };
 };
 export async function onOpen(msg, ctx, socket) {
@@ -249,7 +256,7 @@ export async function onMessage(msg, ctx, socket) {
       // SOCK_MOUNT's `.sockets/` subtree via an ordinary `call` step.
       { path: NOTIFY_MOUNT, service: "pipeline", config: { access: { invoke: "A", write: "A" } } },
       // `code:` mount with guest open/message handlers.
-      { path: GUEST_MOUNT, service: guestRef, config: { access: "open", webSocket: true } },
+      { path: GUEST_MOUNT, service: guestRef, config: { access: { read: "all", invoke: "all", write: "A" }, webSocket: true } },
     ]);
 
     await seed.createPrincipals([DEV_U, OTHER_E]);
@@ -454,6 +461,32 @@ export async function onMessage(msg, ctx, socket) {
     } finally {
       ws.close();
       await once(ws, "close").catch(() => {});
+    }
+  });
+
+  test("guest push: a plain invocation reaches the mount's own sockets via ctx.sockets", async () => {
+    const inRoom = track(new WebSocket(wsUrl(`${GUEST_MOUNT}/room/7`)));
+    const elsewhere = track(new WebSocket(wsUrl(`${GUEST_MOUNT}/lobby`)));
+    try {
+      await Promise.all([once(inRoom, "open"), once(elsewhere, "open")]);
+      expect(jsonFrame(await once<MessageEvent>(inRoom, "message"))).toEqual({ greeting: "hello" });
+      expect(jsonFrame(await once<MessageEvent>(elsewhere, "message"))).toEqual({ greeting: "hello" });
+
+      // Anonymous caller, no write role on the mount: the push is the
+      // service's own act on its own mount, not the caller's.
+      const res = await anon.post(`${GUEST_MOUNT}/notify`, { json: { n: 1 } });
+      status(res, 200, "[ws-guest] push invocation");
+      expect(res.json(), "[ws-guest] one socket in /room/, listed").toEqual({ sent: 1, total: 1 });
+      expect(jsonFrame(await once<MessageEvent>(inRoom, "message"))).toEqual({ pushed: { n: 1 } });
+
+      // …while the same caller cannot write to /.sockets/ directly.
+      const direct = await anon.post(`${GUEST_MOUNT}/.sockets/room/`, { json: { n: 2 } });
+      expect([401, 403], "[ws-guest] direct .sockets/ write is still gated").toContain(direct.status);
+    } finally {
+      for (const ws of [inRoom, elsewhere]) {
+        ws.close();
+        await once(ws, "close").catch(() => {});
+      }
     }
   });
 

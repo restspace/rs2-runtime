@@ -14,13 +14,14 @@ import {
   guestRequestOp,
   guestSocketCheckOp,
   guestSocketCloseOp,
+  guestSocketListOp,
   guestSocketSendOp,
   consumeSocketApproval,
   guestStateGetOp,
   guestStatePutOp,
   guestStreamBeginOp,
 } from "./engines/dynamic-worker";
-import type { Invocations, SerializedRequest, SerializedResponse, SocketApprovals } from "./engines/dynamic-worker";
+import type { GuestSocketTarget, Invocations, SerializedRequest, SerializedResponse, SocketApprovals } from "./engines/dynamic-worker";
 import { R2FileStore } from "./capabilities/r2-file-store";
 import { DATA_SCHEMA_SQL, SqliteDataStore } from "./capabilities/sqlite-data-store";
 import {
@@ -874,12 +875,16 @@ export class TenantObject extends DurableObject<Env> {
 
   /// Guest `socket.send`/`socket.close` (§E.6): sugar over the mount's own
   /// `/.sockets/` subtree, issued as `system` for the invocation's mount only.
-  guestSocketSend(invocationId: string, socketId: string, data: string | Uint8Array): Promise<Json> {
-    return guestSocketSendOp(this.invocations, invocationId, socketId, data);
+  guestSocketSend(invocationId: string, target: GuestSocketTarget, data: string | Uint8Array): Promise<Json> {
+    return guestSocketSendOp(this.invocations, invocationId, target, data);
   }
 
-  guestSocketClose(invocationId: string, socketId: string, code: number | undefined, reason: string | undefined): Promise<Json> {
-    return guestSocketCloseOp(this.invocations, invocationId, socketId, code, reason);
+  guestSocketList(invocationId: string, target: GuestSocketTarget): Promise<Json> {
+    return guestSocketListOp(this.invocations, invocationId, target);
+  }
+
+  guestSocketClose(invocationId: string, target: GuestSocketTarget, code: number | undefined, reason: string | undefined): Promise<Json> {
+    return guestSocketCloseOp(this.invocations, invocationId, target, code, reason);
   }
 
   guestFetch(invocationId: string | null, req: SerializedRequest): Promise<SerializedResponse> {

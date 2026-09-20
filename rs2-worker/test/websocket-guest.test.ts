@@ -12,6 +12,7 @@ import { describe, expect, it } from "vitest";
 import {
   DynamicWorkerEngine,
   guestSocketCloseOp,
+  guestSocketListOp,
   guestSocketSendOp,
 } from "../src/engines/dynamic-worker";
 import type { EngineHost, InvocationRecord, Invocations, SocketMount } from "../src/engines/dynamic-worker";
@@ -305,5 +306,60 @@ describe("guest socket ops address only the invocation's own mount", () => {
     expect(over.code).toBe("limit_exceeded");
     // The second invocation's budget is untouched by the first's breach.
     expect(await guestSocketSendOp(invocations, "call-b", "s", "one")).toEqual({ sent: 1 });
+  });
+});
+
+describe("ctx.sockets selects within the invocation's own mount", () => {
+  // The scheduled-push case: a tick (or any HTTP request) has no `socket`
+  // handle, and `ctx.request` would run as the caller. `ctx.sockets` is the
+  // same `system` op with a selection instead of one id.
+  it("an exact path, a subtree, and the whole mount", async () => {
+    const { mount, seen } = stubRequester();
+    const invocations: Invocations = new Map([["i1", record(mount, 8)]]);
+    await guestSocketSendOp(invocations, "i1", { path: "/room/42" }, "a");
+    await guestSocketSendOp(invocations, "i1", { path: "room/42", subtree: true }, "b");
+    await guestSocketSendOp(invocations, "i1", { path: "/room/" }, "c");
+    await guestSocketSendOp(invocations, "i1", {}, "d");
+    expect(seen.map((r) => `${r.path}?${r.query}`)).toEqual([
+      "/chat/.sockets/room/42?",
+      "/chat/.sockets/room/42/?",
+      "/chat/.sockets/room/?",
+      "/chat/.sockets/?",
+    ]);
+    expect(seen.every((r) => r.source === "system" && r.method === "POST")).toBe(true);
+  });
+
+  it("$id and $user narrow it, URL-encoded", async () => {
+    const { mount, seen } = stubRequester();
+    const invocations: Invocations = new Map([["i1", record(mount)]]);
+    await guestSocketSendOp(invocations, "i1", { path: "/room/", id: "s 1", user: "a@x&$id=other" }, "x");
+    expect(seen[0]!.path).toBe("/chat/.sockets/room/");
+    expect(seen[0]!.query).toBe("$id=s%201&$user=a%40x%26%24id%3Dother");
+  });
+
+  it("a path cannot leave the mount's /.sockets/ subtree", async () => {
+    const { mount, seen } = stubRequester();
+    const invocations: Invocations = new Map([["i1", record(mount, 16)]]);
+    for (const path of ["../../admin", "room/../../x", "%2e%2e/x", "room/%2Fx", "a?$user=root", "a#b", "a\b", "%zz"]) {
+      const out = (await guestSocketSendOp(invocations, "i1", { path }, "x")) as JsonObject;
+      expect(out.__rs2_error, path).toBe(true);
+      expect(out.code, path).toBe("bad_request");
+    }
+    expect(seen).toHaveLength(0);
+  });
+
+  it("list returns the /.sockets/ listing for the selection's subtree", async () => {
+    const listing = { path: "/chat/.sockets/room/", entries: [], total: 0 };
+    const { mount, seen } = stubRequester((msg) => msg.response(200, Body.fromJson(listing)));
+    const invocations: Invocations = new Map([["i1", record(mount)]]);
+    expect(await guestSocketListOp(invocations, "i1", { path: "/room" })).toEqual(listing);
+    expect(seen[0]!).toMatchObject({ method: "GET", path: "/chat/.sockets/room/", source: "system" });
+  });
+
+  it("close takes a selection too", async () => {
+    const { mount, seen } = stubRequester((msg) => msg.response(200, Body.fromJson({ closed: 3 })));
+    const invocations: Invocations = new Map([["i1", record(mount)]]);
+    expect(await guestSocketCloseOp(invocations, "i1", { user: "u@x" }, 4000, undefined)).toEqual({ closed: 3 });
+    expect(seen[0]!.query).toBe("$user=u%40x&code=4000");
   });
 });

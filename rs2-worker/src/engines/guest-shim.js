@@ -79,6 +79,23 @@ function makeCtx(rs2, config, invocationId) {
         end: () => {}, // the stream closes when the handler returns
       };
     },
+    // The mount's own sockets (webSocket mounts only): push, close or list a
+    // selection `{path?, subtree?, id?, user?}` — `path` relative to the
+    // mount; `{}` is every socket on it. Works from any invocation (an HTTP
+    // request, a scheduled tick), not just a socket handler.
+    sockets: {
+      send: (sel, data) => hostCall(() => rs2.socketSend(invocationId, selectorOf(sel), frameOf(data))),
+      close: (sel, code, reason) =>
+        hostCall(() =>
+          rs2.socketClose(
+            invocationId,
+            selectorOf(sel),
+            code === undefined || code === null ? undefined : Number(code),
+            reason === undefined || reason === null ? undefined : String(reason),
+          ),
+        ),
+      list: (sel) => hostCall(() => rs2.socketList(invocationId, selectorOf(sel))),
+    },
   };
   return ctx;
 }
@@ -102,6 +119,16 @@ function frameOf(data) {
 /// the raw socket. Reaching OTHER sockets is an ordinary `ctx.request` to a
 /// `prefix` grant over `/.sockets/`, not a wider handle here. The host
 /// resolves the id against the invocation's own mount.
+/// A `ctx.sockets` selection as plain data for the RPC boundary (the host
+/// validates it; an id string selects one socket).
+function selectorOf(sel) {
+  if (typeof sel === "string") return { id: sel };
+  const s = sel && typeof sel === "object" ? sel : {};
+  const out = {};
+  for (const k of ["path", "subtree", "id", "user"]) if (s[k] !== undefined && s[k] !== null) out[k] = s[k];
+  return out;
+}
+
 function makeSocket(rs2, invocationId, id) {
   const denied = () => {
     const e = new Error("socket capability is not granted to this service");

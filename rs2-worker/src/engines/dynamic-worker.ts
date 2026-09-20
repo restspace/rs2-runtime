@@ -263,14 +263,56 @@ export async function guestStatePutOp(invocations: Invocations, id: string, key:
 
 // ---- inbound WebSockets: the guest's `socket` handle (§E.6) --------------
 
-/// The URL a guest socket op addresses: the invocation's own mount's
-/// reserved subtree, with the socket id **only ever** URL-encoded into the
-/// `$id` query value. The mount base comes from host-side invocation state
-/// and nothing the guest passes can reach the path, so these `system`
-/// messages cannot be steered onto another mount or path.
-function socketControlUrl(base: string, socketId: string, extra: string): string {
+/// What a guest may address: one socket id (the `socket` handle), or a
+/// `ctx.sockets` selection `{path?, subtree?, id?, user?}` — `path` relative
+/// to the mount, written as it appears in a URL.
+export type GuestSocketTarget = string | { path?: unknown; subtree?: unknown; id?: unknown; user?: unknown };
+
+/// A path segment with nothing that could re-route a URL: no separators,
+/// no query/fragment marks, no control characters.
+function plainSegment(seg: string): boolean {
+  for (const ch of seg) {
+    const c = ch.codePointAt(0) ?? 0;
+    if (c < 0x20 || c === 0x7f || ch === "/" || ch === "\\" || ch === "?" || ch === "#") return false;
+  }
+  return true;
+}
+
+/// The URL a guest socket op addresses: always inside the invocation's own
+/// mount's reserved subtree. The mount base comes from host-side invocation
+/// state; `id`/`user` are only ever URL-encoded query values; and a `path`
+/// is admitted segment by segment, so nothing the guest passes can steer
+/// these `system` messages onto another mount or out of `/.sockets/`
+/// (`validatePath` in dispatch is the second line of defence).
+function socketControlUrl(base: string, target: GuestSocketTarget, extra: string): string {
   const mount = base === "/" ? "" : base.replace(/\/+$/, "");
-  return `${mount}/${SOCKETS_SEGMENT}/?$id=${encodeURIComponent(socketId)}${extra}`;
+  const root = `${mount}/${SOCKETS_SEGMENT}/`;
+  if (typeof target === "string") return `${root}?$id=${encodeURIComponent(target)}${extra}`;
+  const t = target && typeof target === "object" ? target : {};
+  let rest = "";
+  if (t.path !== undefined && t.path !== null) {
+    if (typeof t.path !== "string") throw RsError.badRequest("sockets selector: 'path' must be a string");
+    const segments = t.path.split("/").filter((seg) => seg !== "");
+    for (const seg of segments) {
+      const decoded = (() => {
+        try {
+          return decodeURIComponent(seg);
+        } catch {
+          throw RsError.badRequest("sockets selector: 'path' is not a valid URL path");
+        }
+      })();
+      if (decoded === "." || decoded === ".." || !plainSegment(decoded) || !plainSegment(seg)) {
+        throw RsError.badRequest("sockets selector: 'path' must be a plain path relative to the mount");
+      }
+    }
+    const subtree = t.subtree === true || t.path.endsWith("/");
+    if (segments.length > 0) rest = segments.join("/") + (subtree ? "/" : "");
+  }
+  let query = "";
+  if (t.id !== undefined && t.id !== null) query += `&$id=${encodeURIComponent(String(t.id))}`;
+  if (t.user !== undefined && t.user !== null) query += `&$user=${encodeURIComponent(String(t.user))}`;
+  query += extra;
+  return `${root}${rest}${query === "" ? "" : `?${query.slice(1)}`}`;
 }
 
 /// A `/.sockets/` failure response back as a structured error, so a denial
@@ -292,13 +334,13 @@ function errorFromProblem(status: number, payload: Json): RsError {
 async function runSocketControl(
   record: InvocationRecord,
   method: string,
-  socketId: string,
+  target: GuestSocketTarget,
   extra: string,
   body: Body | undefined,
 ): Promise<JsonObject> {
   const mount = record.socketMount;
   if (!mount) throw RsError.capabilityDenied("socket");
-  const call = Message.request(method, socketControlUrl(mount.base, socketId, extra), record.tenant);
+  const call = Message.request(method, socketControlUrl(mount.base, target, extra), record.tenant);
   call.source = "system";
   call.principal = record.principal ? { ...record.principal } : undefined;
   call.depth = record.depth; // advanced once, in `GrantedHost.requestUnnamed`
@@ -315,7 +357,7 @@ async function runSocketControl(
 export async function guestSocketSendOp(
   invocations: Invocations,
   id: string,
-  socketId: string,
+  target: GuestSocketTarget,
   data: string | Uint8Array,
 ): Promise<Json> {
   const record = invocations.get(id);
@@ -325,7 +367,7 @@ export async function guestSocketSendOp(
       typeof data === "string"
         ? Body.fromString(data, new MediaType("text/plain"))
         : Body.fromBytes(data instanceof Uint8Array ? data : new Uint8Array(data), MediaType.octetStream());
-    return await runSocketControl(record, "POST", String(socketId), "", body);
+    return await runSocketControl(record, "POST", target, "", body);
   } catch (e) {
     return failGuest(record, toRsError(e));
   }
@@ -336,7 +378,7 @@ export async function guestSocketSendOp(
 export async function guestSocketCloseOp(
   invocations: Invocations,
   id: string,
-  socketId: string,
+  target: GuestSocketTarget,
   code: number | undefined,
   reason: string | undefined,
 ): Promise<Json> {
@@ -346,7 +388,21 @@ export async function guestSocketCloseOp(
   if (typeof code === "number" && Number.isFinite(code)) extra += `&code=${Math.floor(code)}`;
   if (typeof reason === "string") extra += `&reason=${encodeURIComponent(reason)}`;
   try {
-    return await runSocketControl(record, "DELETE", String(socketId), extra, undefined);
+    return await runSocketControl(record, "DELETE", target, extra, undefined);
+  } catch (e) {
+    return failGuest(record, toRsError(e));
+  }
+}
+
+/// `ctx.sockets.list`: the selection's connections, as the `/.sockets/`
+/// listing reports them. A selection with a `path` lists that subtree.
+/// → `{path, entries, total}`.
+export async function guestSocketListOp(invocations: Invocations, id: string, target: GuestSocketTarget): Promise<Json> {
+  const record = invocations.get(id);
+  if (!record) return errorMarker(RsError.internal(`unknown invocation '${id}'`));
+  try {
+    const sel = typeof target === "string" ? target : { ...target, subtree: true };
+    return await runSocketControl(record, "GET", sel, "", undefined);
   } catch (e) {
     return failGuest(record, toRsError(e));
   }
