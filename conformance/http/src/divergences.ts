@@ -60,6 +60,14 @@ export interface Divergences {
    * `RS2_CF_REMOTE` run, where the real platform serves the binding.
    */
   imageFidelity: "full" | "basic";
+  /**
+   * Inbound WebSockets (docs/agents/websocket.md): implemented on the Worker
+   * host (`SocketHub` over the Hibernation API) — `"served"`. The Rust host
+   * has no socket wiring yet — `"absent"` — so `websocket.test.ts` gates its
+   * whole live-socket suite on this flag and, on `"absent"`, only checks the
+   * negative contract: an `Upgrade` request never turns into a 101.
+   */
+  webSocket: "served" | "absent";
 }
 
 const TABLE: Record<HostKind, Divergences> = {
@@ -70,6 +78,7 @@ const TABLE: Record<HostKind, Divergences> = {
     domainAttachment: "config",
     imageBundle: "wasm",
     imageFidelity: "full",
+    webSocket: "absent",
   },
   cloudflare: {
     absentDirectoryDelete: [204, 404],
@@ -78,6 +87,7 @@ const TABLE: Record<HostKind, Divergences> = {
     domainAttachment: "api",
     imageBundle: "js",
     imageFidelity: process.env.RS2_CF_REMOTE ? "full" : "basic",
+    webSocket: "served",
   },
 };
 

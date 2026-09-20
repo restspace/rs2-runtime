@@ -147,6 +147,9 @@ export class Message {
   name: string | undefined;
   /// Internal-call depth, capped by limits to bound recursion.
   depth: number;
+  /// Set by `dispatch` on a 101 response: the host must complete the
+  /// WebSocket upgrade with this identity (`runtime/sockets.ts`).
+  socketAccept: import("./sockets").SocketAccept | undefined;
 
   constructor(method: string, url: MsgUrl, tenant: string) {
     this.method = method;
@@ -160,6 +163,7 @@ export class Message {
     this.source = "external";
     this.name = undefined;
     this.depth = 0;
+    this.socketAccept = undefined;
   }
 
   static request(method: string, pathAndQuery: string, tenant: string): Message {

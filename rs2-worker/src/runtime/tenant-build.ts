@@ -59,6 +59,7 @@ import { urlHost } from "./outbound";
 import { MountTable } from "./router";
 import type { Mount } from "./router";
 import { scheduleFromConfig } from "./scheduler";
+import { parseWebSocketConfig } from "./sockets";
 import { CachePolicy, CorsPolicy, invocationLimits } from "./wrapper";
 import type { InvocationLimits, LimitTable } from "./wrapper";
 
@@ -509,6 +510,9 @@ export function buildTenant(
   }
   for (const m of config.mounts) {
     if (m.config.schedule !== undefined) scheduleFromConfig(m.config.schedule);
+    // Normalized on every dispatch; parsed here so a bad value is a 400 at
+    // config PUT rather than a surprise on the first upgrade.
+    parseWebSocketConfig(m.config.webSocket, m.service);
   }
   const mounts = new MountTable(config.mounts.map((m) => ({ basePath: m.path, service: m.service, config: m.config })));
   const infras = adapters.infras;

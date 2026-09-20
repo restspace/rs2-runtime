@@ -370,6 +370,10 @@ export default {
     const forwarded = new Request(request, { headers });
     const resp = await tenantStub(env, tenant).fetch(forwarded);
     await drainUnread(forwarded.body);
+    // An accepted WebSocket upgrade passes through intact: re-wrapping a
+    // 101 drops its `webSocket` half (and a 101 cannot be constructed
+    // without one).
+    if (resp.status === 101 && resp.webSocket) return resp;
     const out = new Response(resp.body, resp);
     out.headers.set("x-trace-id", traceId);
     return out;

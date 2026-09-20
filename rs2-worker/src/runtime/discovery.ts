@@ -10,6 +10,7 @@ import type { Json, JsonObject } from "./error";
 import { Message } from "./message";
 import type { Mount } from "./router";
 import { configGet } from "./router";
+import { webSocketConfigOf } from "./sockets";
 import type { Tenant } from "./tenant-build";
 import { RS2_VERSION } from "./version";
 import { checkRoleSpec } from "./wrapper";
@@ -29,6 +30,14 @@ export function limitsDoc(limits: LimitTable): JsonObject {
     materializedBodyBytes: limits.materializedBodyBytes,
     outboundCalls: limits.outboundCalls,
     maxDepth: limits.maxDepth,
+    // Per-socket/per-tenant WebSocket ceilings (cloudflare.md §E.6): a client
+    // that knows them can size its frames and its reconnect policy.
+    webSocket: {
+      messageBytes: limits.wsMessageBytes,
+      messagesInFlight: limits.wsMessagesInFlight,
+      messagesPerSecond: limits.wsMessagesPerSecond,
+      socketsPerTenant: limits.wsSocketsPerTenant,
+    },
     host: "cloudflare",
   };
 }
@@ -172,6 +181,13 @@ function authoringOf(mount: Mount): Json | undefined {
   }
 }
 
+/// The `websocket` facet: this mount accepts an `Upgrade: websocket` on its
+/// connect paths and answers the reserved `/.sockets/` subtree.
+function pushWebSocketFacet(mount: Mount, facets: string[]): string[] {
+  if (webSocketConfigOf(mount.config, mount.service) !== undefined) facets.push("websocket");
+  return facets;
+}
+
 /// API pattern + facets (the polymorphism contract).
 export function patternOf(mount: Mount): [string, string[]] {
   if (mount.service === "wrapper") {
@@ -179,7 +195,7 @@ export function patternOf(mount: Mount): [string, string[]] {
     const pattern = typeof p === "string" ? p : "store-transform";
     const f = mount.config.facets;
     const facets = Array.isArray(f) ? f.filter((v): v is string => typeof v === "string") : [];
-    return [pattern, facets];
+    return [pattern, pushWebSocketFacet(mount, facets)];
   }
   let pattern: string;
   let facets: string[];
@@ -232,7 +248,7 @@ export function patternOf(mount: Mount): [string, string[]] {
       facets = mount.service.startsWith("code:") ? ["guest-async"] : [];
   }
   if (pattern.startsWith("store")) facets.push("conditional-write");
-  return [pattern, facets];
+  return [pattern, pushWebSocketFacet(mount, facets)];
 }
 
 function withPattern(entry: JsonObject, mount: Mount): JsonObject {

@@ -73,6 +73,15 @@ export class GrantedHost {
   async request(capability: string, msg: Message): Promise<Message> {
     const target = this.grants.get(capability);
     if (!target) throw RsError.capabilityDenied(capability);
+    return this.requestUnnamed(target, msg);
+  }
+
+  /// A host call that is **not** a named grant, so the guest cannot reach it
+  /// through `ctx.request`: the host itself owns the target and supplies it
+  /// (today: `socket.send`/`socket.close` on the invocation's own mount's
+  /// `/.sockets/` subtree, §E.6). It is still one outbound call — same
+  /// budget, same child trace, same depth advance.
+  async requestUnnamed(target: CapabilityTarget, msg: Message): Promise<Message> {
     const used = ++this.outboundUsed;
     if (used > this.outboundBudget) {
       throw RsError.limitExceeded("outbound_calls", used, this.outboundBudget);

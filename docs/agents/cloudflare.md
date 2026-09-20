@@ -48,6 +48,7 @@ prelude's virtual timers). Wasm components on the Worker.
 | `DELETE` of a directory that never existed: Rust local-fs → 404; R2 has no directories → **204** | runner accepts `204|404` for this one case (§F); documented, not declared |
 | Dot segments in the request target (`/files/../x`, `/files/%2e%2e/x`) | The Workers platform canonicalizes them before the Worker runs (`request.url` already reads `/x`), so the router's 400 `path_unsafe` is unreachable and the request routes on the normalized path (404 for an unmounted target); `%00`, `\`, control characters and drive letters still reach the router and are 400 | runner accepts `400|404` for the two dot-segment cases (`dotSegmentTraversal` in `src/divergences.ts`); documented, not declared |
 | Log storage: per-tenant SQLite rows with a cap instead of rotated NDJSON files | not observable through the `log` reader contract |
+| Inbound WebSocket upgrade is served only on the Worker host for now | declared via the `websocket` facet on a `webSocket`-flagged mount's discovery entry (absent on Rust, where such a mount serves the plain GET unchanged) and the discovery `limits.webSocket` object; bringing the Rust host to parity is a follow-up. Full contract: `websocket.md` |
 
 Everything else — including the odd corners (405 responses that carry
 `code: bad_request`, `If-Match` mismatch on `PUT /services/raw` being **409**
@@ -72,6 +73,7 @@ it as a both-hosts change.
         ┌────────────────────────────────┐          │  infras.json equivalent
         │ TenantObject (DO, 1 per tenant)│◄─────────┘
         │  = Runtime::dispatch + handle  │
+        │  hibernating WebSockets        │
         │  KV: tenant config + version   │      R2 bucket RS2_FILES
         │  SQLite: data, idempotency,    │────► keys `<tenant>/<path>`
         │          logs, schedule claims │      (FileStore, spec stores,
@@ -85,6 +87,11 @@ it as a both-hosts change.
 One Durable Object class `TenantObject`, `idFromName(tenant)`. One
 `RegistryObject` (`idFromName("registry")`) is the operator table. Both are
 SQLite-backed DO classes.
+
+`TenantObject` also holds every accepted inbound WebSocket for the tenant, via
+the Hibernation API (`ctx.acceptWebSocket`) — an idle socket costs no CPU and
+does not pin the DO, and `serializeAttachment`/`getWebSockets` let a socket's
+identity (`SocketAccept`) survive eviction. Full contract: `websocket.md`.
 
 ### B.2 The routing rule
 
@@ -160,6 +167,14 @@ Steps marked **[W]** run in the stateless Worker; **[DO]** in `TenantObject`.
       mounted at '<path>'`; `apply_mount`.
    9. `check_access` (fail closed: no `access` → 401/403; pipeline mounts
       defer non-authoring paths to the service).
+   9.5. **WebSocket upgrade branch.** If the request carries `Upgrade:
+        websocket` and is `external`/`GET` and the mount has `webSocket` and
+        the host has a `SocketHub`, dispatch diverts here to the upgrade path
+        (a 503 `limit_exceeded("ws_sockets_per_tenant")` or a `101` marker) —
+        after `check_access`, so a 101 is never sent before authorization; a
+        mount without the flag falls through and ignores `Upgrade`
+        (`websocket.md` "Upgrade"). The Worker passes the resulting `101`
+        straight through to the client unchanged.
    10. `OPTIONS` → `describe_mount` + `Allow` (a read-only capability probe).
    11. Declared body size (10 GiB absolute cap) and concurrency admission
        (64, fail fast).
@@ -626,6 +641,22 @@ isolate keep their own attribution (grants, principal, outbound budget) and
 work that outlives its invocation carries a finished id the host no longer
 knows (denied).
 
+**Inbound WebSockets — guest side.** The platform `WebSocket` global above is
+the *client* surface (a guest connecting out); a mount that wants to *accept*
+inbound connections opts in with `"webSocket": true` on the mount config and
+exports `onOpen`/`onMessage`/`onClose(msg, ctx, socket)` beside `default`.
+`msg` is the ordinary guest message (frame as the body, media-typed like
+`default`'s); `socket` is `{id, send(data), close(code?, reason?)}` — **never
+the raw platform `WebSocket`**, because the connection itself lives in
+`TenantObject`, not in the guest's isolate. `send`/`close` are RPC
+(`socketSend`/`socketClose`, §E.3) to the invocation's own mount. The returned
+envelope is the reply frame, exactly as a `default` handler's envelope is the
+HTTP response. Critically, each event is its own guest invocation: a socket
+message does **not** hold a CPU/wall-clock/outbound budget open across the
+connection's lifetime, only across that one call — there is no long-lived
+guest process per socket. Full contract, including the close-code and typing
+rules: `websocket.md` ("Guests").
+
 `makeCtx` mirrors `__rs2_dispatch`'s `ctx` exactly in shape; every member that
 was a blocking op in V8 is now a Promise: `request`, `state.get/put`,
 `readBody`, `body()` (async iterable), `beginStream(env).write`. `log` stays
@@ -654,6 +685,8 @@ guest, unforgeable). Methods:
 | `bodyRead()` → `Uint8Array|null` | `op_rs2_body_read` when `requestStreaming`; cumulative cap |
 | `streamBegin(envelope)`, `bodyWrite(bytes)` | `responseStreaming`: the host resolves the client response on `streamBegin` with a `TransformStream` and pumps writes into it; twice → 502 `beginStream called more than once`; write before begin → 502 |
 | `socketConnect(host, port, tls)` | **not RPC** — sockets stay in the guest via `cloudflare:sockets`; the gateway's `connect()` hook enforces the `{"type":"socket","hosts":[…]}` allowlist (`socket_allowed` patterns: `host:port`, host-only, `*`, `*.suffix[:port]`) and denies with `capability 'socket <host>:<port>' is not granted to this service` |
+| `socketSend(invocationId, socketId, data)` | inbound-WebSocket only (`websocket.md`): the host issues a `system` request to the invocation's own mount's `/.sockets/?$id=<socketId>` carrying `data` as the frame body — any socket id on that mount, never another mount's |
+| `socketClose(invocationId, socketId, code?, reason?)` | same shape as `socketSend`, but `DELETE …/.sockets/?$id=<socketId>[&code=&reason=]` |
 
 Host → guest: `const worker = env.LOADER.get(id, loadCode)` where `id =
 "<tenant>:<mount base>:<name>@<version>"` (content-addressed — a redeploy is
@@ -1328,3 +1361,58 @@ Decisions 35–40 were made during the P4b build:
     it without re-deriving the mapping. Found in passing and fixed on both
     hosts: `file` `HEAD` carried no `ETag`, so "the source ETag versions the
     cache key" had never held — HEAD now serves GET's validator.
+
+Decisions 48–54 are the inbound-WebSocket design (full contract:
+`websocket.md`; shared types `rs2-worker/src/runtime/sockets.ts`):
+
+48. **Sockets live in `TenantObject`, not a separate DO class.** Dispatch —
+    `check_access`, the breaker, boundary logging — already lives in the
+    tenant DO, and a socket event is just another message through it (below);
+    a second DO class would be a second dispatch path with its own routing to
+    keep in sync. Hibernation (`ctx.acceptWebSocket`) means an idle socket
+    costs no CPU and does not pin the DO awake, so the one-DO shape does not
+    trade away idle cost. The Workers platform's 32 768-sockets-per-DO cap is
+    therefore the practical ceiling under the operator-configurable
+    `limits.webSocket.socketsPerTenant` (`wsSocketsPerTenant`), not a reason
+    to shard.
+49. **Events are messages, and the budget is per message, not per
+    connection.** Every socket event (`open`/`message`/`close`) becomes a
+    synthetic `system` `POST` through `Runtime.handle` — the same shape as a
+    scheduler tick (`x-rs2-trigger`, here `websocket`) — so the service wall
+    clock, the breaker, concurrency admission and boundary logging apply with
+    no special case, exactly as `architecture.md`'s host-choke-point rule
+    requires. The connection itself is never inside a wall clock; only each
+    dispatched event is.
+50. **`.sockets/` is a reserved subtree**, the `.pipelines/`/`.queries/`
+    precedent: outbound sends/closes/listings are ordinary requests to
+    `/<mount>/.sockets/…`, host-intercepted in `dispatch` after `checkAccess`
+    and answered from the host's `SocketHub`, so a pipeline's `call` step (or
+    a guest's `socketSend`/`socketClose`) is just another internal dispatch —
+    no bespoke RPC surface for outbound frames.
+51. **Close code = 4000 + the RS2 error's HTTP status; reason = the RS2
+    code** (`closeFor`, `≤123` bytes, `limit_exceeded:<limit>` for limit
+    breaches). Application close codes are namespaced 4000–4999 (RFC 6455);
+    offsetting by the HTTP status keeps the mapping mechanical and lets a
+    client that already understands RS2's HTTP error codes read a close code
+    without a second lookup table.
+52. **Text frames default to JSON** (mount config `"text": "json"`, the
+    default; `"text"` for plain-text framing), matching the default body
+    typing everywhere else in RS2; binary frames are always
+    `application/octet-stream`. Configurable per mount because not every
+    protocol on top of WebSocket is JSON-framed.
+53. **Browser auth is `rs2.bearer.<jwt>` as a `Sec-WebSocket-Protocol` entry,
+    plus an `Origin` check on cookie-authenticated upgrades.** A browser
+    WebSocket client cannot set `Authorization`, so the bearer token rides a
+    subprotocol entry instead (offered alongside a real protocol,
+    conventionally `rs2`; the host selects the first non-bearer entry, or
+    echoes the bearer entry when it's the only one offered — a handshake must
+    select something it was offered). WebSocket upgrades are exempt from
+    CORS, so a cookie-authenticated upgrade instead gets the CSRF guard's
+    treatment: an `Origin` the tenant's CORS policy does not trust is refused
+    403, the same cross-site-WebSocket-hijacking mitigation already applied
+    to unsafe methods elsewhere in `dispatch`.
+54. **A mount without the `webSocket` flag ignores `Upgrade` and serves the
+    plain GET** (RFC 9110) rather than answering 426 or otherwise special-
+    casing the header. This keeps "add WebSocket to a mount" strictly
+    additive — an unflagged mount's behavior toward a client that happens to
+    send `Upgrade: websocket` is unchanged.

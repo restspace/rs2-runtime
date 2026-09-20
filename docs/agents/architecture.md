@@ -117,6 +117,23 @@ Before adding a service, ask whether it's a mode of an existing one:
 5. If it's store-shaped, hold it to `tests/store_conformance.rs`.
 6. Document it in the skill (the `rs2-skill` repo's `references/services.md`).
 
+## Sockets are messages
+
+Inbound WebSockets (Worker host so far; spec: `docs/agents/websocket.md`)
+follow the same throughline rather than opening a second dispatch path:
+every socket event (`open`/`message`/`close`) becomes a synthetic `system`
+message through the host's ordinary `handle`/`dispatch` — the same shape as
+a scheduler tick — so a pipeline mount runs its pipeline per event and a
+`code:` mount routes to `onOpen`/`onMessage`/`onClose`. That keeps the wall
+clock, the breaker, concurrency admission and boundary logging applying per
+event with no special case; the connection itself is never inside a wall
+clock, only each dispatched event is. Outbound frames are the mirror image:
+a reserved dot-subtree, `/<mount>/.sockets/…` (the `.pipelines/` precedent),
+answered by the host's socket registry, so a pipeline sends a frame with an
+ordinary `call` step and a guest sends one through the same capability shape
+as any other host call. A socket connection is host state (who is
+connected), not a runtime concern services reason about directly.
+
 ## Instruction plane vs. data
 
 A tenant's **instruction plane** is exactly: tenant config + `.rs2-code/` +

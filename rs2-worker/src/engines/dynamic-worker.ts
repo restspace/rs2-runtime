@@ -13,6 +13,8 @@ import type { Json, JsonObject } from "../runtime/error";
 import { MediaType } from "../runtime/media-type";
 import { Message } from "../runtime/message";
 import type { Principal } from "../runtime/message";
+import { SOCKETS_SEGMENT, SOCKET_ID_HEADER, socketEventOf } from "../runtime/sockets";
+import type { Requester } from "../services/context";
 import { GrantedHost } from "./host-api";
 import type { CapabilityTarget, GuestStateKv, LogContext } from "./host-api";
 import { GUEST_GLOBALS, GUEST_SHIM } from "./guest-shim.bundled";
@@ -132,6 +134,21 @@ export interface InvocationRecord {
   bodyReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   streamedIn: number;
   sink: ResponseSink | undefined;
+  /// Where a guest `socket.send`/`socket.close` may act (§E.6): the
+  /// invocation's OWN mount base and the internal requester that re-enters
+  /// dispatch. Host-side state — the guest never names a mount. Absent on
+  /// invocations with no socket surface (resident adapters, templates), and
+  /// optional so it is only set where it means something.
+  socketMount?: SocketMount;
+}
+
+/// The half of an invocation a socket op needs: the mount whose
+/// `/.sockets/` subtree the guest may address, and the way back into
+/// dispatch (the same `Requester` a `prefix` grant uses).
+export interface SocketMount {
+  /// The mount's base path (`/chat`, or `/` for a root mount).
+  base: string;
+  requester: Requester;
 }
 
 export type Invocations = Map<string, InvocationRecord>;
@@ -242,6 +259,97 @@ export async function guestStatePutOp(invocations: Invocations, id: string, key:
   if (!record) return null;
   await record.host.statePut(String(key), String(value));
   return null;
+}
+
+// ---- inbound WebSockets: the guest's `socket` handle (§E.6) --------------
+
+/// The URL a guest socket op addresses: the invocation's own mount's
+/// reserved subtree, with the socket id **only ever** URL-encoded into the
+/// `$id` query value. The mount base comes from host-side invocation state
+/// and nothing the guest passes can reach the path, so these `system`
+/// messages cannot be steered onto another mount or path.
+function socketControlUrl(base: string, socketId: string, extra: string): string {
+  const mount = base === "/" ? "" : base.replace(/\/+$/, "");
+  return `${mount}/${SOCKETS_SEGMENT}/?$id=${encodeURIComponent(socketId)}${extra}`;
+}
+
+/// A `/.sockets/` failure response back as a structured error, so a denial
+/// or a limit keeps its identity when the shim rethrows it.
+function errorFromProblem(status: number, payload: Json): RsError {
+  const p = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+  const code = typeof p.code === "string" ? p.code : codes.CONTRACT_VIOLATION;
+  const title = typeof p.title === "string" ? p.title : "Error";
+  const detail = typeof p.detail === "string" ? p.detail : `socket request failed with status ${status}`;
+  return new RsError(status, code, title, detail);
+}
+
+/// One guest socket op: an internal request to the mount's `/.sockets/`
+/// subtree. `system`-sourced — the guest is answering on its own mount, so
+/// the connected user need not hold that mount's write role — which is
+/// exactly why the URL above is built entirely from host-side state. It is
+/// an ordinary host call otherwise: counted against the outbound budget,
+/// child trace, depth + 1.
+async function runSocketControl(
+  record: InvocationRecord,
+  method: string,
+  socketId: string,
+  extra: string,
+  body: Body | undefined,
+): Promise<JsonObject> {
+  const mount = record.socketMount;
+  if (!mount) throw RsError.capabilityDenied("socket");
+  const call = Message.request(method, socketControlUrl(mount.base, socketId, extra), record.tenant);
+  call.source = "system";
+  call.principal = record.principal ? { ...record.principal } : undefined;
+  call.depth = record.depth; // advanced once, in `GrantedHost.requestUnnamed`
+  if (body) call.body = body;
+  const resp = await record.host.requestUnnamed((m) => mount.requester.request(m), call);
+  const status = resp.status ?? 200;
+  const payload = resp.body ? await resp.body.asAny(record.materializeCap) : null;
+  if (status < 200 || status >= 300) throw errorFromProblem(status, payload);
+  return payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+}
+
+/// `socket.send`: a string is a text frame, bytes are a binary one
+/// (the shim has already JSON-stringified anything else). → `{sent: n}`.
+export async function guestSocketSendOp(
+  invocations: Invocations,
+  id: string,
+  socketId: string,
+  data: string | Uint8Array,
+): Promise<Json> {
+  const record = invocations.get(id);
+  if (!record) return errorMarker(RsError.internal(`unknown invocation '${id}'`));
+  try {
+    const body =
+      typeof data === "string"
+        ? Body.fromString(data, new MediaType("text/plain"))
+        : Body.fromBytes(data instanceof Uint8Array ? data : new Uint8Array(data), MediaType.octetStream());
+    return await runSocketControl(record, "POST", String(socketId), "", body);
+  } catch (e) {
+    return failGuest(record, toRsError(e));
+  }
+}
+
+/// `socket.close`: the selection's close, default code 1000 host-side.
+/// → `{closed: n}`.
+export async function guestSocketCloseOp(
+  invocations: Invocations,
+  id: string,
+  socketId: string,
+  code: number | undefined,
+  reason: string | undefined,
+): Promise<Json> {
+  const record = invocations.get(id);
+  if (!record) return errorMarker(RsError.internal(`unknown invocation '${id}'`));
+  let extra = "";
+  if (typeof code === "number" && Number.isFinite(code)) extra += `&code=${Math.floor(code)}`;
+  if (typeof reason === "string") extra += `&reason=${encodeURIComponent(reason)}`;
+  try {
+    return await runSocketControl(record, "DELETE", String(socketId), extra, undefined);
+  } catch (e) {
+    return failGuest(record, toRsError(e));
+  }
 }
 
 /// `op_rs2_body_read`: next chunk of the streamed request body (or null at
@@ -516,6 +624,9 @@ export interface InvokeArgs {
   /// The engine wall-clock backstop (ms) and the loader CPU budget.
   wallClockMs: number;
   cpuMs: number;
+  /// Granted on a mount that can dispatch socket events: what
+  /// `socket.send`/`socket.close` are allowed to address (§E.6).
+  socketMount?: SocketMount;
 }
 
 interface RaceOutcome {
@@ -625,7 +736,14 @@ export class DynamicWorkerEngine {
       bodyReader,
       streamedIn: 0,
       sink: undefined,
+      socketMount: args.socketMount,
     };
+
+    // A socket event (`system`-sourced, so a client forging the trigger
+    // header still reaches `default`) routes to the matching export with a
+    // `{id, send, close}` handle on the socket it came from.
+    const socketEvent = socketEventOf(msg);
+    const socketArg = socketEvent ? { event: socketEvent, id: msg.header(SOCKET_ID_HEADER) ?? "" } : undefined;
 
     let streamedReadable: ReadableStream<Uint8Array> | undefined;
     let beganResolve: ((envelope: Json) => void) | undefined;
@@ -664,10 +782,10 @@ export class DynamicWorkerEngine {
       limits: { cpuMs: args.cpuMs },
     }));
     const ep = worker.getEntrypoint("Rs2Guest") as unknown as {
-      invoke(msg: Json, config: Json, invocationId: string): Promise<Json>;
+      invoke(msg: Json, config: Json, invocationId: string, socket?: Json): Promise<Json>;
     };
 
-    const invokePromise = ep.invoke(input, config, invocationId);
+    const invokePromise = ep.invoke(input, config, invocationId, socketArg ?? null);
     const settled: Promise<RaceOutcome> = invokePromise.then(
       (value) => ({ kind: "done", value }),
       (error) => ({ kind: "failed", error }),
@@ -698,6 +816,13 @@ export class DynamicWorkerEngine {
       const outcome = await Promise.race(races);
       if (outcome.kind === "done" && isGuestThrow(outcome.value)) {
         throw this.mapFailure(new Error(guestThrowMessage(outcome.value)), record, args);
+      }
+      // A `webSocket` mount whose bundle cannot answer a frame at all is a
+      // broken contract, not a 204 (§E.6): the shim marks it, the host
+      // names it.
+      const missing = missingHandler(outcome.value);
+      if (outcome.kind === "done" && missing !== undefined) {
+        throw RsError.contractViolation(`bundle has no ${missing} export`);
       }
       switch (outcome.kind) {
         case "began": {
@@ -922,6 +1047,14 @@ function describe(e: unknown): string {
 /// A handler throw crossing back as a value (see the shim's `invoke`).
 function isGuestThrow(value: Json | undefined): boolean {
   return !!value && typeof value === "object" && !Array.isArray(value) && value.__rs2_guest_throw === true;
+}
+
+/// The shim's marker for a socket event whose export the bundle does not
+/// have and which cannot be a no-op (`onMessage`); returns its name.
+function missingHandler(value: Json | undefined): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (value.__rs2_no_handler !== true) return undefined;
+  return typeof value.handler === "string" ? value.handler : "onMessage";
 }
 
 function guestThrowMessage(value: Json | undefined): string {

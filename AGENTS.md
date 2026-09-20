@@ -25,6 +25,9 @@ it first.** This file is the agent working guide.
   second host (`rs2-worker/`, TypeScript on Cloudflare Workers) and the HTTP
   conformance runner (`conformance/http/`) both hosts must pass. Read before
   touching either, or before changing anything a client can observe.
+- **[docs/agents/websocket.md](docs/agents/websocket.md)** — inbound WebSocket
+  design (Worker host first; the Rust host is a follow-up). Read before
+  touching sockets, the guest `on{Open,Message,Close}` contract, or `.sockets/`.
 
 ## Five-second version
 

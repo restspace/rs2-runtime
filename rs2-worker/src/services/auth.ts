@@ -10,6 +10,7 @@ import { base64UrlDecode, base64UrlEncode, constantTimeEqual, hmacBytes } from "
 import { RsError } from "../runtime/error";
 import type { Json, JsonObject } from "../runtime/error";
 import type { Message, Principal } from "../runtime/message";
+import { BEARER_SUBPROTOCOL_PREFIX, isWebSocketUpgrade } from "../runtime/sockets";
 import { isSameOrigin, originMatches } from "../runtime/wrapper";
 import type { Service, ServiceContext } from "./context";
 
@@ -143,33 +144,72 @@ export async function verify(token: string, secret: string): Promise<Claims> {
   return { sub: c.sub, roles: c.roles, kind: c.kind, iat: c.iat, exp: c.exp, extra };
 }
 
-/// Extract the token from `Authorization: Bearer ` (case-sensitive prefix)
-/// or the `rs-auth` cookie.
+/// The offered `Sec-WebSocket-Protocol` entries, trimmed, in order.
+function offeredSubprotocols(msg: Message): string[] {
+  const offered = msg.header("sec-websocket-protocol");
+  if (offered === undefined) return [];
+  return offered.split(",").map((p) => p.trim()).filter((p) => p !== "");
+}
+
+/// The subprotocol a handshake selects: the first offered entry that is not
+/// a bearer smuggle, else the bearer entry itself (a 101 may only select a
+/// value the client offered), else nothing.
+export function selectSubprotocol(msg: Message): string | undefined {
+  const offered = offeredSubprotocols(msg);
+  const plain = offered.find((p) => !p.startsWith(BEARER_SUBPROTOCOL_PREFIX));
+  return plain ?? offered[0];
+}
+
+/// Extract the token from `Authorization: Bearer ` (case-sensitive prefix),
+/// the `rs-auth` cookie, or — on an upgrade request only, where a browser
+/// cannot set `Authorization` — a `Sec-WebSocket-Protocol` entry
+/// `rs2.bearer.<jwt>`.
 export function extractToken(msg: Message): string | undefined {
   const auth = msg.header("authorization");
   if (auth !== undefined && auth.startsWith("Bearer ")) return auth.slice("Bearer ".length).trim();
   const cookies = msg.header("cookie");
-  if (cookies === undefined) return undefined;
-  for (const c of cookies.split(";")) {
-    const t = c.trim();
-    const eq = t.indexOf("=");
-    if (eq < 0) continue;
-    if (t.slice(0, eq) === "rs-auth") return t.slice(eq + 1);
+  if (cookies !== undefined) {
+    for (const c of cookies.split(";")) {
+      const t = c.trim();
+      const eq = t.indexOf("=");
+      if (eq < 0) continue;
+      if (t.slice(0, eq) === "rs-auth") return t.slice(eq + 1);
+    }
+  }
+  if (isWebSocketUpgrade(msg)) {
+    const bearer = offeredSubprotocols(msg).find((p) => p.startsWith(BEARER_SUBPROTOCOL_PREFIX));
+    if (bearer !== undefined) {
+      const token = bearer.slice(BEARER_SUBPROTOCOL_PREFIX.length);
+      if (token !== "") return token;
+    }
   }
   return undefined;
 }
 
-/// Verify the request's token (if any) into a `Principal`.
-export async function principalFromToken(msg: Message, secret: string): Promise<Principal | undefined> {
+/// Verify the request's token (if any) into a `Principal` **and** the token's
+/// expiry — a socket outlives the request that opened it, so the host needs
+/// `exp` to close it when the token lapses (`SocketAccept.exp`).
+export async function verifiedToken(
+  msg: Message,
+  secret: string,
+): Promise<{ principal: Principal; exp: number } | undefined> {
   const token = extractToken(msg);
   if (token === undefined) return undefined;
   const claims = await verify(token, secret);
   return {
-    id: claims.sub,
-    roles: claims.roles.split(/\s+/).filter((r) => r !== ""),
-    kind: claims.kind,
-    extra: claims.extra,
+    principal: {
+      id: claims.sub,
+      roles: claims.roles.split(/\s+/).filter((r) => r !== ""),
+      kind: claims.kind,
+      extra: claims.extra,
+    },
+    exp: claims.exp,
   };
+}
+
+/// Verify the request's token (if any) into a `Principal`.
+export async function principalFromToken(msg: Message, secret: string): Promise<Principal | undefined> {
+  return (await verifiedToken(msg, secret))?.principal;
 }
 
 /// Hash a password with argon2id (PHC output, `m=19456,t=2,p=1`).

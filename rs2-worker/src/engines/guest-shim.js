@@ -83,6 +83,55 @@ function makeCtx(rs2, config, invocationId) {
   return ctx;
 }
 
+// ---- the guest's socket handle (§E.6) -------------------------------------
+
+/// A frame as the host wants it: a string is a text frame, bytes are a
+/// binary one, and any other JSON value is stringified into a text frame.
+function frameOf(data) {
+  if (typeof data === "string") return data;
+  if (data instanceof Uint8Array) return data;
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+  }
+  return JSON.stringify(data === undefined ? null : data);
+}
+
+/// The third argument to `onOpen`/`onMessage`/`onClose`: deliberately
+/// minimal — `{id, send, close}` on the socket the event came from, never
+/// the raw socket. Reaching OTHER sockets is an ordinary `ctx.request` to a
+/// `prefix` grant over `/.sockets/`, not a wider handle here. The host
+/// resolves the id against the invocation's own mount.
+function makeSocket(rs2, invocationId, id) {
+  const denied = () => {
+    const e = new Error("socket capability is not granted to this service");
+    e.code = "capability_denied";
+    e.status = 403;
+    return e;
+  };
+  return {
+    id,
+    send: async (data) => {
+      if (!rs2) throw denied();
+      return rethrow(await rs2.socketSend(invocationId, id, frameOf(data)));
+    },
+    close: async (code, reason) => {
+      if (!rs2) throw denied();
+      return rethrow(
+        await rs2.socketClose(
+          invocationId,
+          id,
+          code === undefined || code === null ? undefined : Number(code),
+          reason === undefined || reason === null ? undefined : String(reason),
+        ),
+      );
+    },
+  };
+}
+
+/// Which export a socket event runs.
+const SOCKET_HANDLERS = { open: "onOpen", message: "onMessage", close: "onClose" };
+
 /// `engines/js.rs` `normalize_envelope`: a bare value (not a
 /// `{ status?, body? }` envelope) is the 200 JSON body; null/undefined → 204.
 function normalizeEnvelope(value) {
@@ -121,9 +170,27 @@ export class Rs2Guest extends WorkerEntrypoint {
   /// (platform kills — CPU/OOM — still reject). The handler runs inside
   /// `invocationContext` so the ambient surfaces (fetch, console, sockets)
   /// attribute to THIS invocation however many others share the isolate.
-  async invoke(msg, config, invocationId) {
+  /// `socket` (`{event, id}`, §E.6) is set only for a socket event the host
+  /// vouched for; it routes the call to `onOpen`/`onMessage`/`onClose` and
+  /// hands the handler the socket handle as its third argument.
+  async invoke(msg, config, invocationId, socket) {
     const rs2 = this.env ? this.env.RS2 : undefined;
     try {
+      const event = socket && typeof socket === "object" ? SOCKET_HANDLERS[socket.event] : undefined;
+      if (event !== undefined) {
+        const sh = user[event];
+        if (typeof sh !== "function") {
+          // Nothing to run on connect/disconnect is a no-op; nothing to run
+          // on a frame is a broken contract the host reports as 502.
+          if (event !== "onMessage") return { status: 204 };
+          return { __rs2_no_handler: true, handler: "onMessage" };
+        }
+        const handle = makeSocket(rs2, invocationId, String(socket.id ?? ""));
+        const sout = await invocationContext.run({ rs2, invocationId }, () =>
+          sh(msg, makeCtx(rs2, config, invocationId), handle),
+        );
+        return normalizeEnvelope(sout);
+      }
       const h = typeof user.default === "function" ? user.default : user.default && user.default.handle;
       if (typeof h !== "function") {
         throw new Error("default export must be a function or { handle }");

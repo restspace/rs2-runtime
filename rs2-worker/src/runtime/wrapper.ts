@@ -6,6 +6,7 @@ import type { Json, JsonObject } from "./error";
 import type { Message, Principal } from "./message";
 import type { Mount } from "./router";
 import { configGet } from "./router";
+import { isWebSocketUpgrade } from "./sockets";
 
 /// Limit table (PRD §9.3 defaults). Durations in milliseconds. The
 /// materialized-body cap is 32 MiB on this host (cloudflare.md §A/§I.6).
@@ -20,6 +21,11 @@ export interface LimitTable {
   breakerThreshold: number;
   breakerWindowMs: number;
   breakerCooldownMs: number;
+  /// WebSocket limits (cloudflare.md §E.6); published as `limits.webSocket`.
+  wsMessageBytes: number;
+  wsMessagesInFlight: number;
+  wsMessagesPerSecond: number;
+  wsSocketsPerTenant: number;
 }
 
 export function defaultLimits(): LimitTable {
@@ -34,6 +40,10 @@ export function defaultLimits(): LimitTable {
     breakerThreshold: 8,
     breakerWindowMs: 10_000,
     breakerCooldownMs: 5_000,
+    wsMessageBytes: 1024 * 1024,
+    wsMessagesInFlight: 8,
+    wsMessagesPerSecond: 50,
+    wsSocketsPerTenant: 1_000,
   };
 }
 
@@ -274,9 +284,15 @@ export class CorsPolicy {
 
   /// The CSRF guard: a cookie-authenticated **unsafe** request from a
   /// cross-site, untrusted origin is rejected before routing.
+  ///
+  /// A WebSocket upgrade counts as unsafe despite being a GET: sockets are
+  /// exempt from CORS, so the browser sends the cookie and reads the frames
+  /// whatever this policy says — cross-site WebSocket hijacking. The only
+  /// place to refuse it is here (cloudflare.md §E.6).
   checkCookieCsrf(msg: Message, origin: string, requestHost: string | undefined): void {
     if (isSameOrigin(origin, requestHost) || this.isTrusted(origin)) return;
-    const unsafeMethod = !(msg.method === "GET" || msg.method === "HEAD" || msg.method === "OPTIONS");
+    const upgrade = msg.method === "GET" && isWebSocketUpgrade(msg);
+    const unsafeMethod = upgrade || !(msg.method === "GET" || msg.method === "HEAD" || msg.method === "OPTIONS");
     const cookie = msg.header("cookie");
     const hasAuthCookie = cookie !== undefined && cookie.split(";").some((p) => p.trimStart().startsWith("rs-auth="));
     if (unsafeMethod && hasAuthCookie) {
@@ -407,12 +423,23 @@ export function checkAccess(msg: Message, mount: Mount): void {
   const first = msg.url.serviceSegments()[0];
   const isAuthoring = first !== undefined && first.startsWith(".");
   if (mount.service === "pipeline" && !isAuthoring) return;
+  checkMountAccess(msg, mount);
+}
+
+/// The mount's own `access`, with no pipeline deferral. A WebSocket upgrade
+/// on a pipeline mount never reaches the service (where per-spec access is
+/// normally checked), so `dispatch` holds it to the mount's floor here.
+export function checkMountAccess(
+  msg: Message,
+  mount: Mount,
+  action: "read" | "write" | "delete" | "invoke" = actionFor(msg.method),
+): void {
   const access = configGet(mount.config, "access");
   if (access === undefined) {
     if (msg.principal) throw RsError.forbidden("this mount has no access policy configured");
     throw RsError.unauthorized("this mount has no access policy configured");
   }
-  checkRoleSpec(access, actionFor(msg.method), msg);
+  checkRoleSpec(access, action, msg);
 }
 
 /// Whether a principal holds any tenant **operator** role (`operatorRoles`).

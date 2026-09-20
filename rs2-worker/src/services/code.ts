@@ -218,6 +218,10 @@ export class CodeService implements Service {
       materializeCap: ctx.limits.materializedBodyBytes,
       wallClockMs: ctx.limits.wallClockMs,
       cpuMs: cpuMsFromConfig(ctx.config),
+      // The guest's `socket.send`/`socket.close` reach exactly this mount's
+      // `/.sockets/` subtree (§E.6) — the base is the host's, never the
+      // guest's, so a socket id cannot be steered off the mount.
+      socketMount: ctx.requester ? { base, requester: ctx.requester } : undefined,
     });
     return resolveBodyRef(resp, grants, tenant, principal, trace, depth, BODY_REF_HEADER);
   }

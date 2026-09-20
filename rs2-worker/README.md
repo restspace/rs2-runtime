@@ -10,8 +10,10 @@ stores, `pipeline`, `wrapper`, `query`, `query-template`, `template`, `auth`,
 Dynamic Workers with `prefix`/`httpOut`/`store` grants, streaming, and
 `compile_check` at deploy, and guest (`code:`) **store adapters** back
 data/file/query/sms mounts (`store.adapter: "code:<name>@<version>"` with
-socket grants — the `guest-adapters/` Redis/Mongo bundles run here).
-Remaining: the `transfer` API (P5).
+socket grants — the `guest-adapters/` Redis/Mongo bundles run here). A
+`webSocket`-flagged mount also accepts inbound WebSocket upgrades, dispatching
+`open`/`message`/`close` as synthetic messages (`docs/agents/websocket.md`) —
+Worker-host only for now. Remaining: the `transfer` API (P5).
 
 ```sh
 npm ci
@@ -261,6 +263,10 @@ All declared in the spec (`docs/agents/cloudflare.md` §A) and observable in
   do. The 501 `engine_unavailable` remains only when the deployment has no
   `worker_loaders` binding. `builtin:mem` is durable (DO SQLite), not
   ephemeral.
+- Inbound WebSocket upgrade is served **only here** — a `webSocket`-flagged
+  mount gains the `websocket` facet and a `limits.webSocket` discovery
+  object; the Rust host serves such a mount's plain GET unchanged (bringing
+  it to parity is a follow-up). Full contract: `docs/agents/websocket.md`.
 
 ## Conformance
 

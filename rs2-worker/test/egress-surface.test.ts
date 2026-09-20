@@ -14,6 +14,8 @@ const HOST_API_OPS = [
   "streamBegin",
   "bodyWrite",
   "socketCheck",
+  "socketSend",
+  "socketClose",
   "fetchOut",
 ].sort();
 

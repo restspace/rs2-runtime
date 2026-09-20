@@ -39,6 +39,13 @@ interface TenantGuestRpc {
   guestBodyWrite(invocationId: string, data: Uint8Array): Promise<Json>;
   guestSocketCheck(invocationId: string, host: string, port: number, tls: boolean): Promise<Json>;
   guestSocketConsume(nonce: string): Promise<{ host: string; port: number; tls: boolean } | null>;
+  guestSocketSend(invocationId: string, socketId: string, data: string | Uint8Array): Promise<Json>;
+  guestSocketClose(
+    invocationId: string,
+    socketId: string,
+    code: number | undefined,
+    reason: string | undefined,
+  ): Promise<Json>;
   guestFetch(invocationId: string | null, req: SerializedRequest): Promise<SerializedResponse>;
 }
 
@@ -91,6 +98,26 @@ export class HostApi extends WorkerEntrypoint<Env> {
 
   socketCheck(invocationId: string, host: string, port: number, tls: boolean): Promise<Json> {
     return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketCheck(invocationId, host, port, !!tls);
+  }
+
+  /// The guest `socket` handle (§E.6). The socket id is the only thing the
+  /// guest supplies; the mount it resolves against is invocation state held
+  /// by the DO, so these cannot address another mount.
+  socketSend(invocationId: string, socketId: string, data: string | Uint8Array): Promise<Json> {
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketSend(
+      invocationId,
+      String(socketId),
+      data,
+    );
+  }
+
+  socketClose(invocationId: string, socketId: string, code?: number, reason?: string): Promise<Json> {
+    return stub(this.env, this.ctx as unknown as { props?: unknown }).guestSocketClose(
+      invocationId,
+      String(socketId),
+      code === undefined ? undefined : Number(code),
+      reason === undefined ? undefined : String(reason),
+    );
   }
 
   /// The serialized-fetch path (spec §E.3 `fetchOut`) for callers that hold
