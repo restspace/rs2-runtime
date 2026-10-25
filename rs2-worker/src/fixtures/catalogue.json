@@ -963,6 +963,42 @@
     {
       "configSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "`mcp` service config (beyond the base envelope): the agent surface served as a Model Context Protocol endpoint. Tools are derived per caller, so the config only names which surface and how the server introduces itself.",
+        "properties": {
+          "instructions": {
+            "default": null,
+            "description": "Free-text `instructions` returned at `initialize`, for the model.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "default": null,
+            "description": "`serverInfo.name` reported at `initialize` (default `rs2`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "surface": {
+            "default": null,
+            "description": "The `x-expose` surface whose mounts become tools (default `mcp`; a mount without `x-expose` appears on every surface).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "McpConfig",
+        "type": "object"
+      },
+      "description": "The agent surface as a Model Context Protocol server (Streamable HTTP, JSON-RPC by POST to the mount root): tools are derived per caller from /.well-known/rs2/agent-surface, and each call runs as the caller",
+      "name": "mcp"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false,
         "description": "`services` self-config API: no fields beyond the base envelope.",
         "title": "ServicesConfig",

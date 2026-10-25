@@ -289,7 +289,7 @@ function stripBom(bytes: Uint8Array): Uint8Array {
 
 /// Standard base64, matching the Rust host's `STANDARD` engine (padded).
 /// Chunked so a large body does not blow the argument limit of `apply`.
-function base64(bytes: Uint8Array): string {
+export function base64(bytes: Uint8Array): string {
   let binary = "";
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.byteLength; i += CHUNK) {

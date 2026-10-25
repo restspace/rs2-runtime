@@ -44,6 +44,7 @@ import type { SpecValidator } from "../services/spec-store";
 import { PipelineService } from "../services/pipeline-service";
 import { QueryService } from "../services/query";
 import { ProxyService } from "../services/proxy";
+import { McpService } from "../services/mcp";
 import { MessageService } from "../services/message";
 import { TemplateService } from "../services/template";
 import { WrapperService } from "../services/wrapper-service";
@@ -599,6 +600,9 @@ export function buildTenant(
         break;
       case "proxy":
         service = new ProxyService();
+        break;
+      case "mcp":
+        service = new McpService();
         break;
       default:
         if (mount.service.startsWith("code:")) {

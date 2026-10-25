@@ -321,6 +321,9 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
         // for. That set comes from the built adapters, not from config, so it
         // is published there rather than guessed here.
         "message" => ("api", vec!["channels"]),
+        // `mcp`: the mount root speaks the Model Context Protocol (JSON-RPC
+        // by POST); its tools are this agent surface, as the caller sees it.
+        "mcp" => ("api", vec!["mcp"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),

@@ -444,6 +444,7 @@ impl Tenant {
                 "log" => Arc::new(crate::services::LogReaderService::new()),
                 "message" => Arc::new(crate::services::MessageService::new()),
                 "proxy" => Arc::new(crate::services::ProxyService::new()),
+                "mcp" => Arc::new(crate::services::McpService::new()),
                 code_ref if code_ref.starts_with("code:") => {
                     Arc::new(crate::services::CodeService::from_ref(code_ref)?)
                 }

@@ -365,6 +365,21 @@ pub struct TemplateConfig {
     pub spec_store: Option<StoreConfig>,
 }
 
+/// `mcp` service config (beyond the base envelope): the agent surface served
+/// as a Model Context Protocol endpoint. Tools are derived per caller, so the
+/// config only names which surface and how the server introduces itself.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct McpConfig {
+    /// The `x-expose` surface whose mounts become tools (default `mcp`; a
+    /// mount without `x-expose` appears on every surface).
+    pub surface: Option<String>,
+    /// `serverInfo.name` reported at `initialize` (default `rs2`).
+    pub name: Option<String>,
+    /// Free-text `instructions` returned at `initialize`, for the model.
+    pub instructions: Option<String>,
+}
+
 /// `services` self-config API: no fields beyond the base envelope.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -405,6 +420,9 @@ pub fn catalogue() -> Value {
             { "name": "proxy",
               "description": "Forward to a fixed external target, attaching operator-supplied auth host-side via `inject` (the credential never appears in config)",
               "configSchema": schema_of::<ProxyConfig>() },
+            { "name": "mcp",
+              "description": "The agent surface as a Model Context Protocol server (Streamable HTTP, JSON-RPC by POST to the mount root): tools are derived per caller from /.well-known/rs2/agent-surface, and each call runs as the caller",
+              "configSchema": schema_of::<McpConfig>() },
             { "name": "services",
               "description": "Self-configuration API (PRD §10.6)",
               "configSchema": schema_of::<ServicesConfig>() }

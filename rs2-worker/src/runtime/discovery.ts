@@ -240,6 +240,12 @@ export function patternOf(mount: Mount): [string, string[]] {
       pattern = "api";
       facets = ["channels"];
       break;
+    // `mcp`: the mount root speaks the Model Context Protocol (JSON-RPC by
+    // POST); its tools are this agent surface, as the caller sees it.
+    case "mcp":
+      pattern = "api";
+      facets = ["mcp"];
+      break;
     default:
       pattern = "api";
       // Every `code:` mount declares the Worker-only guest contract
