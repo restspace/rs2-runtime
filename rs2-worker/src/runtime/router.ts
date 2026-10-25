@@ -90,16 +90,20 @@ export function configGet(config: JsonObject, key: string): Json | undefined {
   return Object.prototype.hasOwnProperty.call(config, key) ? config[key] : undefined;
 }
 
+/// A mount path as the table keys it: one leading `/`, no trailing `/`, and
+/// the root mount as `""`.
+export function normalizeBasePath(path: string): string {
+  const n = `/${path.replace(/^\/+|\/+$/g, "")}`;
+  return n === "/" ? "" : n;
+}
+
 /// Mount table with longest-prefix matching on segment boundaries.
 export class MountTable {
   /// Sorted by descending prefix length so the first match wins.
   private readonly _mounts: Mount[];
 
   constructor(mounts: Mount[]) {
-    const normalized = mounts.map((m) => {
-      const n = `/${m.basePath.replace(/^\/+|\/+$/g, "")}`;
-      return { ...m, basePath: n === "/" ? "" : n };
-    });
+    const normalized = mounts.map((m) => ({ ...m, basePath: normalizeBasePath(m.basePath) }));
     const seen = new Set<string>();
     for (const m of normalized) {
       if (seen.has(m.basePath)) {

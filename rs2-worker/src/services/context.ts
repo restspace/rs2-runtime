@@ -61,8 +61,13 @@ export interface ServiceContext {
 }
 
 /// A unit of behavior handling messages at a mount: Message → Message.
+import type { Authenticator } from "../runtime/authn";
+
 export interface Service {
   handle(msg: Message, ctx: ServiceContext): Promise<Message>;
+  /// A service that authenticates requests returns itself here; the host
+  /// then offers every request to it (`runtime/authn.ts`).
+  authenticator?(): Authenticator | undefined;
 }
 
 /// Whether an `If-None-Match` header value matches the resource's ETag.

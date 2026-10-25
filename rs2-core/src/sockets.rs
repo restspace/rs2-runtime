@@ -165,6 +165,30 @@ pub fn is_websocket_upgrade(msg: &Message) -> bool {
         .is_some_and(|u| u.trim().eq_ignore_ascii_case("websocket"))
 }
 
+/// The `Sec-WebSocket-Protocol` entries a client offered, in order.
+pub fn offered_subprotocols(msg: &Message) -> Vec<&str> {
+    msg.headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The subprotocol a WebSocket handshake selects: the first offered entry
+/// that is not a bearer carrier, else the bearer entry itself (a handshake
+/// may only select a value the client offered). `None` when none was offered.
+pub fn select_subprotocol(msg: &Message) -> Option<String> {
+    let offered = offered_subprotocols(msg);
+    offered
+        .iter()
+        .find(|p| !p.starts_with(BEARER_SUBPROTOCOL_PREFIX))
+        .or(offered.first())
+        .map(|p| p.to_string())
+}
+
 /// The identity of one accepted socket — everything an event needs.
 #[derive(Debug, Clone)]
 pub struct SocketAccept {

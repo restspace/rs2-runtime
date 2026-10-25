@@ -8,7 +8,7 @@ explanation.
 
 ```json
 {
-  "auth":   { … },         // optional — enables token verification + the auth service
+  "auth":   { … },         // optional — settings for the auth service (and apikeys)
   "cors":   { … },         // optional — browser clients
   "retry":  { … },         // optional — tenant-default retry policy
   "catalogues": [ … ],     // optional — external service/adapter catalogues
@@ -21,7 +21,7 @@ explanation.
 | Key | Required | Notes |
 | --- | --- | --- |
 | `mounts` | yes | Array of mount objects (below) |
-| `auth` | no | Presence + `jwtSecret` turns on auth (5.1) |
+| `auth` | no | Settings (`jwtSecret`, …) for the `auth` mount, which turns on auth (5.1) |
 | `cors` | no | `trustedOrigins` / `allowedOrigins` (5.5) |
 | `retry` | no | Default policy; overridden per mount/call (7.7) |
 | `catalogues` | no | Named external catalogue URLs; usable only when the operator allowlists their hosts (8.11, 10.7) |

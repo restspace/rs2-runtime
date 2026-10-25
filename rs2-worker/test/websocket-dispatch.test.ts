@@ -234,6 +234,7 @@ function chatConfig(access: Json = { read: "all", write: "all" }): JsonObject {
   return {
     auth: { jwtSecret: JWT_SECRET },
     mounts: [
+      { path: "/auth", service: "auth" },
       { path: "/chat", service: "data", config: { webSocket: { text: "text" }, access } },
       { path: "/plain", service: "data", config: { access: "open" } },
       { path: "/hooks", service: "pipeline", config: { webSocket: { text: "text" }, access } },
@@ -602,7 +603,10 @@ describe("webSocket config", () => {
     // Observed through the accept, which is where the normalized config lands.
     const h = makeRuntime({
       auth: { jwtSecret: JWT_SECRET },
-      mounts: [{ path: "/chat", service: "data", config: { webSocket: true, access: "open" } }],
+      mounts: [
+        { path: "/auth", service: "auth" },
+        { path: "/chat", service: "data", config: { webSocket: true, access: "open" } },
+      ],
     });
     const resp = await h.runtime.handle(upgrade("/chat/room"));
     expect(resp.socketAccept!.events).toEqual(["message"]);

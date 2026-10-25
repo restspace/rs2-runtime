@@ -287,14 +287,17 @@ impl CorsPolicy {
         Some(resp)
     }
 
-    /// The CSRF guard (v1 rule, host-enforced): a cookie-authenticated
-    /// **unsafe** request from a cross-site, untrusted origin is rejected
+    /// The CSRF guard (v1 rule, host-enforced): an **unsafe** request from a
+    /// cross-site, untrusted origin that carries an ambient credential (one
+    /// the browser attaches by itself, such as the `auth` service's cookie;
+    /// see [`crate::authn::Authenticator::ambient_credential`]) is rejected
     /// before routing. Bearer-token and non-browser requests are unaffected.
-    pub fn check_cookie_csrf(
+    pub fn check_ambient_csrf(
         &self,
         msg: &Message,
         origin: &str,
         request_host: Option<&str>,
+        ambient_credential: bool,
     ) -> Result<(), RsError> {
         if is_same_origin(origin, request_host) || self.is_trusted(origin) {
             return Ok(());
@@ -305,11 +308,7 @@ impl CorsPolicy {
             msg.method,
             http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
         ) || crate::sockets::is_websocket_upgrade(msg);
-        let has_auth_cookie = msg
-            .header("cookie")
-            .map(|c| c.split(';').any(|p| p.trim_start().starts_with("rs-auth=")))
-            .unwrap_or(false);
-        if unsafe_method && has_auth_cookie {
+        if unsafe_method && ambient_credential {
             return Err(RsError::forbidden(format!(
                 "cookie-authenticated cross-origin request from untrusted origin '{origin}' \
                  (add it to cors.trustedOrigins, or use a bearer token)"
@@ -695,7 +694,7 @@ mod tests {
             } else {
                 "https://evil.com"
             };
-            policy.check_cookie_csrf(&msg, origin, Some("api.acme.com"))
+            policy.check_ambient_csrf(&msg, origin, Some("api.acme.com"), true)
         };
         assert!(
             cookie_post(true).is_ok(),
@@ -710,17 +709,17 @@ mod tests {
         let mut read = Message::request(Method::GET, "/data/x", "t");
         read.set_header("cookie", "rs-auth=tok");
         assert!(policy
-            .check_cookie_csrf(&read, "https://evil.com", Some("api.acme.com"))
+            .check_ambient_csrf(&read, "https://evil.com", Some("api.acme.com"), true)
             .is_ok());
         let mut bearer = Message::request(Method::POST, "/data/x", "t");
         bearer.set_header("authorization", "Bearer tok");
         assert!(policy
-            .check_cookie_csrf(&bearer, "https://evil.com", Some("api.acme.com"))
+            .check_ambient_csrf(&bearer, "https://evil.com", Some("api.acme.com"), false)
             .is_ok());
         let mut same = Message::request(Method::POST, "/data/x", "t");
         same.set_header("cookie", "rs-auth=tok");
         assert!(policy
-            .check_cookie_csrf(&same, "https://api.acme.com", Some("api.acme.com"))
+            .check_ambient_csrf(&same, "https://api.acme.com", Some("api.acme.com"), true)
             .is_ok());
     }
 

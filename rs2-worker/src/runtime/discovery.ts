@@ -240,6 +240,12 @@ export function patternOf(mount: Mount): [string, string[]] {
       pattern = "api";
       facets = ["channels"];
       break;
+    // `apikeys`: POST mints, GET lists, DELETE /<id> revokes; the mount is
+    // also an authenticator for `Bearer rs2k_…`.
+    case "apikeys":
+      pattern = "api";
+      facets = ["apikeys"];
+      break;
     // `mcp`: the mount root speaks the Model Context Protocol (JSON-RPC by
     // POST); its tools are this agent surface, as the caller sees it.
     case "mcp":

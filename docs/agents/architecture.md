@@ -35,6 +35,17 @@ breaker, concurrency admission, and boundary logging all live here — **not** i
 services. To add behavior that should apply to every response (a header, a log,
 a policy), decorate at the choke point, not in each service.
 
+**Authentication is the exception that proves the rule:** the host runs it
+for every request but knows no credential format. A service that
+authenticates returns itself from `Service::authenticator()`
+(`src/authn.rs`); `Tenant::build` records those mounts in config order, and
+dispatch offers each request without a principal to them in turn (`Pass` →
+next, `Authenticated` → stop, `Err` → 401, `Unrecognised` → 401 unless a later
+one accepts). Each authenticator claims only its own format, so order never
+changes an outcome. The CSRF guard asks the same chain whether a credential is
+ambient (a cookie). JWTs (`auth`) and API keys (`apikeys`) are both just
+authenticators; a new scheme is a new service, not a host change.
+
 Pitfall: anything you compute here runs on the hot path. Gate optional work
 behind a cheap check (e.g. `LogStore::enabled()` skips building a record when
 no sink is configured) so the G1 budget holds. See `testing.md`.

@@ -77,6 +77,7 @@ fn chat_config(access: Value, web_socket: Value) -> Value {
     json!({
         "auth": { "jwtSecret": SECRET },
         "mounts": [
+            { "path": "/auth", "service": "auth" },
             { "path": "/chat", "service": "pipeline",
               "config": { "access": access, "webSocket": web_socket } }
         ]

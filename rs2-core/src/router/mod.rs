@@ -95,15 +95,21 @@ pub struct MountTable {
     mounts: Vec<Mount>,
 }
 
+/// A mount path as the table keys it: one leading `/`, no trailing `/`, and
+/// the root mount as `""`.
+pub fn normalize_base_path(path: &str) -> String {
+    let normalized = format!("/{}", path.trim_matches('/'));
+    if normalized == "/" {
+        String::new()
+    } else {
+        normalized
+    }
+}
+
 impl MountTable {
     pub fn new(mut mounts: Vec<Mount>) -> Result<Self, RsError> {
         for m in &mut mounts {
-            let normalized = format!("/{}", m.base_path.trim_matches('/'));
-            m.base_path = if normalized == "/" {
-                String::new()
-            } else {
-                normalized
-            };
+            m.base_path = normalize_base_path(&m.base_path);
         }
         let mut seen = std::collections::HashSet::new();
         for m in &mounts {

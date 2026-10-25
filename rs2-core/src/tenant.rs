@@ -285,12 +285,13 @@ impl Adapters {
 pub struct Tenant {
     pub name: String,
     pub mounts: MountTable,
-    /// Tenant auth settings (signing key etc.) for the RBAC wrapper.
-    pub auth: Option<serde_json::Value>,
     /// Host-enforced CORS policy.
     pub cors: Arc<crate::wrapper::CorsPolicy>,
     /// Service instance + granted context per mount base path.
     instances: HashMap<String, (Arc<dyn Service>, Arc<ServiceContext>)>,
+    /// Base paths of the mounts whose service is an authenticator, in config
+    /// order: the chain [`crate::authn::authenticate`] runs.
+    authenticators: Vec<String>,
 }
 
 impl Tenant {
@@ -440,6 +441,10 @@ impl Tenant {
                     &mount.config,
                     config.auth.as_ref(),
                 )?),
+                "apikeys" => Arc::new(crate::services::ApiKeysService::from_config(
+                    &mount.config,
+                    config.auth.as_ref(),
+                )?),
                 "services" => Arc::new(crate::services::ServicesService::new()),
                 "log" => Arc::new(crate::services::LogReaderService::new()),
                 "message" => Arc::new(crate::services::MessageService::new()),
@@ -537,11 +542,31 @@ impl Tenant {
             };
             instances.insert(mount.base_path.clone(), (service, Arc::new(ctx)));
         }
+        let authenticators: Vec<String> = config
+            .mounts
+            .iter()
+            .map(|m| crate::router::normalize_base_path(&m.path))
+            .filter(|base| {
+                instances
+                    .get(base)
+                    .is_some_and(|(service, _)| service.authenticator().is_some())
+            })
+            .collect();
+        // Only an `auth` mount verifies tokens: tenant `auth` settings with
+        // no authenticator mounted mean every token is ignored. Said once, on
+        // the live build (a dry build at config PUT has no requester).
+        if authenticators.is_empty() && config.auth.is_some() && requester.is_some() {
+            crate::logging::ServiceLogger::new(adapters.log.clone(), name, "", "tenant").warn(
+                &crate::message::TraceContext::new(),
+                "tenant has auth settings but no authenticating mount (such as `auth`): \
+                 tokens will not be accepted",
+            );
+        }
         Ok(Tenant {
             name: name.to_string(),
             mounts,
             instances,
-            auth: config.auth.clone(),
+            authenticators,
             cors: Arc::new(crate::wrapper::CorsPolicy::from_config(
                 config.cors.as_ref(),
             )),
@@ -550,6 +575,17 @@ impl Tenant {
 
     pub fn instance(&self, base_path: &str) -> Option<&(Arc<dyn Service>, Arc<ServiceContext>)> {
         self.instances.get(base_path)
+    }
+
+    /// The tenant's authenticators with their mounts' granted contexts, in
+    /// config order.
+    pub fn authenticators(
+        &self,
+    ) -> impl Iterator<Item = (&dyn crate::authn::Authenticator, &ServiceContext)> + '_ {
+        self.authenticators.iter().filter_map(|base| {
+            let (service, ctx) = self.instances.get(base)?;
+            Some((service.authenticator()?, ctx.as_ref()))
+        })
     }
 }
 

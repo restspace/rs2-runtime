@@ -190,6 +190,7 @@ fn ws_config(access: serde_json::Value, web_socket: serde_json::Value) -> serde_
     json!({
         "auth": { "jwtSecret": SECRET },
         "mounts": [
+            { "path": "/auth", "service": "auth" },
             { "path": "/chat", "service": "pipeline",
               "config": { "access": access, "webSocket": web_socket } }
         ]
@@ -751,6 +752,7 @@ async fn bearer_subprotocol_is_ignored_on_a_non_upgrade_request() {
     let config = json!({
         "auth": { "jwtSecret": SECRET },
         "mounts": [
+            { "path": "/auth", "service": "auth" },
             { "path": "/chat", "service": "data",
               "config": { "access": { "read": "U", "write": "A" }, "webSocket": true } }
         ]
@@ -779,6 +781,7 @@ fn cookie_config() -> serde_json::Value {
         "auth": { "jwtSecret": SECRET },
         "cors": { "trustedOrigins": ["https://trusted.example"] },
         "mounts": [
+            { "path": "/auth", "service": "auth" },
             { "path": "/chat", "service": "pipeline",
               "config": { "access": { "read": "U", "write": "A" }, "webSocket": true } }
         ]
@@ -1160,6 +1163,7 @@ async fn sockets_post_and_delete_require_write_role_even_with_invoke_all() {
     let config = json!({
         "auth": { "jwtSecret": SECRET },
         "mounts": [
+            { "path": "/auth", "service": "auth" },
             { "path": "/chat", "service": "pipeline",
               "config": { "access": { "read": "all", "invoke": "all", "write": "A" }, "webSocket": true } }
         ]
@@ -1476,6 +1480,7 @@ async fn pipeline_call_can_push_via_elevate_for_an_anonymous_socket() {
     let config = json!({
         "auth": { "jwtSecret": SECRET },
         "mounts": [
+            { "path": "/auth", "service": "auth" },
             { "path": "/chat", "service": "pipeline",
               "config": {
                   // `write` also grants "A" so the admin can author the

@@ -55,6 +55,7 @@ before, so a first read works front-to-back; later it doubles as a reference.
 - [5.3 Tokens: JWTs, cookies, and bearer headers](part-5-auth-and-access-control/5.3-tokens-cookies-bearer.md)
 - [5.4 Role specs on mounts](part-5-auth-and-access-control/5.4-role-specs-on-mounts.md) (read/write/delete/invoke, path-scoped grants, per-spec access)
 - [5.5 CORS, trusted vs. allowed origins, and the CSRF guard](part-5-auth-and-access-control/5.5-cors-and-csrf.md)
+- [5.6 API keys](part-5-auth-and-access-control/5.6-api-keys.md) (long-lived, revocable keys for scripts and MCP clients)
 
 ### Part 6 — Querying and Rendering Data
 

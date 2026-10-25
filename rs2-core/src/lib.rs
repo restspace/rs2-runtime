@@ -21,6 +21,7 @@
 //! - [`tenant`] / [`runtime`] — tenant config, lazy loading, dispatch
 
 pub mod adapters;
+pub mod authn;
 pub mod capabilities;
 pub mod config_schema;
 pub mod contract;

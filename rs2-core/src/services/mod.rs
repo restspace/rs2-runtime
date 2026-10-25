@@ -3,6 +3,7 @@
 //! the sandbox host exposes, so swapping adapters affects prebuilt and
 //! custom services identically.
 
+pub mod apikeys;
 pub mod auth;
 pub mod catalogue;
 pub mod code;
@@ -26,6 +27,7 @@ pub use code::CodeService;
 pub use data::DataService;
 pub use file::FileService;
 pub use log_reader::LogReaderService;
+pub use apikeys::ApiKeysService;
 pub use mcp::{McpService, IDEMPOTENCY_META_KEY as MCP_IDEMPOTENCY_META_KEY, MCP_PROTOCOL_VERSIONS};
 pub use message::MessageService;
 pub use pipeline_service::{PipelineService, PIPELINE_PREFIX, PIPELINE_SUBTREE};
@@ -119,6 +121,12 @@ pub struct ServiceContext {
 #[async_trait]
 pub trait Service: Send + Sync {
     async fn handle(&self, msg: Message, ctx: &ServiceContext) -> Result<Message, RsError>;
+
+    /// A service that authenticates requests returns itself here; the host
+    /// then offers every external request to it ([`crate::authn`]).
+    fn authenticator(&self) -> Option<&dyn crate::authn::Authenticator> {
+        None
+    }
 }
 
 /// Whether an `If-None-Match` header value matches the resource's ETag

@@ -10,7 +10,8 @@ import { base64UrlDecode, base64UrlEncode, constantTimeEqual, hmacBytes } from "
 import { RsError } from "../runtime/error";
 import type { Json, JsonObject } from "../runtime/error";
 import type { Message, Principal } from "../runtime/message";
-import { BEARER_SUBPROTOCOL_PREFIX, isWebSocketUpgrade } from "../runtime/sockets";
+import { BEARER_SUBPROTOCOL_PREFIX, isWebSocketUpgrade, offeredSubprotocols } from "../runtime/sockets";
+import type { AuthOutcome, Authenticator } from "../runtime/authn";
 import { isSameOrigin, originMatches } from "../runtime/wrapper";
 import type { Service, ServiceContext } from "./context";
 
@@ -144,22 +145,6 @@ export async function verify(token: string, secret: string): Promise<Claims> {
   return { sub: c.sub, roles: c.roles, kind: c.kind, iat: c.iat, exp: c.exp, extra };
 }
 
-/// The offered `Sec-WebSocket-Protocol` entries, trimmed, in order.
-function offeredSubprotocols(msg: Message): string[] {
-  const offered = msg.header("sec-websocket-protocol");
-  if (offered === undefined) return [];
-  return offered.split(",").map((p) => p.trim()).filter((p) => p !== "");
-}
-
-/// The subprotocol a handshake selects: the first offered entry that is not
-/// a bearer smuggle, else the bearer entry itself (a 101 may only select a
-/// value the client offered), else nothing.
-export function selectSubprotocol(msg: Message): string | undefined {
-  const offered = offeredSubprotocols(msg);
-  const plain = offered.find((p) => !p.startsWith(BEARER_SUBPROTOCOL_PREFIX));
-  return plain ?? offered[0];
-}
-
 /// Extract the token from `Authorization: Bearer ` (case-sensitive prefix),
 /// the `rs-auth` cookie, or — on an upgrade request only, where a browser
 /// cannot set `Authorization` — a `Sec-WebSocket-Protocol` entry
@@ -195,7 +180,11 @@ export async function verifiedToken(
 ): Promise<{ principal: Principal; exp: number } | undefined> {
   const token = extractToken(msg);
   if (token === undefined) return undefined;
-  const claims = await verify(token, secret);
+  return principalOf(await verify(token, secret));
+}
+
+/// A verified token's principal and expiry.
+function principalOf(claims: Claims): { principal: Principal; exp: number } {
   return {
     principal: {
       id: claims.sub,
@@ -205,6 +194,12 @@ export async function verifiedToken(
     },
     exp: claims.exp,
   };
+}
+
+/// Whether the request carries the `rs-auth` session cookie.
+function hasAuthCookie(msg: Message): boolean {
+  const cookie = msg.header("cookie");
+  return cookie !== undefined && cookie.split(";").some((p) => p.trimStart().startsWith("rs-auth="));
 }
 
 /// Verify the request's token (if any) into a `Principal`.
@@ -234,7 +229,7 @@ interface LockoutState {
   lockedUntil: number | undefined;
 }
 
-export class AuthService implements Service {
+export class AuthService implements Service, Authenticator {
   private readonly lockouts = new Map<string, LockoutState>();
 
   private constructor(private readonly settings: AuthSettings) {}
@@ -380,5 +375,28 @@ export class AuthService implements Service {
       return msg.okJson(body);
     }
     throw RsError.notFound(`auth endpoint '${msg.url.servicePath}' (have: POST login/refresh/logout, GET user)`);
+  }
+
+  authenticator(): Authenticator {
+    return this;
+  }
+
+  ambientCredential(msg: Message): boolean {
+    return hasAuthCookie(msg);
+  }
+
+  /// The JWT authenticator: a token from `extractToken` with a JWT's three
+  /// parts is this service's, so a bad one is refused here. Anything else
+  /// might be another authenticator's (an API key, say), so it is only
+  /// "unrecognised": still a 401 unless someone else accepts it.
+  async tryAuthenticate(msg: Message, _ctx: ServiceContext): Promise<AuthOutcome> {
+    const token = extractToken(msg);
+    if (token === undefined) return { kind: "pass" };
+    if (token.split(".").length !== 3) {
+      return { kind: "unrecognised", error: RsError.unauthorized("malformed token") };
+    }
+    const { principal, exp } = principalOf(await verify(token, this.settings.jwtSecret));
+    msg.principal = principal;
+    return { kind: "authenticated", expires: exp };
   }
 }

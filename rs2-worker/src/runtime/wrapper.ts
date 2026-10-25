@@ -282,20 +282,20 @@ export class CorsPolicy {
     return resp;
   }
 
-  /// The CSRF guard: a cookie-authenticated **unsafe** request from a
-  /// cross-site, untrusted origin is rejected before routing.
+  /// The CSRF guard: an **unsafe** request from a cross-site, untrusted
+  /// origin that carries an ambient credential (one the browser attaches by
+  /// itself, such as the `auth` service's cookie; see
+  /// `Authenticator.ambientCredential`) is rejected before routing.
   ///
   /// A WebSocket upgrade counts as unsafe despite being a GET: sockets are
   /// exempt from CORS, so the browser sends the cookie and reads the frames
   /// whatever this policy says — cross-site WebSocket hijacking. The only
   /// place to refuse it is here (cloudflare.md §E.6).
-  checkCookieCsrf(msg: Message, origin: string, requestHost: string | undefined): void {
+  checkAmbientCsrf(msg: Message, origin: string, requestHost: string | undefined, ambientCredential: boolean): void {
     if (isSameOrigin(origin, requestHost) || this.isTrusted(origin)) return;
     const upgrade = msg.method === "GET" && isWebSocketUpgrade(msg);
     const unsafeMethod = upgrade || !(msg.method === "GET" || msg.method === "HEAD" || msg.method === "OPTIONS");
-    const cookie = msg.header("cookie");
-    const hasAuthCookie = cookie !== undefined && cookie.split(";").some((p) => p.trimStart().startsWith("rs-auth="));
-    if (unsafeMethod && hasAuthCookie) {
+    if (unsafeMethod && ambientCredential) {
       throw RsError.forbidden(
         `cookie-authenticated cross-origin request from untrusted origin '${origin}' (add it to cors.trustedOrigins, or use a bearer token)`,
       );

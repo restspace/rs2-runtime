@@ -474,30 +474,20 @@ impl Runtime {
                         return Ok(preflight);
                     }
                 }
+                let ambient = crate::authn::has_ambient_credential(&tenant, &msg);
                 tenant
                     .cors
-                    .check_cookie_csrf(&msg, &origin, request_host.as_deref())?;
+                    .check_ambient_csrf(&msg, &origin, request_host.as_deref(), ambient)?;
             }
         }
 
-        // Verify any presented token into a principal (PRD §10.5); a bad
-        // token is rejected outright rather than treated as anonymous.
-        // The token's expiry is kept: an accepted WebSocket outlives this
-        // request, and the host closes it when the token would have lapsed.
+        // Authentication is the tenant's authenticator chain (`authn`); the
+        // host knows no credential format. A credential that is refused is a
+        // 401, not anonymous. Its expiry is kept: an accepted WebSocket
+        // outlives this request, and the host closes it when that lapses.
         let mut token_exp = None;
         if msg.principal.is_none() {
-            if let Some(secret) = tenant
-                .auth
-                .as_ref()
-                .and_then(|a| a.get("jwtSecret"))
-                .and_then(|v| v.as_str())
-            {
-                if let Some((principal, exp)) = crate::services::auth::verified_token(&msg, secret)?
-                {
-                    msg.principal = Some(principal);
-                    token_exp = Some(exp);
-                }
-            }
+            token_exp = crate::authn::authenticate(&tenant, &mut msg).await?;
         }
 
         // The discovery surface (PRD §12) is generated, not mounted; its
@@ -668,7 +658,7 @@ impl Runtime {
             exp,
             text: ws.text,
             events: ws.events,
-            protocol: crate::services::auth::select_subprotocol(msg),
+            protocol: crate::sockets::select_subprotocol(msg),
             connected_at,
         };
         let mut resp = msg.response(StatusCode::SWITCHING_PROTOCOLS, None);

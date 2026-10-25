@@ -4,7 +4,7 @@
 // becomes a structured problem+json response attributed to the tenant and
 // trace.
 
-import { selectSubprotocol, verifiedToken } from "../services/auth";
+import { authenticate, hasAmbientCredential } from "./authn";
 import type { Requester, Service, ServiceContext, TenantControl } from "../services/context";
 import { Body } from "./body";
 import { parseTenantConfig } from "./config-schema";
@@ -20,7 +20,7 @@ import { simpleUuid } from "./message";
 import type { Message } from "./message";
 import { validatePath } from "./router";
 import type { Mount } from "./router";
-import { SOCKETS_SEGMENT, isWebSocketUpgrade, webSocketConfigOf } from "./sockets";
+import { SOCKETS_SEGMENT, isWebSocketUpgrade, selectSubprotocol, webSocketConfigOf } from "./sockets";
 import type { SocketAccept, SocketSelector, WebSocketConfig } from "./sockets";
 import { buildTenant } from "./tenant-build";
 import type { Adapters, Tenant } from "./tenant-build";
@@ -204,25 +204,16 @@ export class Runtime {
           const preflight = tenant.cors.preflight(msg, origin, requestHost);
           if (preflight) return preflight;
         }
-        tenant.cors.checkCookieCsrf(msg, origin, requestHost);
+        tenant.cors.checkAmbientCsrf(msg, origin, requestHost, hasAmbientCredential(tenant, msg));
       }
     }
 
-    // Verify any presented token into a principal; a bad token is rejected
-    // outright rather than treated as anonymous. The expiry is kept because
-    // a socket outlives the request that opened it (`SocketAccept.exp`).
+    // Authentication is the tenant's authenticator chain (`authn.ts`); the
+    // host knows no credential format. A credential that is refused is a
+    // 401, not anonymous. Its expiry is kept because a socket outlives the
+    // request that opened it (`SocketAccept.exp`).
     let tokenExp: number | undefined;
-    if (!msg.principal) {
-      const auth = tenant.auth;
-      const secret = auth && typeof auth === "object" && !Array.isArray(auth) ? auth.jwtSecret : undefined;
-      if (typeof secret === "string") {
-        const verified = await verifiedToken(msg, secret);
-        if (verified) {
-          msg.principal = verified.principal;
-          tokenExp = verified.exp;
-        }
-      }
-    }
+    if (!msg.principal) tokenExp = await authenticate(tenant, msg);
 
     if (isDiscoveryPath(msg.url.path)) return handleDiscovery(tenant, msg, limits);
 

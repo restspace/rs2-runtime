@@ -963,6 +963,38 @@
     {
       "configSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "`apikeys` service config (beyond the base envelope).",
+        "properties": {
+          "adminRole": {
+            "default": null,
+            "description": "A role that may list and revoke every key, not just its own.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dataset": {
+            "default": "apikeys",
+            "description": "Dataset holding key records (default `apikeys`).",
+            "type": "string"
+          },
+          "maxDays": {
+            "default": 90,
+            "description": "The longest lifetime a key may have, in days (default 90). Keys never outlive it, so a key whose owner lost a role lapses within this time.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "title": "ApiKeysSettings",
+        "type": "object"
+      },
+      "description": "Long-lived, revocable API keys (`Authorization: Bearer rs2k_…`): POST mints a key with a subset of the caller's roles, GET lists, DELETE /<id> revokes. Needs the tenant auth.jwtSecret, which seals the key records",
+      "name": "apikeys"
+    },
+    {
+      "configSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "`mcp` service config (beyond the base envelope): the agent surface served as a Model Context Protocol endpoint. Tools are derived per caller, so the config only names which surface and how the server introduces itself.",
         "properties": {
           "instructions": {

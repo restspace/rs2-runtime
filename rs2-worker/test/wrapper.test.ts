@@ -56,20 +56,20 @@ describe("wrapper", () => {
     const cookiePost = (originOk: boolean) => {
       const msg = Message.request("POST", "/data/x", "t");
       msg.setHeader("cookie", "rs-auth=tok");
-      return () => policy.checkCookieCsrf(msg, originOk ? "https://app.acme.com" : "https://evil.com", "api.acme.com");
+      return () => policy.checkAmbientCsrf(msg, originOk ? "https://app.acme.com" : "https://evil.com", "api.acme.com", true);
     };
     expect(cookiePost(true)).not.toThrow();
     expect(cookiePost(false)).toThrow();
 
     const read = Message.request("GET", "/data/x", "t");
     read.setHeader("cookie", "rs-auth=tok");
-    expect(() => policy.checkCookieCsrf(read, "https://evil.com", "api.acme.com")).not.toThrow();
+    expect(() => policy.checkAmbientCsrf(read, "https://evil.com", "api.acme.com", true)).not.toThrow();
     const bearer = Message.request("POST", "/data/x", "t");
     bearer.setHeader("authorization", "Bearer tok");
-    expect(() => policy.checkCookieCsrf(bearer, "https://evil.com", "api.acme.com")).not.toThrow();
+    expect(() => policy.checkAmbientCsrf(bearer, "https://evil.com", "api.acme.com", false)).not.toThrow();
     const same = Message.request("POST", "/data/x", "t");
     same.setHeader("cookie", "rs-auth=tok");
-    expect(() => policy.checkCookieCsrf(same, "https://api.acme.com", "api.acme.com")).not.toThrow();
+    expect(() => policy.checkAmbientCsrf(same, "https://api.acme.com", "api.acme.com", true)).not.toThrow();
   });
 
   it("path scoped grants resolve extra claims", () => {

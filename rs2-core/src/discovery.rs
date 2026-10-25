@@ -324,6 +324,9 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
         // `mcp`: the mount root speaks the Model Context Protocol (JSON-RPC
         // by POST); its tools are this agent surface, as the caller sees it.
         "mcp" => ("api", vec!["mcp"]),
+        // `apikeys`: POST mints, GET lists, DELETE /<id> revokes; the mount
+        // is also an authenticator for `Bearer rs2k_…`.
+        "apikeys" => ("api", vec!["apikeys"]),
         "auth" | "services" => ("api", vec![]),
         s if s.starts_with("code:") => ("api", vec![]),
         _ => ("api", vec![]),

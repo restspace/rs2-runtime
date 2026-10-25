@@ -21,6 +21,7 @@ import { CHANNELS, RoutingGateway, parseChannel } from "../capabilities/message"
 import type { Channel, MessageGateway } from "../capabilities/message";
 import type { DataStore, FileStore, HttpOut, QueryStore } from "../capabilities/types";
 import { requireStoreRoot, sanitizedStoreRoot } from "../capabilities/types";
+import { ApiKeysService } from "../services/apikeys";
 import { AuthService } from "../services/auth";
 import type { CatalogueClient } from "../services/catalogue";
 import { CodeService } from "../services/code";
@@ -55,9 +56,11 @@ import { RsError } from "./error";
 import type { Json, JsonObject } from "./error";
 import { InfraSet, expandInfra } from "./infra";
 import { ServiceLogger } from "./logging";
+import { TraceContext } from "./message";
+import type { Authenticator } from "./authn";
 import type { LogStore, Severity } from "./logging";
 import { urlHost } from "./outbound";
-import { MountTable } from "./router";
+import { MountTable, normalizeBasePath } from "./router";
 import type { Mount } from "./router";
 import { scheduleFromConfig } from "./scheduler";
 import { parseWebSocketConfig } from "./sockets";
@@ -110,13 +113,26 @@ export class Tenant {
   constructor(
     readonly name: string,
     readonly mounts: MountTable,
-    readonly auth: Json | undefined,
     readonly cors: CorsPolicy,
     private readonly instances: Map<string, [Service, ServiceContext]>,
+    /// Base paths of the mounts whose service is an authenticator, in
+    /// config order: the chain `authenticate` runs.
+    private readonly authenticatorPaths: string[],
   ) {}
 
   instance(basePath: string): [Service, ServiceContext] | undefined {
     return this.instances.get(basePath);
+  }
+
+  /// The tenant's authenticators with their mounts' contexts, in config order.
+  authenticators(): [Authenticator, ServiceContext][] {
+    const out: [Authenticator, ServiceContext][] = [];
+    for (const base of this.authenticatorPaths) {
+      const inst = this.instances.get(base);
+      const auth = inst?.[0].authenticator?.();
+      if (inst && auth) out.push([auth, inst[1]]);
+    }
+    return out;
   }
 }
 
@@ -589,6 +605,9 @@ export function buildTenant(
       case "auth":
         service = AuthService.fromConfig(mount.config, config.auth);
         break;
+      case "apikeys":
+        service = ApiKeysService.fromConfig(mount.config, config.auth);
+        break;
       case "services":
         service = new ServicesService(adapters.engine);
         break;
@@ -649,5 +668,17 @@ export function buildTenant(
     };
     instances.set(mount.basePath, [service, ctx]);
   }
-  return new Tenant(name, mounts, config.auth, cors, instances);
+  const authenticatorPaths = config.mounts
+    .map((m) => normalizeBasePath(m.path))
+    .filter((p) => instances.get(p)?.[0].authenticator?.() !== undefined);
+  // Only an `auth` mount verifies tokens: tenant `auth` settings with no
+  // authenticator mounted mean every token is ignored. Said once, on the
+  // live build (a dry build at config PUT has no requester).
+  if (authenticatorPaths.length === 0 && config.auth !== undefined && requester !== undefined) {
+    new ServiceLogger(adapters.log, name, "", "tenant").warn(
+      new TraceContext(),
+      "tenant has auth settings but no authenticating mount (such as `auth`): tokens will not be accepted",
+    );
+  }
+  return new Tenant(name, mounts, cors, instances, authenticatorPaths);
 }

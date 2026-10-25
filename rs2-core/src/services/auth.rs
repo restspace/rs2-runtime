@@ -18,6 +18,7 @@ use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use sha2::Sha512;
 
+use crate::authn::{AuthOutcome, Authenticator};
 use crate::error::RsError;
 use crate::message::{Message, Principal};
 
@@ -134,30 +135,6 @@ pub fn verify(token: &str, secret: &str) -> Result<Claims, RsError> {
     Ok(claims)
 }
 
-/// The `Sec-WebSocket-Protocol` entries a client offered, in order.
-fn offered_subprotocols(msg: &Message) -> Vec<&str> {
-    msg.headers
-        .get_all("sec-websocket-protocol")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .collect()
-}
-
-/// The subprotocol a WebSocket handshake selects: the first offered entry
-/// that is not a bearer carrier, else the bearer entry itself (a handshake
-/// may only select a value the client offered). `None` when none was offered.
-pub fn select_subprotocol(msg: &Message) -> Option<String> {
-    let offered = offered_subprotocols(msg);
-    offered
-        .iter()
-        .find(|p| !p.starts_with(crate::sockets::BEARER_SUBPROTOCOL_PREFIX))
-        .or(offered.first())
-        .map(|p| p.to_string())
-}
-
 /// Extract the token from `Authorization: Bearer`, the `rs-auth` cookie, or —
 /// on a WebSocket upgrade only, where a browser can set neither header — a
 /// `Sec-WebSocket-Protocol` entry `rs2.bearer.<jwt>`.
@@ -176,7 +153,7 @@ pub fn extract_token(msg: &Message) -> Option<String> {
     if cookie.is_some() || !crate::sockets::is_websocket_upgrade(msg) {
         return cookie;
     }
-    offered_subprotocols(msg)
+    crate::sockets::offered_subprotocols(msg)
         .into_iter()
         .find_map(|p| p.strip_prefix(crate::sockets::BEARER_SUBPROTOCOL_PREFIX))
         .filter(|t| !t.is_empty())
@@ -194,7 +171,11 @@ pub fn verified_token(msg: &Message, secret: &str) -> Result<Option<(Principal, 
     let Some(token) = extract_token(msg) else {
         return Ok(None);
     };
-    let claims = verify(&token, secret)?;
+    Ok(Some(principal_of(verify(&token, secret)?)))
+}
+
+/// A verified token's principal and expiry.
+fn principal_of(claims: Claims) -> (Principal, u64) {
     let exp = claims.exp;
     let principal = Principal {
         id: claims.sub,
@@ -202,7 +183,7 @@ pub fn verified_token(msg: &Message, secret: &str) -> Result<Option<(Principal, 
         kind: claims.kind,
         extra: claims.extra,
     };
-    Ok(Some((principal, exp)))
+    (principal, exp)
 }
 
 /// Hash a password with argon2id (the at-rest format for new hashes).
@@ -523,6 +504,45 @@ impl Service for AuthService {
                 msg.url.service_path
             ))),
         }
+    }
+
+    fn authenticator(&self) -> Option<&dyn Authenticator> {
+        Some(self)
+    }
+}
+
+/// Whether the request carries the `rs-auth` session cookie.
+fn has_auth_cookie(msg: &Message) -> bool {
+    msg.header("cookie")
+        .is_some_and(|c| c.split(';').any(|p| p.trim_start().starts_with("rs-auth=")))
+}
+
+/// The JWT authenticator: a token from [`extract_token`] that has a JWT's
+/// three parts is this service's, so a bad one is refused here. Anything
+/// else might be another authenticator's (an API key, say), so it is only
+/// "unrecognised": still a 401 unless someone else accepts it.
+#[async_trait]
+impl Authenticator for AuthService {
+    fn ambient_credential(&self, msg: &Message) -> bool {
+        has_auth_cookie(msg)
+    }
+
+    async fn try_authenticate(
+        &self,
+        msg: &mut Message,
+        _ctx: &ServiceContext,
+    ) -> Result<AuthOutcome, RsError> {
+        let Some(token) = extract_token(msg) else {
+            return Ok(AuthOutcome::Pass);
+        };
+        if token.split('.').count() != 3 {
+            return Ok(AuthOutcome::Unrecognised(RsError::unauthorized(
+                "malformed token",
+            )));
+        }
+        let (principal, exp) = principal_of(verify(&token, &self.settings.jwt_secret)?);
+        msg.principal = Some(principal);
+        Ok(AuthOutcome::Authenticated { expires: Some(exp) })
     }
 }
 

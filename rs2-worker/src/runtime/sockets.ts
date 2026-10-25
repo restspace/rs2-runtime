@@ -100,6 +100,22 @@ export function isWebSocketUpgrade(msg: Message): boolean {
   return (msg.header("upgrade") ?? "").trim().toLowerCase() === "websocket";
 }
 
+/// The offered `Sec-WebSocket-Protocol` entries, trimmed, in order.
+export function offeredSubprotocols(msg: Message): string[] {
+  const offered = msg.header("sec-websocket-protocol");
+  if (offered === undefined) return [];
+  return offered.split(",").map((p) => p.trim()).filter((p) => p !== "");
+}
+
+/// The subprotocol a handshake selects: the first offered entry that is not
+/// a bearer smuggle, else the bearer entry itself (a 101 may only select a
+/// value the client offered), else nothing.
+export function selectSubprotocol(msg: Message): string | undefined {
+  const offered = offeredSubprotocols(msg);
+  const plain = offered.find((p) => !p.startsWith(BEARER_SUBPROTOCOL_PREFIX));
+  return plain ?? offered[0];
+}
+
 /// The serializable identity of one accepted socket — the hibernation
 /// attachment. Everything a handler needs after eviction is here.
 export interface SocketAccept {
