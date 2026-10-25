@@ -489,7 +489,8 @@ sudo tee /etc/apache2/sites-available/rs2.conf >/dev/null <<APACHE
     ProxyPreserveHost On
     RequestHeader set X-Forwarded-Proto "https"
 
-    ProxyPass        / http://127.0.0.1:3100/
+    # upgrade=websocket (Apache 2.4.47+) tunnels WebSocket handshakes.
+    ProxyPass        / http://127.0.0.1:3100/ upgrade=websocket
     ProxyPassReverse / http://127.0.0.1:3100/
 
     # RS2 streams response bodies; don't let the proxy buffer them whole.

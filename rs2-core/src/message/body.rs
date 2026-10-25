@@ -258,8 +258,10 @@ mod tests {
     /// instead of losing them to replacement characters.
     #[tokio::test]
     async fn as_any_falls_back_for_undecodable_text() {
-        let mut body =
-            Body::from_bytes(Bytes::from_static(&[0xFF, 0xFE]), MediaType::new("text/plain"));
+        let mut body = Body::from_bytes(
+            Bytes::from_static(&[0xFF, 0xFE]),
+            MediaType::new("text/plain"),
+        );
         let v = body.as_any(1024).await.unwrap();
         assert_eq!(B64.decode(v.as_str().unwrap()).unwrap(), [0xFF, 0xFE]);
     }

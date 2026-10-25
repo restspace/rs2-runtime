@@ -26,6 +26,8 @@ use rs2_core::tenant::{Adapters, TenantConfig};
 use rs2_core::wrapper::LimitTable;
 use rs2_core::{RsError, Runtime};
 
+mod websocket;
+
 /// Successor to Restspace's `serverConfig.json` (PRD 13), v1 subset.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +93,10 @@ struct LimitsConfig {
     breaker_threshold: Option<u32>,
     breaker_window_ms: Option<u64>,
     breaker_cooldown_ms: Option<u64>,
+    ws_message_bytes: Option<u64>,
+    ws_messages_in_flight: Option<u32>,
+    ws_messages_per_second: Option<u32>,
+    ws_sockets_per_tenant: Option<usize>,
 }
 
 impl LimitsConfig {
@@ -138,6 +144,18 @@ impl LimitsConfig {
         }
         if let Some(ms) = positive("breakerCooldownMs", self.breaker_cooldown_ms)? {
             t.breaker_cooldown = Duration::from_millis(ms);
+        }
+        if let Some(v) = positive("wsMessageBytes", self.ws_message_bytes)? {
+            t.ws_message_bytes = v;
+        }
+        if let Some(v) = positive("wsMessagesInFlight", self.ws_messages_in_flight)? {
+            t.ws_messages_in_flight = v;
+        }
+        if let Some(v) = positive("wsMessagesPerSecond", self.ws_messages_per_second)? {
+            t.ws_messages_per_second = v;
+        }
+        if let Some(v) = positive("wsSocketsPerTenant", self.ws_sockets_per_tenant)? {
+            t.ws_sockets_per_tenant = v;
         }
         Ok(t)
     }
@@ -418,6 +436,13 @@ fn hyper_request_to_message(req: hyper::Request<Incoming>, tenant: &str) -> Mess
 
 type OutBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;
 
+/// A response with no representation at all (a 101 handshake, `/healthz`).
+fn empty_body() -> OutBody {
+    http_body_util::Empty::new()
+        .map_err(std::io::Error::other)
+        .boxed_unsync()
+}
+
 fn message_to_hyper_response(msg: Message) -> Response<OutBody> {
     let status = msg.status.unwrap_or(StatusCode::OK);
     let mut builder = Response::builder().status(status);
@@ -607,7 +632,7 @@ fn domains_endpoint(
 async fn serve_request(
     runtime: Arc<Runtime>,
     admin_token: Option<Arc<str>>,
-    req: hyper::Request<Incoming>,
+    mut req: hyper::Request<Incoming>,
 ) -> Response<OutBody> {
     let path = req.uri().path();
     // Ops endpoints (PRD 14), outside tenant routing.
@@ -673,9 +698,30 @@ async fn serve_request(
             )
             .unwrap();
     };
+    // Inbound WebSockets (`docs/agents/websocket.md`): the upgrade handle has
+    // to be taken while we still own the request, before the conversion
+    // consumes it — but nothing is upgraded until `dispatch` has authorized the
+    // GET and answered a 101 marker. A mount without the flag (or a failed
+    // authorization) simply answers as the ordinary HTTP request it is, and the
+    // handle is dropped unused.
+    let upgrade = websocket::is_upgrade(&req).then(|| {
+        (
+            websocket::Handshake::capture(req.headers()),
+            hyper::upgrade::on(&mut req),
+        )
+    });
     let msg = hyper_request_to_message(req, &tenant);
     let trace_id = msg.trace.trace_id.clone();
-    let mut resp = message_to_hyper_response(runtime.handle(msg).await);
+    let out = runtime.handle(msg).await;
+    let mut resp = match upgrade {
+        Some((handshake, on_upgrade)) if out.socket_accept.is_some() => {
+            match websocket::accept(&runtime, out, handshake, on_upgrade) {
+                Ok(resp) => resp,
+                Err(err) => problem_response(err),
+            }
+        }
+        _ => message_to_hyper_response(out),
+    };
     if let Ok(v) = http::HeaderValue::from_str(&trace_id) {
         resp.headers_mut().insert("x-trace-id", v);
     }
@@ -853,7 +899,11 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     .with_http(Arc::new(rs2_core::adapters::UreqHttpOut::new()))
     .with_logging(log_store, log_level)
     // External-catalogue fetching, bounded by the operator host allowlist.
-    .with_catalogue(config.catalogue_hosts.clone());
+    .with_catalogue(config.catalogue_hosts.clone())
+    // This listener can carry WebSockets (`websocket.rs`), so the node gets a
+    // socket registry: `webSocket` mounts upgrade and `/.sockets/` is served.
+    // Without this, `dispatch` answers an upgrade as the plain GET.
+    .with_sockets();
     {
         let data_fs = data_fs.clone();
         adapters.builtins.register_data(
@@ -926,6 +976,19 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     println!("rs2-server listening on http://{addr}");
 
+    serve(runtime, listener, admin_token).await?;
+    Ok(())
+}
+
+/// Accept loop for an already-built runtime on an already-bound listener: the
+/// packaging-free half of [`run`], so an embedder (and the integration tests)
+/// can serve a runtime it constructed itself without a config file on disk.
+/// Runs until the listener fails.
+pub async fn serve(
+    runtime: Arc<Runtime>,
+    listener: TcpListener,
+    admin_token: Option<Arc<str>>,
+) -> std::io::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let runtime = runtime.clone();
@@ -941,8 +1004,11 @@ pub async fn run(config_path: &str) -> Result<(), Box<dyn std::error::Error>> {
                     )
                 }
             });
+            // `with_upgrades` is what makes `hyper::upgrade::on` resolve: a 101
+            // hands the connection's IO to the socket task (websocket.rs).
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
+                .with_upgrades()
                 .await
             {
                 eprintln!("connection error: {e}");

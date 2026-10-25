@@ -13,9 +13,14 @@ use crate::error::RsError;
 use crate::idempotency;
 use crate::message::Message;
 use crate::router::{validate_path, Tenancy};
+use crate::sockets::{
+    is_websocket_upgrade, web_socket_config_of, Frame, SocketAccept, SocketHub, SocketSelector,
+    WebSocketConfig, SOCKETS_SEGMENT,
+};
 use crate::tenant::{Adapters, Tenant, TenantConfig};
 use crate::wrapper::{
-    check_access, check_declared_body_size, LimitTable, TenantBreaker, TenantLimiter,
+    check_access, check_declared_body_size, check_mount_access, LimitTable, TenantBreaker,
+    TenantLimiter,
 };
 
 /// Source of tenant configs ("config store" — PRD §13). The server binary
@@ -90,6 +95,8 @@ pub struct Runtime {
     log: Arc<dyn crate::logging::LogStore>,
     /// Boundary-log severity floor; failures bypass it.
     log_level: crate::logging::Severity,
+    /// The node's WebSocket registry; `None` when the host carries no sockets.
+    sockets: Option<Arc<SocketHub>>,
 }
 
 /// Internal dispatch capability handed to services (pipelines): requests
@@ -156,6 +163,7 @@ impl Runtime {
         Arc::new_cyclic(|me| Runtime {
             log: adapters.log.clone(),
             log_level: adapters.log_level,
+            sockets: adapters.sockets.clone(),
             tenancy,
             adapters,
             loader,
@@ -166,6 +174,23 @@ impl Runtime {
             load_guards: tokio::sync::Mutex::new(HashMap::new()),
             self_ref: me.clone(),
         })
+    }
+
+    /// The operator limit table in force.
+    pub fn limits(&self) -> &LimitTable {
+        &self.limits
+    }
+
+    /// The node's WebSocket registry, when this host carries sockets.
+    pub fn sockets(&self) -> Option<&Arc<SocketHub>> {
+        self.sockets.as_ref()
+    }
+
+    /// Count a resource-limit breach against the tenant's circuit breaker —
+    /// for breaches the host observes outside `invoke` (a socket's per-frame
+    /// limits), which must feed the breaker exactly as an in-band one does.
+    pub fn record_breach(&self, tenant: &str) {
+        self.breaker.record_breach(tenant, &self.limits);
     }
 
     pub fn resolve_tenant(&self, host: &str) -> Option<String> {
@@ -333,7 +358,11 @@ impl Runtime {
         // Default caching posture: anything that didn't opt in — errors,
         // discovery docs, preflights, auth responses — is never stored.
         // (304s are exempt: the cached entry's own policy governs them.)
-        if resp.header("cache-control").is_none() && resp.status != Some(StatusCode::NOT_MODIFIED) {
+        // (A 101 is a handshake, not a representation: exempt likewise.)
+        if resp.header("cache-control").is_none()
+            && resp.status != Some(StatusCode::NOT_MODIFIED)
+            && resp.status != Some(StatusCode::SWITCHING_PROTOCOLS)
+        {
             resp.set_header("cache-control", "no-store");
         }
 
@@ -453,6 +482,9 @@ impl Runtime {
 
         // Verify any presented token into a principal (PRD §10.5); a bad
         // token is rejected outright rather than treated as anonymous.
+        // The token's expiry is kept: an accepted WebSocket outlives this
+        // request, and the host closes it when the token would have lapsed.
+        let mut token_exp = None;
         if msg.principal.is_none() {
             if let Some(secret) = tenant
                 .auth
@@ -460,7 +492,11 @@ impl Runtime {
                 .and_then(|a| a.get("jwtSecret"))
                 .and_then(|v| v.as_str())
             {
-                msg.principal = crate::services::auth::principal_from_token(&msg, secret)?;
+                if let Some((principal, exp)) = crate::services::auth::verified_token(&msg, secret)?
+                {
+                    msg.principal = Some(principal);
+                    token_exp = Some(exp);
+                }
             }
         }
 
@@ -489,6 +525,35 @@ impl Runtime {
                 &crate::discovery::allowed_methods(mount).join(", "),
             );
             return Ok(resp);
+        }
+
+        // Inbound WebSockets (`docs/agents/websocket.md`), only on a mount that
+        // opted in: the upgrade — authorized above as the GET it is, so a 101
+        // is never sent before authorization — and the reserved `/.sockets/`
+        // subtree, answered from the hub rather than routed to the service.
+        if let Some(ws) = web_socket_config_of(&mount.config, &mount.service) {
+            if msg.source == crate::message::Source::External
+                && msg.method == http::Method::GET
+                && is_websocket_upgrade(&msg)
+                && self.sockets.is_some()
+            {
+                // `check_access` defers a pipeline mount's execution paths to
+                // the per-spec check in the service, which an upgrade never
+                // reaches: hold it to the mount's own read role.
+                if mount.service == "pipeline" {
+                    check_mount_access(&msg, mount, "read")?;
+                }
+                return self.accept_upgrade(&msg, mount, ws, token_exp);
+            }
+            if msg.url.service_segments().first() == Some(&SOCKETS_SEGMENT) {
+                // Sends and closes need the mount's **write** role — never
+                // `invoke`/`delete`, so `invoke: "all"` does not open a
+                // mount's sockets to the public.
+                if msg.method != http::Method::GET && msg.method != http::Method::HEAD {
+                    check_mount_access(&msg, mount, "write")?;
+                }
+                return self.handle_sockets(msg, mount).await;
+            }
         }
 
         check_declared_body_size(&msg, &self.limits)?;
@@ -562,6 +627,153 @@ impl Runtime {
             }
             resp
         })
+    }
+
+    /// Authorize-then-accept: the 101 marker the listener completes. Holds
+    /// no concurrency permit; idempotency and caching do not apply.
+    fn accept_upgrade(
+        &self,
+        msg: &Message,
+        mount: &crate::router::Mount,
+        ws: WebSocketConfig,
+        exp: Option<u64>,
+    ) -> Result<Message, RsError> {
+        let hub = self.sockets.as_ref().expect("checked by the caller");
+        let observed = hub.count(&msg.tenant);
+        if observed >= self.limits.ws_sockets_per_tenant {
+            // A tenant hammering the socket ceiling feeds the breaker exactly
+            // as an in-invocation breach would.
+            self.record_breach(&msg.tenant);
+            return Err(RsError::limit_exceeded(
+                "ws_sockets_per_tenant",
+                observed as u64,
+                self.limits.ws_sockets_per_tenant as u64,
+            ));
+        }
+        let connected_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let accept = SocketAccept {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            tenant: msg.tenant.clone(),
+            mount: mount.base_path.clone(),
+            path: msg.url.path.clone(),
+            query: if msg.url.query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", msg.url.query)
+            },
+            principal: msg.principal.clone(),
+            exp,
+            text: ws.text,
+            events: ws.events,
+            protocol: crate::services::auth::select_subprotocol(msg),
+            connected_at,
+        };
+        let mut resp = msg.response(StatusCode::SWITCHING_PROTOCOLS, None);
+        resp.socket_accept = Some(Box::new(accept));
+        Ok(resp)
+    }
+
+    /// The reserved `/<mount>/.sockets/…` subtree (the `.pipelines/`
+    /// precedent), answered from the node's [`SocketHub`]. Access was checked
+    /// by the caller: a listing needs the mount's read role, a send or a
+    /// close its write role.
+    async fn handle_sockets(
+        &self,
+        mut msg: Message,
+        mount: &crate::router::Mount,
+    ) -> Result<Message, RsError> {
+        let hub = self.sockets.as_ref().ok_or_else(|| {
+            RsError::provider_unavailable(
+                "this host has no socket registry, so '/.sockets/' cannot be served",
+            )
+        })?;
+        let rest = msg.url.service_path[SOCKETS_SEGMENT.len() + 1..].to_string();
+        let relative = rest.trim_start_matches('/');
+        let sel = SocketSelector {
+            mount: mount.base_path.clone(),
+            // No path at all (`/<m>/.sockets[/]`) addresses the whole mount.
+            path: (!relative.is_empty()).then(|| format!("{}/{relative}", mount.base_path)),
+            subtree: relative.is_empty() || rest.ends_with('/'),
+            id: msg.url.query_param("$id"),
+            user: msg.url.query_param("$user"),
+        };
+        match msg.method {
+            http::Method::POST => {
+                let cap = self.limits.ws_message_bytes;
+                let mut body = msg.body.take().ok_or_else(|| {
+                    RsError::bad_request("sending a frame requires a request body")
+                })?;
+                let bytes = match body.materialize(cap).await {
+                    Ok(bytes) => bytes.clone(),
+                    Err(e) if e.code == crate::error::codes::LIMIT_EXCEEDED => {
+                        return Err(RsError::payload_too_large(format!(
+                            "a frame may not exceed the wsMessageBytes limit of {cap} bytes"
+                        )))
+                    }
+                    Err(e) => return Err(e),
+                };
+                let frame = Frame::typed(bytes, &body.media_type);
+                let sent = hub.send(&msg.tenant, &sel, &frame);
+                Ok(msg.ok_json(&serde_json::json!({ "sent": sent })))
+            }
+            http::Method::GET => {
+                let entries: Vec<serde_json::Value> = hub
+                    .list(&msg.tenant, &sel)
+                    .into_iter()
+                    .map(|s| {
+                        let mut entry = serde_json::json!({
+                            "name": s.id, "dir": false, "path": s.path,
+                        });
+                        if let Some(user) = s.user {
+                            entry["user"] = user.into();
+                        }
+                        entry["connectedAt"] = s.connected_at.into();
+                        entry
+                    })
+                    .collect();
+                let total = entries.len();
+                let listing = serde_json::json!({
+                    "path": msg.url.path, "entries": entries, "total": total,
+                });
+                let mut resp = msg.ok(Some(crate::message::Body::from_string(
+                    listing.to_string(),
+                    crate::message::MediaType::dir_json(),
+                )));
+                resp.set_header("x-total-count", &total.to_string());
+                Ok(resp)
+            }
+            http::Method::DELETE => {
+                let mut code = 1000u16;
+                if let Some(raw) = msg.url.query_param("code") {
+                    // Only the normal closure and the application range are a
+                    // caller's to send; the protocol reserves the rest.
+                    code = raw
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|n| *n == 1000 || (3000..=4999).contains(n))
+                        .ok_or_else(|| {
+                            RsError::bad_request(format!(
+                                "close code '{raw}' must be 1000 or in the application range 3000–4999"
+                            ))
+                        })?;
+                }
+                let reason = msg.url.query_param("reason").unwrap_or_default();
+                let closed = hub.close(&msg.tenant, &sel, code, &reason);
+                Ok(msg.ok_json(&serde_json::json!({ "closed": closed })))
+            }
+            _ => Err(RsError::new(
+                405,
+                crate::error::codes::BAD_REQUEST,
+                "Method Not Allowed",
+                format!(
+                    "'/{SOCKETS_SEGMENT}/' takes POST (send), GET (list) and DELETE (close), not {}",
+                    msg.method
+                ),
+            )),
+        }
     }
 
     async fn invoke(

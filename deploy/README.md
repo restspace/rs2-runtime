@@ -51,8 +51,11 @@ run on 22.04+.
 RS2 resolves **tenancy from the `Host` header** (domain map + subdomain), so the
 vhost sets `ProxyPreserveHost On`. Without it, every request lands on the wrong
 tenant. The template also forwards `X-Forwarded-Proto: https` and disables proxy
-buffering so RS2's streaming bodies pass through. WebSockets are out of scope for
-v1, so no `mod_proxy_wstunnel` is needed.
+buffering so RS2's streaming bodies pass through. Inbound WebSockets
+(`"webSocket": true` mounts) are tunnelled by `upgrade=websocket` on the
+`ProxyPass` line — Apache 2.4.47+, part of `mod_proxy_http`, so no
+`mod_proxy_wstunnel` is needed. A vhost installed before that parameter was
+added serves such a mount's plain GET instead of upgrading; add it by hand.
 
 Required modules (the installer enables them): `proxy proxy_http headers ssl rewrite`.
 

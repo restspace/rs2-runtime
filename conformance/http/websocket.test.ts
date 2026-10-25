@@ -4,12 +4,9 @@
 // every outbound frame is an ordinary request to the mount's reserved
 // `/.sockets/` subtree. This suite proves that contract black-box.
 //
-// Implemented on the Worker host only, so far (`divergences().webSocket`:
-// `"served"` on cloudflare, `"absent"` on rust). The live-socket suite below
-// is gated on `"served"` and skips cleanly on the Rust host. The one case
-// that runs on `"absent"` pins the negative contract instead: a
-// `webSocket: true` mount still answers `Upgrade` as a plain GET — a 101 is
-// never sent when there is no `SocketHub` to hand the connection to.
+// Both hosts serve it: the Worker's `SocketHub` over the Hibernation API,
+// the Rust host's in-memory hub behind hyper's upgrade (`sockets.rs`,
+// `rs2-server/src/websocket.rs`).
 //
 // Two things `fetch` cannot do, so this file reaches past `Rs2Client`:
 //   - `fetch` forbids setting the `Upgrade` header, so the rejection cases
@@ -35,8 +32,7 @@ import type { Socket } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { env, Rs2Client, type Rs2Response } from "./src/client.ts";
-import { divergences } from "./src/divergences.ts";
-import { type Mount, Seed } from "./src/seed.ts";
+import { Seed } from "./src/seed.ts";
 
 /// The subprotocol convention from docs/agents/websocket.md: a client that
 /// cannot set `Authorization` offers `rs2.bearer.<jwt>` alongside a real
@@ -148,46 +144,9 @@ function status(res: Rs2Response, want: number, msg: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Rust host: the negative contract only. No `SocketHub` is wired up yet, so
-// an `Upgrade` request to a `webSocket: true` mount must fall back to the
-// plain GET — a 101 is never sent before (or instead of) authorization.
+// The live contract.
 // ---------------------------------------------------------------------------
-describe.runIf(divergences().webSocket === "absent")("websocket (rust: no SocketHub yet)", () => {
-  let seed: Seed | undefined;
-
-  afterAll(async () => {
-    await seed?.restore();
-  });
-
-  test("a webSocket:true mount answers Upgrade as a plain GET, never 101", async (ctx) => {
-    seed = await Seed.create();
-    const probe: Mount = { path: "/ws-probe", service: "pipeline", config: { access: "open", webSocket: true } };
-    const applied = await seed.tryApplyMounts([probe]);
-    if (applied.status !== 204) {
-      // Config validation rejects the unknown `webSocket` field before an
-      // upgrade path exists at all — nothing left to probe here.
-      ctx.skip();
-      return;
-    }
-    const spec = await seed.admin.put("/ws-probe/.pipelines/.root", {
-      json: { pipeline: { steps: [{ transform: { ok: true } }] } },
-    });
-    status(spec, 201, "[ws-probe] author .root");
-
-    const res = await rawUpgradeRequest("/ws-probe/anything");
-    expect(res.status, `[ws-probe] upgrade must not succeed: ${res.status} ${res.body}`).not.toBe(101);
-    // The mount ignores `Upgrade` and serves the ordinary GET (RFC 9110):
-    // the pipeline ran and answered normally.
-    expect(res.status, `[ws-probe] falls back to a plain GET: ${res.status} ${res.body}`).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ ok: true });
-    res.socket?.destroy();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Cloudflare host: the live contract.
-// ---------------------------------------------------------------------------
-describe.runIf(divergences().webSocket === "served")("websocket (cloudflare: SocketHub)", () => {
+describe("websocket", () => {
   // A `pipeline` mount defers execution-path access to the matched spec,
   // which an upgrade never reaches — so the handshake is held to the
   // MOUNT's read role (websocket.md, "Pipeline mounts"). AUTH_MOUNT (`data`)

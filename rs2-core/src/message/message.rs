@@ -163,6 +163,9 @@ pub struct Message {
     pub name: Option<String>,
     /// Internal-call depth, capped by limits to bound recursion.
     pub depth: u16,
+    /// Set by `dispatch` on a `101` it authorized: the identity of the socket
+    /// the listener should now accept (`docs/agents/websocket.md`).
+    pub socket_accept: Option<Box<crate::sockets::SocketAccept>>,
 }
 
 impl Message {
@@ -179,6 +182,7 @@ impl Message {
             source: Source::External,
             name: None,
             depth: 0,
+            socket_accept: None,
         }
     }
 
@@ -205,6 +209,7 @@ impl Message {
             source: self.source,
             name: self.name.clone(),
             depth: self.depth,
+            socket_accept: None,
         }
     }
 

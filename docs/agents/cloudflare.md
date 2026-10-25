@@ -48,7 +48,6 @@ prelude's virtual timers). Wasm components on the Worker.
 | `DELETE` of a directory that never existed: Rust local-fs → 404; R2 has no directories → **204** | runner accepts `204|404` for this one case (§F); documented, not declared |
 | Dot segments in the request target (`/files/../x`, `/files/%2e%2e/x`) | The Workers platform canonicalizes them before the Worker runs (`request.url` already reads `/x`), so the router's 400 `path_unsafe` is unreachable and the request routes on the normalized path (404 for an unmounted target); `%00`, `\`, control characters and drive letters still reach the router and are 400 | runner accepts `400|404` for the two dot-segment cases (`dotSegmentTraversal` in `src/divergences.ts`); documented, not declared |
 | Log storage: per-tenant SQLite rows with a cap instead of rotated NDJSON files | not observable through the `log` reader contract |
-| Inbound WebSocket upgrade is served only on the Worker host for now | declared via the `websocket` facet on a `webSocket`-flagged mount's discovery entry (absent on Rust, where such a mount serves the plain GET unchanged) and the discovery `limits.webSocket` object; bringing the Rust host to parity is a follow-up. Full contract: `websocket.md` |
 
 Everything else — including the odd corners (405 responses that carry
 `code: bad_request`, `If-Match` mismatch on `PUT /services/raw` being **409**

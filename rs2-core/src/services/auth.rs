@@ -134,36 +134,75 @@ pub fn verify(token: &str, secret: &str) -> Result<Claims, RsError> {
     Ok(claims)
 }
 
-/// Extract the token from the `rs-auth` cookie or `Authorization: Bearer`.
+/// The `Sec-WebSocket-Protocol` entries a client offered, in order.
+fn offered_subprotocols(msg: &Message) -> Vec<&str> {
+    msg.headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The subprotocol a WebSocket handshake selects: the first offered entry
+/// that is not a bearer carrier, else the bearer entry itself (a handshake
+/// may only select a value the client offered). `None` when none was offered.
+pub fn select_subprotocol(msg: &Message) -> Option<String> {
+    let offered = offered_subprotocols(msg);
+    offered
+        .iter()
+        .find(|p| !p.starts_with(crate::sockets::BEARER_SUBPROTOCOL_PREFIX))
+        .or(offered.first())
+        .map(|p| p.to_string())
+}
+
+/// Extract the token from `Authorization: Bearer`, the `rs-auth` cookie, or —
+/// on a WebSocket upgrade only, where a browser can set neither header — a
+/// `Sec-WebSocket-Protocol` entry `rs2.bearer.<jwt>`.
 pub fn extract_token(msg: &Message) -> Option<String> {
     if let Some(auth) = msg.header("authorization") {
         if let Some(token) = auth.strip_prefix("Bearer ") {
             return Some(token.trim().to_string());
         }
     }
-    let cookies = msg.header("cookie")?;
-    cookies.split(';').find_map(|c| {
-        let (k, v) = c.trim().split_once('=')?;
-        if k == "rs-auth" {
-            Some(v.to_string())
-        } else {
-            None
-        }
-    })
+    let cookie = msg.header("cookie").and_then(|cookies| {
+        cookies.split(';').find_map(|c| {
+            let (k, v) = c.trim().split_once('=')?;
+            (k == "rs-auth").then(|| v.to_string())
+        })
+    });
+    if cookie.is_some() || !crate::sockets::is_websocket_upgrade(msg) {
+        return cookie;
+    }
+    offered_subprotocols(msg)
+        .into_iter()
+        .find_map(|p| p.strip_prefix(crate::sockets::BEARER_SUBPROTOCOL_PREFIX))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 /// Verify the request's token (if any) into a [`Principal`].
 pub fn principal_from_token(msg: &Message, secret: &str) -> Result<Option<Principal>, RsError> {
+    Ok(verified_token(msg, secret)?.map(|(principal, _)| principal))
+}
+
+/// [`principal_from_token`], keeping the token's expiry (epoch seconds): an
+/// accepted WebSocket outlives the request, so the host closes it then.
+pub fn verified_token(msg: &Message, secret: &str) -> Result<Option<(Principal, u64)>, RsError> {
     let Some(token) = extract_token(msg) else {
         return Ok(None);
     };
     let claims = verify(&token, secret)?;
-    Ok(Some(Principal {
+    let exp = claims.exp;
+    let principal = Principal {
         id: claims.sub,
         roles: claims.roles.split_whitespace().map(String::from).collect(),
         kind: claims.kind,
         extra: claims.extra,
-    }))
+    };
+    Ok(Some((principal, exp)))
 }
 
 /// Hash a password with argon2id (the at-rest format for new hashes).

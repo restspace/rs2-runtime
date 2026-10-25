@@ -270,7 +270,7 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
                     .collect()
             })
             .unwrap_or_default();
-        return (pattern, facets);
+        return (pattern, push_websocket_facet(mount, facets));
     }
     let (pattern, facets): (&str, Vec<&str>) = match mount.service.as_str() {
         "file" => {
@@ -336,7 +336,16 @@ fn pattern_of(mount: &Mount) -> (String, Vec<String>) {
     if pattern.starts_with("store") {
         facets.push("conditional-write".to_string());
     }
-    (pattern.to_string(), facets)
+    (pattern.to_string(), push_websocket_facet(mount, facets))
+}
+
+/// The `websocket` facet: this mount accepts an `Upgrade: websocket` on its
+/// connect paths and answers the reserved `/.sockets/` subtree.
+fn push_websocket_facet(mount: &Mount, mut facets: Vec<String>) -> Vec<String> {
+    if crate::sockets::web_socket_config_of(&mount.config, &mount.service).is_some() {
+        facets.push("websocket".to_string());
+    }
+    facets
 }
 
 fn with_pattern(mut entry: Value, mount: &Mount) -> Value {
@@ -404,6 +413,12 @@ fn limits_doc(limits: &LimitTable) -> Value {
         "materializedBodyBytes": limits.materialized_body_bytes,
         "outboundCalls": limits.outbound_calls,
         "maxDepth": limits.max_depth,
+        "webSocket": {
+            "messageBytes": limits.ws_message_bytes,
+            "messagesInFlight": limits.ws_messages_in_flight,
+            "messagesPerSecond": limits.ws_messages_per_second,
+            "socketsPerTenant": limits.ws_sockets_per_tenant,
+        },
         "host": "rust",
     })
 }

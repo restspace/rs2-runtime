@@ -41,6 +41,7 @@ pub mod router;
 pub mod runtime;
 pub mod scheduler;
 pub mod services;
+pub mod sockets;
 pub mod tenant;
 #[cfg(feature = "tls")]
 pub mod tls;

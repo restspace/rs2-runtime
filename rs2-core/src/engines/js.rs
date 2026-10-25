@@ -15,6 +15,13 @@
 //! `{ config, request(capability, req), log(level, text),
 //!    state: { get(key), put(key, value) } }`.
 //!
+//! Inbound WebSockets (`docs/agents/websocket.md`, "Guests"): a socket event
+//! runs the bundle's `onOpen`/`onMessage`/`onClose` export `(msg, ctx, socket)`
+//! instead of `default`, with `socket` = `{ id, send(data), close(code?,
+//! reason?) }`; and every invocation's `ctx` carries `sockets` =
+//! `{ send(sel, data), close(sel, code?, reason?), list(sel) }` over the
+//! invocation's own mount (`capability_denied` unless the mount is `webSocket`).
+//!
 //! Limits: wall clock via a watchdog thread calling `terminate_execution`;
 //! memory via the near-heap-limit callback; the outbound budget and
 //! materialization caps are host-enforced as for every engine.
@@ -34,9 +41,10 @@ use deno_error::JsErrorBox;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::contract::{Engine, HostApi, InvocationLimits, LogLevel, ServiceCode};
+use crate::contract::{Engine, HostApi, InvocationLimits, LogLevel, ServiceCode, SocketOp};
 use crate::error::{codes, RsError};
 use crate::message::{Body, ByteStream, MediaType, Message, Principal, Provenance, Source};
+use crate::sockets::SocketEvent;
 use bytes::Bytes;
 use futures::StreamExt;
 
@@ -83,7 +91,53 @@ const BOOTSTRAP: &str = r#"
     close() { ops.op_rs2_sock_close(this._id); }
   }
   globalThis.RS2Socket = RS2Socket;
-  globalThis.__rs2_dispatch = async (userDefault, msg, config) => {
+  // A frame as the host wants it: a string is a text frame, bytes are a
+  // binary one, and any other JSON value is stringified into a text frame.
+  const frameOf = (data) => {
+    if (typeof data === "string") return data;
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) {
+      return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+    }
+    return JSON.stringify(data === undefined ? null : data);
+  };
+  // A `ctx.sockets` selection as plain data for the op boundary (the host
+  // validates it; an id string selects one socket).
+  const selectorOf = (sel) => {
+    if (typeof sel === "string") return sel;
+    const s = sel && typeof sel === "object" ? sel : {};
+    const out = {};
+    for (const k of ["path", "subtree", "id", "user"]) if (s[k] !== undefined && s[k] !== null) out[k] = s[k];
+    return out;
+  };
+  const socketSend = (target, data) => {
+    const frame = frameOf(data);
+    return rethrow(typeof frame === "string"
+      ? ops.op_rs2_socket_send(target, frame)
+      : ops.op_rs2_socket_send_bytes(target, frame));
+  };
+  const socketClose = (target, code, reason) => {
+    const n = code === undefined || code === null ? NaN : Number(code);
+    return rethrow(ops.op_rs2_socket_close(target, {
+      code: Number.isFinite(n) ? Math.floor(n) : null,
+      reason: reason === undefined || reason === null ? null : String(reason),
+    }));
+  };
+  // The third argument to `onOpen`/`onMessage`/`onClose`: deliberately
+  // minimal — `{id, send, close}` on the socket the event came from, never
+  // the raw socket. The host resolves the id against the invocation's own
+  // mount, so a handle cannot reach another mount's sockets.
+  const makeSocket = (id) => ({
+    id,
+    send: (data) => socketSend(id, data),
+    close: (code, reason) => socketClose(id, code, reason),
+  });
+  // `socket` (`{id}`) is set only for a socket event the host vouched for:
+  // `userDefault` is then the matching `onOpen`/`onMessage`/`onClose` export
+  // (the host already checked it is a function) and gets the socket handle as
+  // its third argument.
+  globalThis.__rs2_dispatch = async (userDefault, msg, config, socket) => {
     const ctx = {
       config,
       request: (cap, req) => rethrow(ops.op_rs2_request(String(cap), req ?? {})),
@@ -125,7 +179,19 @@ const BOOTSTRAP: &str = r#"
           end: () => {}, // the stream closes when the handler returns
         };
       },
+      // The mount's own sockets (webSocket mounts only): push, close or list a
+      // selection `{path?, subtree?, id?, user?}` — `path` relative to the
+      // mount; `{}` is every socket on it. Works from any invocation (an HTTP
+      // request, a scheduled tick), not just a socket handler.
+      sockets: {
+        send: (sel, data) => socketSend(selectorOf(sel), data),
+        close: (sel, code, reason) => socketClose(selectorOf(sel), code, reason),
+        list: (sel) => rethrow(ops.op_rs2_socket_list(selectorOf(sel))),
+      },
     };
+    if (socket && typeof socket === "object") {
+      return await userDefault(msg, ctx, makeSocket(String(socket.id ?? "")));
+    }
     const handle = typeof userDefault === "function"
       ? userDefault
       : (userDefault && userDefault.handle);
@@ -918,6 +984,148 @@ fn op_rs2_body_write(state: &mut OpState, #[buffer] data: &[u8]) -> serde_json::
     }
 }
 
+/// The known RS2 codes, so a `/.sockets/` problem read back off the wire keeps
+/// its identity in the `&'static str` an [`RsError`] carries.
+fn static_code(code: &str) -> &'static str {
+    const ALL: &[&str] = &[
+        codes::BAD_REQUEST,
+        codes::UNAUTHORIZED,
+        codes::FORBIDDEN,
+        codes::NOT_FOUND,
+        codes::CONFLICT,
+        codes::PRECONDITION_FAILED,
+        codes::PAYLOAD_TOO_LARGE,
+        codes::VALIDATION_FAILED,
+        codes::IDEMPOTENCY_KEY_REUSE,
+        codes::LIMIT_EXCEEDED,
+        codes::CAPABILITY_DENIED,
+        codes::ENGINE_UNAVAILABLE,
+        codes::PROVIDER_UNAVAILABLE,
+        codes::PATH_UNSAFE,
+        codes::INTERNAL,
+    ];
+    ALL.iter()
+        .find(|c| **c == code)
+        .copied()
+        .unwrap_or(codes::CONTRACT_VIOLATION)
+}
+
+/// One guest socket op, run to completion on the main runtime: the host
+/// ([`HostApi::socket_control`]) addresses the invocation's own mount's
+/// `/.sockets/` subtree, and the answer comes back as its JSON payload
+/// (`{sent}` / `{closed}` / the listing). A failure response is turned back
+/// into a structured error, so a denial or a limit keeps its identity when
+/// the bootstrap rethrows it.
+async fn run_socket_control(
+    host: Arc<dyn HostApi>,
+    op: SocketOp,
+    target: Value,
+    call: Message,
+    materialize_cap: u64,
+) -> Result<Value, RsError> {
+    let mut resp = host.socket_control(op, &target, call).await?;
+    let status = resp.status.map(|s| s.as_u16()).unwrap_or(200);
+    let payload = match &mut resp.body {
+        None => Value::Null,
+        Some(body) => body.as_any(materialize_cap).await?,
+    };
+    if !(200..300).contains(&status) {
+        let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
+        return Err(RsError::new(
+            status,
+            field("code")
+                .map(static_code)
+                .unwrap_or(codes::CONTRACT_VIOLATION),
+            field("title").unwrap_or("Error"),
+            field("detail")
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("socket request failed with status {status}")),
+        ));
+    }
+    Ok(if payload.is_object() {
+        payload
+    } else {
+        json!({})
+    })
+}
+
+/// Shared tail of the socket ops: build the identity-only call (the host
+/// fills in method, URL and source — nothing here is the guest's to steer),
+/// block on the host, and map a failure to the recorded marker like every
+/// other host op.
+fn socket_op(state: &mut OpState, op: SocketOp, target: Value) -> Value {
+    let inv = state.borrow::<Arc<InvocationState>>().clone();
+    let mut call = Message::request(http::Method::GET, "/", &inv.tenant);
+    call.principal = inv.principal.clone();
+    // Advanced once, host-side, as for `request` (issue #2 item 9).
+    call.depth = inv.depth;
+    let host = inv.host.clone();
+    let cap = inv.materialize_cap;
+    match block_on_main(&inv.main, run_socket_control(host, op, target, call, cap)) {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(e)) => fail_socket(&inv, e),
+        Err(_) => fail_socket(&inv, RsError::internal("host task dropped")),
+    }
+}
+
+/// `socket.send` / `ctx.sockets.send` with a text frame (the bootstrap has
+/// already JSON-stringified anything that is not a string or bytes).
+/// → `{sent: n}`.
+#[op2]
+#[serde]
+fn op_rs2_socket_send(
+    state: &mut OpState,
+    #[serde] target: serde_json::Value,
+    #[string] text: String,
+) -> serde_json::Value {
+    let body = Body::from_string(text, MediaType::new("text/plain"));
+    socket_op(state, SocketOp::Send(body), target)
+}
+
+/// The binary-frame form of [`op_rs2_socket_send`].
+#[op2]
+#[serde]
+fn op_rs2_socket_send_bytes(
+    state: &mut OpState,
+    #[serde] target: serde_json::Value,
+    #[buffer] data: &[u8],
+) -> serde_json::Value {
+    let body = Body::from_bytes(data.to_vec(), MediaType::octet_stream());
+    socket_op(state, SocketOp::Send(body), target)
+}
+
+/// `socket.close` / `ctx.sockets.close`: `opts` is `{code, reason}` (either
+/// may be null; the host defaults the code to 1000). → `{closed: n}`.
+#[op2]
+#[serde]
+fn op_rs2_socket_close(
+    state: &mut OpState,
+    #[serde] target: serde_json::Value,
+    #[serde] opts: serde_json::Value,
+) -> serde_json::Value {
+    let op = SocketOp::Close {
+        code: opts
+            .get("code")
+            .and_then(|c| c.as_i64().or_else(|| c.as_f64().map(|f| f as i64))),
+        reason: opts
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .map(str::to_string),
+    };
+    socket_op(state, op, target)
+}
+
+/// `ctx.sockets.list`: the selection's connections, as the `/.sockets/`
+/// listing reports them. → `{path, entries, total}`.
+#[op2]
+#[serde]
+fn op_rs2_socket_list(
+    state: &mut OpState,
+    #[serde] target: serde_json::Value,
+) -> serde_json::Value {
+    socket_op(state, SocketOp::List, target)
+}
+
 extension!(
     rs2_host,
     ops = [
@@ -934,7 +1142,11 @@ extension!(
         op_rs2_body_read,
         op_rs2_take_chunk,
         op_rs2_stream_begin,
-        op_rs2_body_write
+        op_rs2_body_write,
+        op_rs2_socket_send,
+        op_rs2_socket_send_bytes,
+        op_rs2_socket_close,
+        op_rs2_socket_list
     ]
 );
 
@@ -1040,6 +1252,13 @@ impl Engine for JsEngine {
             }
         };
         let template = msg.response(http::StatusCode::OK, None);
+        // A socket event (`System`-sourced, so a client forging the trigger
+        // headers still reaches `default`) routes to the matching export with
+        // a `{id, send, close}` handle on the socket it came from.
+        let socket = crate::sockets::socket_event_of(&msg).map(|event| {
+            let id = msg.header(crate::sockets::SOCKET_ID_HEADER).unwrap_or("");
+            (event, id.to_string())
+        });
 
         // Body passthrough (`"bodyPassthrough": true` on the mount): the guest
         // sees the request body's *metadata* but not its bytes — the body is
@@ -1158,6 +1377,7 @@ impl Engine for JsEngine {
                 template,
                 request_stream,
                 carried_body,
+                socket,
             )
             .await;
         }
@@ -1180,7 +1400,7 @@ impl Engine for JsEngine {
                 .enable_all()
                 .build()
                 .map_err(|e| RsError::internal(format!("runtime build failed: {e}")))?;
-            local.block_on(run_invocation(&source, input, config, inv, &limits))
+            local.block_on(run_invocation(&source, input, config, inv, &limits, socket))
         })
         .await
         .map_err(|e| RsError::internal(format!("isolate thread failed: {e}")))??;
@@ -1262,6 +1482,7 @@ async fn invoke_streaming(
     template: Message,
     request_stream: Option<ByteStream>,
     carried_body: Option<Body>,
+    socket: Option<(SocketEvent, String)>,
 ) -> Result<Message, RsError> {
     // How many chunks the producer may run ahead of the consumer (backpressure).
     const CHANNEL_CAP: usize = 4;
@@ -1297,7 +1518,7 @@ async fn invoke_streaming(
             .enable_all()
             .build()
             .map_err(|e| RsError::internal(format!("runtime build failed: {e}")))?;
-        local.block_on(run_invocation(&source, input, config, inv, &limits))
+        local.block_on(run_invocation(&source, input, config, inv, &limits, socket))
     });
 
     let mut hdr_rx = hdr_rx;
@@ -1340,26 +1561,79 @@ async fn invoke_streaming(
 
 /// Build the runtime, run the bundle once, and return the response envelope.
 /// Runs on a current-thread runtime on its own thread (per invocation).
+/// `socket` (`(event, socket id)`) routes the call to the bundle's
+/// `onOpen`/`onMessage`/`onClose` export instead of `default`.
 async fn run_invocation(
     source: &str,
     input: Value,
     config: Value,
     inv: Arc<InvocationState>,
     limits: &InvocationLimits,
+    socket: Option<(SocketEvent, String)>,
 ) -> Result<Value, RsError> {
     let oom = Arc::new(AtomicBool::new(false));
-    let (mut runtime, default_export, _features) =
-        build_runtime(source, inv.clone(), limits, oom.clone()).await?;
-    dispatch_once(
+    let (mut runtime, namespace, _features) =
+        build_module(source, inv.clone(), limits, oom.clone()).await?;
+    let (handler, socket_arg) = match socket {
+        None => (module_export(&mut runtime, &namespace, "default"), None),
+        Some((event, id)) => {
+            let name = match event {
+                SocketEvent::Open => "onOpen",
+                SocketEvent::Message => "onMessage",
+                SocketEvent::Close => "onClose",
+            };
+            let Some(handler) = module_function(&mut runtime, &namespace, name) else {
+                // Nothing to run on connect/disconnect is a no-op; nothing to
+                // run on a frame is a broken contract — the mount asked for
+                // message events and the bundle cannot take them.
+                if event == SocketEvent::Message {
+                    return Err(RsError::contract_violation(format!(
+                        "bundle has no {name} export"
+                    )));
+                }
+                return Ok(json!({ "status": 204 }));
+            };
+            (handler, Some(json!({ "event": event.as_str(), "id": id })))
+        }
+    };
+    dispatch_handler(
         &mut runtime,
-        &default_export,
+        &handler,
         &input,
         &config,
+        socket_arg.as_ref(),
         &inv,
         limits,
         &oom,
     )
     .await
+}
+
+/// A named export of the evaluated bundle (`undefined` when absent).
+fn module_export(
+    runtime: &mut JsRuntime,
+    namespace: &v8::Global<v8::Object>,
+    name: &str,
+) -> v8::Global<v8::Value> {
+    deno_core::scope!(scope, runtime);
+    let ns = v8::Local::new(scope, namespace);
+    let value = v8::String::new(scope, name)
+        .and_then(|key| ns.get(scope, key.into()))
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    v8::Global::new(scope, value)
+}
+
+/// A named export, only if it is callable.
+fn module_function(
+    runtime: &mut JsRuntime,
+    namespace: &v8::Global<v8::Object>,
+    name: &str,
+) -> Option<v8::Global<v8::Value>> {
+    let export = module_export(runtime, namespace, name);
+    deno_core::scope!(scope, runtime);
+    v8::Local::new(scope, &export)
+        .is_function()
+        .then_some(export)
 }
 
 /// Wall-clock watchdog: terminate the isolate at `deadline`. Returns
@@ -1441,6 +1715,21 @@ pub(crate) async fn build_runtime(
     limits: &InvocationLimits,
     oom: Arc<AtomicBool>,
 ) -> Result<(JsRuntime, v8::Global<v8::Value>, Vec<String>), RsError> {
+    let (mut runtime, namespace, features) = build_module(source, inv, limits, oom).await?;
+    let default_export = module_export(&mut runtime, &namespace, "default");
+    Ok((runtime, default_export, features))
+}
+
+/// [`build_runtime`], returning the module **namespace** rather than just its
+/// default export: a per-invocation run may be a socket event, which runs a
+/// named export (`onOpen`/`onMessage`/`onClose`) instead. A resident adapter
+/// never receives socket events, so it keeps the default-export form.
+async fn build_module(
+    source: &str,
+    inv: Arc<InvocationState>,
+    limits: &InvocationLimits,
+    oom: Arc<AtomicBool>,
+) -> Result<(JsRuntime, v8::Global<v8::Object>, Vec<String>), RsError> {
     // When the committed snapshot is used, the bootstrap + prelude globals are
     // already baked into the isolate's heap; otherwise they run from source
     // (identical result, ~10ms slower per isolate creation).
@@ -1513,7 +1802,7 @@ pub(crate) async fn build_runtime(
     let evaluated = load_and_evaluate(&mut runtime, source).await;
     done.store(true, Ordering::SeqCst);
     match evaluated {
-        Ok((default_export, features)) => Ok((runtime, default_export, features)),
+        Ok((namespace, features)) => Ok((runtime, namespace, features)),
         Err(fail) => {
             if timed_out.load(Ordering::SeqCst) {
                 runtime.v8_isolate().cancel_terminate_execution();
@@ -1538,14 +1827,14 @@ pub(crate) async fn build_runtime(
     }
 }
 
-/// Load + evaluate the ESM bundle and return its default export plus its
+/// Load + evaluate the ESM bundle and return its module namespace plus its
 /// declared feature flags (an optional top-level `export const features =
 /// ["…"]` — the handshake by which an adapter advertises native capabilities
 /// such as `"list-records"`; absent or malformed → empty).
 async fn load_and_evaluate(
     runtime: &mut JsRuntime,
     source: &str,
-) -> Result<(v8::Global<v8::Value>, Vec<String>), String> {
+) -> Result<(v8::Global<v8::Object>, Vec<String>), String> {
     let spec = resolve_url("rs2:service").map_err(|e| format!("specifier: {e}"))?;
     let mod_id = runtime
         .load_main_es_module_from_code(&spec, source.to_string())
@@ -1562,17 +1851,13 @@ async fn load_and_evaluate(
         .get_module_namespace(mod_id)
         .map_err(|e| format!("namespace: {e}"))?;
     deno_core::scope!(scope, runtime);
-    let ns = v8::Local::new(scope, namespace);
-    let default_key = v8::String::new(scope, "default").ok_or("oom")?;
-    let default_export = ns
-        .get(scope, default_key.into())
-        .ok_or("no default export")?;
+    let ns = v8::Local::new(scope, &namespace);
     let features_key = v8::String::new(scope, "features").ok_or("oom")?;
     let features = ns
         .get(scope, features_key.into())
         .and_then(|v| serde_v8::from_v8::<Vec<String>>(scope, v).ok())
         .unwrap_or_default();
-    Ok((v8::Global::new(scope, default_export), features))
+    Ok((namespace, features))
 }
 
 /// Call `__rs2_dispatch(default, msg, config)` once and return the response
@@ -1589,12 +1874,38 @@ pub(crate) async fn dispatch_once(
     limits: &InvocationLimits,
     oom: &Arc<AtomicBool>,
 ) -> Result<Value, RsError> {
+    dispatch_handler(
+        runtime,
+        default_export,
+        input,
+        config,
+        None,
+        inv,
+        limits,
+        oom,
+    )
+    .await
+}
+
+/// [`dispatch_once`] over any handler: with `socket` (`{event, id}`) the
+/// handler is a socket export, called `(msg, ctx, socket)`.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_handler(
+    runtime: &mut JsRuntime,
+    handler: &v8::Global<v8::Value>,
+    input: &Value,
+    config: &Value,
+    socket: Option<&Value>,
+    inv: &InvocationState,
+    limits: &InvocationLimits,
+    oom: &Arc<AtomicBool>,
+) -> Result<Value, RsError> {
     *inv.host_error.lock().unwrap() = None;
     oom.store(false, Ordering::SeqCst);
 
     let handle = runtime.v8_isolate().thread_safe_handle();
     let (timed_out, done) = spawn_watchdog(handle, limits.wall_clock);
-    let result = drive_dispatch(runtime, default_export, input, config).await;
+    let result = drive_dispatch(runtime, handler, input, config, socket).await;
     done.store(true, Ordering::SeqCst);
 
     match result {
@@ -1623,7 +1934,7 @@ pub(crate) async fn dispatch_once(
     }
 }
 
-/// Call `__rs2_dispatch(default, msg, config)` and drive: drain microtasks via
+/// Call `__rs2_dispatch(handler, msg, config[, socket])` and drive: drain microtasks via
 /// the event loop and, when the result promise is still pending with no real
 /// work left, advance the virtual-time timers (host ops are synchronous, so
 /// timers are the only async surface — backoffs fast-forward instead of
@@ -1633,6 +1944,7 @@ async fn drive_dispatch(
     default_export: &v8::Global<v8::Value>,
     input: &Value,
     config: &Value,
+    socket: Option<&Value>,
 ) -> Result<Value, String> {
     // Gather the dispatch fn + args (no awaits while a scope is live).
     let (dispatch_fn, args): (v8::Global<v8::Function>, Vec<v8::Global<v8::Value>>) = {
@@ -1651,11 +1963,16 @@ async fn drive_dispatch(
         let cfg_local =
             serde_v8::to_v8(scope, config).map_err(|e| format!("config marshaling: {e}"))?;
 
-        let args = vec![
+        let mut args = vec![
             default_export.clone(),
             v8::Global::new(scope, msg_local),
             v8::Global::new(scope, cfg_local),
         ];
+        if let Some(socket) = socket {
+            let socket_local =
+                serde_v8::to_v8(scope, socket).map_err(|e| format!("socket marshaling: {e}"))?;
+            args.push(v8::Global::new(scope, socket_local));
+        }
         (v8::Global::new(scope, dispatch_local), args)
     };
 

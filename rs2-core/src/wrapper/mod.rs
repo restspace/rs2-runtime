@@ -28,6 +28,13 @@ pub struct LimitTable {
     pub breaker_threshold: u32,
     pub breaker_window: Duration,
     pub breaker_cooldown: Duration,
+    /// Inbound WebSockets (`docs/agents/websocket.md`): the largest frame, the
+    /// per-socket in-flight and per-second message ceilings, and the open
+    /// sockets one tenant may hold.
+    pub ws_message_bytes: u64,
+    pub ws_messages_in_flight: u32,
+    pub ws_messages_per_second: u32,
+    pub ws_sockets_per_tenant: usize,
 }
 
 impl Default for LimitTable {
@@ -43,6 +50,10 @@ impl Default for LimitTable {
             breaker_threshold: 8,
             breaker_window: Duration::from_secs(10),
             breaker_cooldown: Duration::from_secs(5),
+            ws_message_bytes: 1024 * 1024,
+            ws_messages_in_flight: 8,
+            ws_messages_per_second: 50,
+            ws_sockets_per_tenant: 1000,
         }
     }
 }
@@ -288,10 +299,12 @@ impl CorsPolicy {
         if is_same_origin(origin, request_host) || self.is_trusted(origin) {
             return Ok(());
         }
+        // WebSocket is exempt from CORS, so a cookie-authenticated upgrade is
+        // as unsafe as a POST (cross-site WebSocket hijacking).
         let unsafe_method = !matches!(
             msg.method,
             http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
-        );
+        ) || crate::sockets::is_websocket_upgrade(msg);
         let has_auth_cookie = msg
             .header("cookie")
             .map(|c| c.split(';').any(|p| p.trim_start().starts_with("rs-auth=")))
@@ -504,6 +517,19 @@ pub fn check_access(msg: &Message, mount: &crate::router::Mount) -> Result<(), R
     if mount.service == "pipeline" && !is_authoring {
         return Ok(());
     }
+    check_mount_access(msg, mount, action_for(&msg.method))
+}
+
+/// Hold a request to the **mount's** `access` for an explicit action,
+/// whatever the service. `dispatch` uses it where [`check_access`]'s rules do
+/// not fit: a pipeline mount's WebSocket upgrade (which never reaches the
+/// per-spec check) and `/.sockets/` writes (the `write` role, never
+/// `invoke`/`delete`).
+pub fn check_mount_access(
+    msg: &Message,
+    mount: &crate::router::Mount,
+    action: &str,
+) -> Result<(), RsError> {
     let access = match mount.config.get("access") {
         Some(a) => a,
         // No policy configured: deny. 401 for an anonymous caller (so a client
@@ -520,7 +546,7 @@ pub fn check_access(msg: &Message, mount: &crate::router::Mount) -> Result<(), R
             ))
         }
     };
-    check_role_spec(access, action_for(&msg.method), msg)
+    check_role_spec(access, action, msg)
 }
 
 /// Whether a principal holds any role designated as a tenant **operator** role

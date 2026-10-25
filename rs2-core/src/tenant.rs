@@ -112,6 +112,11 @@ pub struct Adapters {
     /// file-backed loader over `infras.json`; `None` ⇒ infras are fixed at
     /// startup and `reload_infras` reports no source.
     pub infra_loader: Option<Arc<dyn crate::infra::InfraLoader>>,
+    /// The node's WebSocket registry (`docs/agents/websocket.md`). `None` —
+    /// the default — means this host pumps no sockets: upgrades are served as
+    /// the plain GET and `/.sockets/` answers 501. A listener that can carry
+    /// WebSockets opts in with [`Adapters::with_sockets`].
+    pub sockets: Option<Arc<crate::sockets::SocketHub>>,
 }
 
 impl Adapters {
@@ -190,6 +195,7 @@ impl Adapters {
             builtins,
             catalogue: None,
             schedule: Arc::new(crate::scheduler::MemScheduleStore::new()),
+            sockets: None,
             infras: Arc::new(std::sync::RwLock::new(Arc::new(
                 crate::infra::InfraSet::default(),
             ))),
@@ -222,6 +228,13 @@ impl Adapters {
     /// re-read mid-build (so a concurrent reload can't tear a build).
     pub fn infras_snapshot(&self) -> Arc<crate::infra::InfraSet> {
         self.infras.read().unwrap().clone()
+    }
+
+    /// Enable inbound WebSockets: the host promises to complete every `101`
+    /// `dispatch` returns with a `socket_accept` (see `sockets::SocketSession`).
+    pub fn with_sockets(mut self) -> Self {
+        self.sockets = Some(crate::sockets::SocketHub::new());
+        self
     }
 
     /// Swap the scheduler coordination store (e.g. a shared Redis adapter for
@@ -310,6 +323,9 @@ impl Tenant {
             if let Some(sched) = mount.config.get("schedule") {
                 crate::scheduler::Schedule::from_config(sched)?;
             }
+            // Likewise `webSocket`: a value the contract does not name is
+            // refused here rather than at the first upgrade.
+            crate::sockets::parse_web_socket_config(mount.config.get("webSocket"), &mount.service)?;
         }
         let mounts = MountTable::new(
             config

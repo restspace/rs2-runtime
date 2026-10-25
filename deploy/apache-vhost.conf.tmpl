@@ -22,7 +22,10 @@
     # Tell RS2 the edge terminated TLS (for cookie Secure flags, absolute URLs).
     RequestHeader set X-Forwarded-Proto "https"
 
-    ProxyPass        / http://127.0.0.1:3100/
+    # `upgrade=websocket` (Apache 2.4.47+, mod_proxy_http) tunnels the
+    # WebSocket handshake of a `"webSocket": true` mount; every other request
+    # is proxied as plain HTTP. No mod_proxy_wstunnel needed.
+    ProxyPass        / http://127.0.0.1:3100/ upgrade=websocket
     ProxyPassReverse / http://127.0.0.1:3100/
 
     # RS2 streams response bodies; don't let the proxy buffer them whole.

@@ -480,15 +480,30 @@ impl Service for CodeService {
                         span_id: msg.trace.span_id.clone(),
                     };
                     let grants = self.grants(ctx)?;
-                    let host = Arc::new(
-                        crate::contract::GrantedHost::new(
-                            grants.clone(),
-                            ctx.limits.outbound_calls,
-                            self.state.clone(),
-                            &service_ref,
-                        )
-                        .with_log_context(log_ctx),
-                    );
+                    let mut host = crate::contract::GrantedHost::new(
+                        grants.clone(),
+                        ctx.limits.outbound_calls,
+                        self.state.clone(),
+                        &service_ref,
+                    )
+                    .with_log_context(log_ctx);
+                    // The guest's `socket.send`/`close` and `ctx.sockets`
+                    // reach exactly this mount's `/.sockets/` subtree — the
+                    // base is the host's, never the guest's, so a selection
+                    // cannot be steered off the mount. Only a `webSocket`
+                    // mount has the subtree: on any other, `/.sockets/` is an
+                    // ordinary path of this very service, and the op would
+                    // call back in — so there the surface stays denied.
+                    if let (Some(requester), Some(_)) = (
+                        ctx.requester.clone(),
+                        crate::sockets::web_socket_config_of(&ctx.config, "code:"),
+                    ) {
+                        host = host.with_socket_mount(crate::contract::SocketMount {
+                            base: base.clone(),
+                            requester,
+                        });
+                    }
+                    let host = Arc::new(host);
                     let resp = self
                         .js_engine
                         .invoke(

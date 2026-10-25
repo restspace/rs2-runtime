@@ -677,10 +677,9 @@ impl Executor {
             // verification. Bound only when the template mentions it: it's a
             // full owned copy of the body per step.
             let raw_body = match &mut msg.body {
-                Some(body) if transform::mentions(template, "_rawBody") => body
-                    .as_raw_string(self.limits.materialize_cap)
-                    .await
-                    .ok(),
+                Some(body) if transform::mentions(template, "_rawBody") => {
+                    body.as_raw_string(self.limits.materialize_cap).await.ok()
+                }
                 _ => None,
             };
             let mut eval_vars = vars.clone();
@@ -1217,6 +1216,7 @@ fn clone_with_body(msg: &Message, body: Option<Body>) -> Message {
         source: msg.source,
         name: msg.name.clone(),
         depth: msg.depth,
+        socket_accept: None,
     }
 }
 

@@ -1,8 +1,10 @@
-# Inbound WebSockets — design (Cloudflare host first)
+# Inbound WebSockets — design
 
-Status: implemented on the Worker host (`rs2-worker/`); the Rust host is a
-follow-up and must reproduce this contract exactly. The shared types live in
-`rs2-worker/src/runtime/sockets.ts` — read it with this doc.
+Status: implemented on both hosts, which must keep to this contract exactly
+(`conformance/http/websocket.test.ts` runs against each). The Worker's hub
+sits on the Hibernation API (`rs2-worker/src/runtime/sockets.ts`); the Rust
+host's is in memory (`rs2-core/src/sockets.rs`, with the hyper upgrade in
+`rs2-server/src/websocket.rs`). Read the shared types with this doc.
 
 ## The idea
 
